@@ -38,4 +38,5 @@ build/
 
 # Private deployment secrets
 deploy/mac.shared.env
+deploy/migration/
 wecom-gui/cli_anything/wecom_gui/utils/key.json
