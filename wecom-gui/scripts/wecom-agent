@@ -23,6 +23,10 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
+if [[ -z "${SDKROOT:-}" && -d "/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk" ]]; then
+  export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk"
+fi
+
 MODE="${WECOM_AGENT_MODE:-auto}"
 POLL="${WECOM_AGENT_POLL:-0.5}"
 SCAN_INTERVAL="${WECOM_AGENT_SCAN_INTERVAL:-1}"
@@ -36,6 +40,169 @@ LOG_INTERVAL="${WECOM_AGENT_LOG_INTERVAL:-1}"
 
 PYTHON_BIN="${WECOM_GUI_PYTHON:-python}"
 PYTHONPATH_VALUE="${WECOM_GUI_PYTHONPATH:-}"
+
+preflight_agent() {
+  local failed=0
+
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "ERROR: missing env file: $ENV_FILE" >&2
+    failed=1
+  fi
+  if ! command -v screen >/dev/null 2>&1; then
+    echo "ERROR: screen is required but was not found." >&2
+    failed=1
+  fi
+  if ! command -v osascript >/dev/null 2>&1; then
+    echo "ERROR: osascript is required but was not found." >&2
+    failed=1
+  fi
+  if ! command -v swift >/dev/null 2>&1; then
+    echo "ERROR: swift is required but was not found." >&2
+    failed=1
+  fi
+  if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "ERROR: Python not found or not executable: $PYTHON_BIN" >&2
+    failed=1
+  fi
+  if [[ "$failed" != "0" ]]; then
+    return 1
+  fi
+
+  PYTHONPATH="$PYTHONPATH_VALUE" "$PYTHON_BIN" - "$ROOT_DIR" "$ENV_FILE" <<'PY'
+import importlib
+import json
+import os
+import shutil
+import sys
+import urllib.request
+from pathlib import Path
+
+root = Path(sys.argv[1])
+env_file = Path(sys.argv[2])
+errors: list[str] = []
+notes: list[str] = []
+
+def add_error(message: str) -> None:
+    errors.append(message)
+
+def command_path(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if "/" in value:
+        return value if Path(value).expanduser().exists() else ""
+    return shutil.which(value) or ""
+
+for module in ("click", "cli_anything.wecom_gui", "csbot", "openpyxl", "psycopg"):
+    try:
+        importlib.import_module(module)
+    except Exception as exc:
+        add_error(f"Python dependency import failed: {module}: {exc}")
+
+for key in ("WECOM_GUI_CSBOT_DIR", "CSBOT_CODEX_WORKDIR", "CSBOT_KB_XLSX"):
+    value = os.environ.get(key, "").strip()
+    if value and not Path(value).expanduser().exists():
+        add_error(f"{key} path does not exist: {value}")
+
+provider = os.environ.get("WECOM_GUI_AI_PROVIDER", "uda").strip().lower()
+if provider == "pi":
+    pi_cmd = os.environ.get("WECOM_GUI_PI_COMMAND", "pi")
+    if not command_path(pi_cmd):
+        add_error(f"WECOM_GUI_PI_COMMAND is not executable or not on PATH: {pi_cmd}")
+    pi_home = Path(os.environ.get("WECOM_GUI_PI_HOME", "~/.codex-csbot-wecom/pi-home")).expanduser()
+    models_path = pi_home / "models.json"
+    pi_provider = os.environ.get("WECOM_GUI_PI_PROVIDER", "uda-openai")
+    if not models_path.exists():
+        add_error(f"Pi models config missing: {models_path}")
+    else:
+        try:
+            data = json.loads(models_path.read_text(encoding="utf-8"))
+            provider_cfg = (data.get("providers") or {}).get(pi_provider) or {}
+            if not provider_cfg.get("apiKey"):
+                add_error(f"Pi provider {pi_provider} has no apiKey in {models_path}")
+            if not provider_cfg.get("baseUrl"):
+                add_error(f"Pi provider {pi_provider} has no baseUrl in {models_path}")
+            if not provider_cfg.get("models"):
+                add_error(f"Pi provider {pi_provider} has no models in {models_path}")
+            else:
+                notes.append(f"pi={pi_provider}:{provider_cfg.get('baseUrl', '')}")
+        except Exception as exc:
+            add_error(f"Pi models config is not readable JSON: {models_path}: {exc}")
+elif provider == "uda":
+    if not os.environ.get("WECOM_GUI_UDA_API_KEY", "").strip():
+        add_error("WECOM_GUI_UDA_API_KEY is required for WECOM_GUI_AI_PROVIDER=uda")
+elif provider not in {"codex", "fallback"}:
+    if not os.environ.get("OPENAI_API_KEY", "").strip():
+        add_error(f"OPENAI_API_KEY is required for WECOM_GUI_AI_PROVIDER={provider}")
+    if not os.environ.get("OPENAI_BASE_URL", "").strip():
+        add_error(f"OPENAI_BASE_URL is required for WECOM_GUI_AI_PROVIDER={provider}")
+
+try:
+    from cli_anything.wecom_gui.utils import macos_backend
+
+    status = macos_backend.doctor_status()
+    if not status.ok:
+        add_error(
+            "WeCom automation doctor failed: "
+            f"app_running={status.app_running}, accessibility_ok={status.accessibility_ok}, "
+            f"app_name={status.app_name}, notes={'; '.join(status.notes)}"
+        )
+
+    geometry = macos_backend.window_geometry()
+    if not geometry.get("ok"):
+        add_error(
+            "Swift AX helper failed to read WeCom geometry. "
+            f"SDKROOT={os.environ.get('SDKROOT', '')!r}, result={geometry}. "
+            "Run: SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk "
+            "swift cli_anything/wecom_gui/scripts/ax_wecom.swift geometry"
+        )
+    else:
+        notes.append(f"wecom_window={geometry.get('window')}")
+
+    if os.environ.get("WECOM_GUI_NORMALIZE_FULLSCREEN", "0") == "1":
+        normalized = macos_backend.normalize_window()
+        if not normalized.get("ok"):
+            add_error(f"Swift AX helper failed to normalize WeCom window: {normalized}")
+except Exception as exc:
+    add_error(f"WeCom GUI automation preflight failed: {type(exc).__name__}: {exc}")
+
+dsn = os.environ.get("CSBOT_PG_DSN", "").strip()
+if dsn:
+    try:
+        import psycopg
+
+        with psycopg.connect(dsn, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        notes.append("postgres=ok")
+    except Exception as exc:
+        add_error(f"CSBOT_PG_DSN connection failed: {type(exc).__name__}: {exc}")
+
+mem0_url = os.environ.get("CSBOT_MEM0_URL", "").strip().rstrip("/")
+if mem0_url:
+    try:
+        request = urllib.request.Request(
+            f"{mem0_url}/openapi.json",
+            headers={"X-API-Key": os.environ.get("CSBOT_MEM0_API_KEY", "")},
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            if response.status >= 400:
+                add_error(f"CSBOT_MEM0_URL returned HTTP {response.status}: {mem0_url}")
+        notes.append("mem0=ok")
+    except Exception as exc:
+        add_error(f"CSBOT_MEM0_URL check failed: {type(exc).__name__}: {exc}")
+
+if errors:
+    print("ERROR: wecom-agent preflight failed:", file=sys.stderr)
+    for error in errors:
+        print(f"  - {error}", file=sys.stderr)
+    print(f"  env: {env_file}", file=sys.stderr)
+    sys.exit(1)
+
+print("Preflight OK: " + "; ".join(notes))
+PY
+}
 
 is_running() {
   local listing
@@ -58,6 +225,7 @@ write_header() {
     printf 'WINDOW_MODE=%s COORD_MODE=%s NORMALIZE_FULLSCREEN=%s\n' \
       "${WECOM_GUI_WINDOW_MODE:-fullscreen}" "${WECOM_GUI_COORD_MODE:-adaptive}" \
       "${WECOM_GUI_NORMALIZE_FULLSCREEN:-0}"
+    printf 'SDKROOT=%s\n' "${SDKROOT:-}"
   } >> "$LOG_FILE"
 }
 
@@ -67,6 +235,8 @@ start_agent() {
     status_agent
     return 0
   fi
+
+  preflight_agent
 
   : > "$LOG_FILE"
   write_header
@@ -87,11 +257,11 @@ stop_agent() {
     echo "not running: $SESSION_NAME"
   fi
   local stale_pids
-  stale_pids="$(pgrep -f "$PYTHON_BIN -u -m cli_anything.wecom_gui agent" 2>/dev/null || true)"
+  stale_pids="$(pgrep -f "cli_anything\\.wecom_gui agent" 2>/dev/null || true)"
   if [[ -n "$stale_pids" ]]; then
     printf '%s\n' "$stale_pids" | xargs kill 2>/dev/null || true
     sleep 0.5
-    stale_pids="$(pgrep -f "$PYTHON_BIN -u -m cli_anything.wecom_gui agent" 2>/dev/null || true)"
+    stale_pids="$(pgrep -f "cli_anything\\.wecom_gui agent" 2>/dev/null || true)"
     if [[ -n "$stale_pids" ]]; then
       printf '%s\n' "$stale_pids" | xargs kill -9 2>/dev/null || true
     fi
