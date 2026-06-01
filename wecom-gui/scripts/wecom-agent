@@ -1,0 +1,175 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SESSION_NAME="${WECOM_AGENT_SESSION:-wecom-agent}"
+RUN_DIR="$ROOT_DIR/.codex-run"
+LOG_FILE="${WECOM_AGENT_LOG:-$RUN_DIR/wecom-agent.log}"
+PID_FILE="$RUN_DIR/wecom-agent.pid"
+ENV_FILE="${WECOM_AGENT_ENV:-$ROOT_DIR/.env.local}"
+SIDEBAR_SESSION_NAME="${WECOM_SIDEBAR_SESSION:-wecom-sidebar-8111}"
+SIDEBAR_LOG_FILE="${WECOM_SIDEBAR_LOG:-$RUN_DIR/wecom-sidebar.log}"
+
+cd "$ROOT_DIR"
+mkdir -p "$RUN_DIR"
+
+export WECOM_GUI_NORMALIZE_FULLSCREEN="${WECOM_GUI_NORMALIZE_FULLSCREEN:-1}"
+export WECOM_GUI_WINDOW_MODE="${WECOM_GUI_WINDOW_MODE:-fullscreen}"
+export WECOM_GUI_COORD_MODE="${WECOM_GUI_COORD_MODE:-adaptive}"
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  source "$ENV_FILE"
+  set +a
+fi
+
+MODE="${WECOM_AGENT_MODE:-auto}"
+POLL="${WECOM_AGENT_POLL:-0.5}"
+SCAN_INTERVAL="${WECOM_AGENT_SCAN_INTERVAL:-1}"
+INBOX_LIMIT="${WECOM_AGENT_INBOX_LIMIT:-8}"
+SCAN_PAGES="${WECOM_AGENT_SCAN_PAGES:-1}"
+SCROLL_TICKS="${WECOM_AGENT_SCROLL_TICKS:-6}"
+DEEP_SCAN_INTERVAL="${WECOM_AGENT_DEEP_SCAN_INTERVAL:-30}"
+MAX_DRAFTS="${WECOM_AGENT_MAX_DRAFTS:-2}"
+LAST_MESSAGES="${WECOM_AGENT_LAST:-4}"
+LOG_INTERVAL="${WECOM_AGENT_LOG_INTERVAL:-1}"
+
+PYTHON_BIN="${WECOM_GUI_PYTHON:-python}"
+PYTHONPATH_VALUE="${WECOM_GUI_PYTHONPATH:-}"
+
+is_running() {
+  local listing
+  listing="$(screen -ls 2>/dev/null || true)"
+  printf '%s\n' "$listing" | awk -v name="$SESSION_NAME" '{ first = $1; sub("^[0-9]+[.]", "", first); if (first == name) found = 1 } END { exit found ? 0 : 1 }'
+}
+
+sidebar_running() {
+  local listing
+  listing="$(screen -ls 2>/dev/null || true)"
+  printf '%s\n' "$listing" | awk -v name="$SIDEBAR_SESSION_NAME" '{ first = $1; sub("^[0-9]+[.]", "", first); if (first == name) found = 1 } END { exit found ? 0 : 1 }'
+}
+
+write_header() {
+  {
+    printf 'START_TS=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'ROOT=%s\n' "$ROOT_DIR"
+    printf 'MODE=%s REQUIRED_TAG=%s PROVIDER=%s\n' \
+      "$MODE" "${WECOM_GUI_REQUIRED_TAGS:-${WECOM_GUI_REQUIRED_TAG:-@微信}}" "${WECOM_GUI_AI_PROVIDER:-uda}"
+    printf 'WINDOW_MODE=%s COORD_MODE=%s NORMALIZE_FULLSCREEN=%s\n' \
+      "${WECOM_GUI_WINDOW_MODE:-fullscreen}" "${WECOM_GUI_COORD_MODE:-adaptive}" \
+      "${WECOM_GUI_NORMALIZE_FULLSCREEN:-0}"
+  } >> "$LOG_FILE"
+}
+
+start_agent() {
+  if is_running; then
+    echo "already running: $SESSION_NAME"
+    status_agent
+    return 0
+  fi
+
+  : > "$LOG_FILE"
+  write_header
+  local command
+  command="cd '$ROOT_DIR' && PYTHONPATH='$PYTHONPATH_VALUE' '$PYTHON_BIN' -u -m cli_anything.wecom_gui agent --mode '$MODE' --poll '$POLL' --scan-interval '$SCAN_INTERVAL' --inbox-limit '$INBOX_LIMIT' --scan-pages '$SCAN_PAGES' --scroll-ticks '$SCROLL_TICKS' --deep-scan-interval '$DEEP_SCAN_INTERVAL' --max-drafts '$MAX_DRAFTS' --last '$LAST_MESSAGES' --log-interval '$LOG_INTERVAL' >> '$LOG_FILE' 2>&1"
+  screen -dmS "$SESSION_NAME" zsh -lc "$command"
+  sleep 1
+  screen -ls | awk -v name="$SESSION_NAME" '$0 ~ "\\." name "[[:space:]]" { split($1, a, "."); print a[1] }' > "$PID_FILE" || true
+  echo "started: $SESSION_NAME"
+  tail -n 20 "$LOG_FILE"
+}
+
+stop_agent() {
+  if is_running; then
+    screen -S "$SESSION_NAME" -X quit
+    echo "stopped: $SESSION_NAME"
+  else
+    echo "not running: $SESSION_NAME"
+  fi
+  local stale_pids
+  stale_pids="$(pgrep -f "$PYTHON_BIN -u -m cli_anything.wecom_gui agent" 2>/dev/null || true)"
+  if [[ -n "$stale_pids" ]]; then
+    printf '%s\n' "$stale_pids" | xargs kill 2>/dev/null || true
+    sleep 0.5
+    stale_pids="$(pgrep -f "$PYTHON_BIN -u -m cli_anything.wecom_gui agent" 2>/dev/null || true)"
+    if [[ -n "$stale_pids" ]]; then
+      printf '%s\n' "$stale_pids" | xargs kill -9 2>/dev/null || true
+    fi
+    echo "stopped stale agent process(es)"
+  fi
+}
+
+status_agent() {
+  if is_running; then
+    echo "running: $SESSION_NAME"
+    screen -ls | grep "[.]${SESSION_NAME}[[:space:]]" || true
+  else
+    echo "stopped: $SESSION_NAME"
+  fi
+  if [[ -f "$LOG_FILE" ]]; then
+    echo "log: $LOG_FILE"
+  fi
+}
+
+logs_agent() {
+  touch "$LOG_FILE"
+  tail -f "$LOG_FILE"
+}
+
+start_sidebar() {
+  if sidebar_running; then
+    echo "already running: $SIDEBAR_SESSION_NAME"
+    return 0
+  fi
+  : > "$SIDEBAR_LOG_FILE"
+  local command
+  command="cd '$ROOT_DIR' && PYTHONPATH='$PYTHONPATH_VALUE' '$PYTHON_BIN' -u -m cli_anything.wecom_gui sidebar --host 127.0.0.1 --port 8111 >> '$SIDEBAR_LOG_FILE' 2>&1"
+  screen -dmS "$SIDEBAR_SESSION_NAME" zsh -lc "$command"
+  sleep 1
+  echo "started: $SIDEBAR_SESSION_NAME"
+  tail -n 10 "$SIDEBAR_LOG_FILE"
+}
+
+stop_sidebar() {
+  if sidebar_running; then
+    screen -S "$SIDEBAR_SESSION_NAME" -X quit
+    echo "stopped: $SIDEBAR_SESSION_NAME"
+  else
+    echo "not running: $SIDEBAR_SESSION_NAME"
+  fi
+}
+
+case "${1:-start}" in
+  start)
+    start_agent
+    ;;
+  stop)
+    stop_agent
+    ;;
+  restart)
+    stop_agent
+    sleep 1
+    start_agent
+    ;;
+  status)
+    status_agent
+    ;;
+  logs)
+    logs_agent
+    ;;
+  sidebar-start)
+    start_sidebar
+    ;;
+  sidebar-stop)
+    stop_sidebar
+    ;;
+  sidebar-restart)
+    stop_sidebar
+    sleep 1
+    start_sidebar
+    ;;
+  *)
+    echo "usage: $0 {start|stop|restart|status|logs|sidebar-start|sidebar-stop|sidebar-restart}" >&2
+    exit 2
+    ;;
+esac

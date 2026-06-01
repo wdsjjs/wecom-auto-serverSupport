@@ -1,0 +1,15 @@
+[project]
+name = "codex-csbot-wecom"
+version = "0.1.0"
+description = "Dual-retrieval customer-service bot using script search and vector memory."
+requires-python = ">=3.10"
+dependencies = [
+  "openpyxl>=3.1.0",
+  "psycopg[binary]>=3.2.0"
+]
+
+[project.scripts]
+csbot = "csbot.cli:main"
+
+[tool.setuptools]
+packages = ["csbot"]

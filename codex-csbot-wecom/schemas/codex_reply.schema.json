@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["action", "reply_text", "used_script_sources", "used_vector_memories", "confidence"],
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["send", "clarify", "handoff", "no_answer"]
+    },
+    "reply_text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "used_script_sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sheet": {"type": "string"},
+          "row": {"type": "integer"},
+          "field": {"type": "string"},
+          "kb_doc_id": {"type": "string"}
+        },
+        "required": ["sheet", "row"]
+      }
+    },
+    "used_vector_memories": {
+      "type": "array"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "commands_run": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string"},
+          "purpose": {"type": "string"},
+          "success": {"type": "boolean"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "retrieval_summary": {
+      "type": "string"
+    },
+    "decision_basis": {
+      "type": "string"
+    },
+    "conflicts": {
+      "type": "array"
+    }
+  },
+  "additionalProperties": true
+}

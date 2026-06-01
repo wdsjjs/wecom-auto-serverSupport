@@ -1,0 +1,41 @@
+.DS_Store
+
+# Local secrets and runtime config
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Runtime state and logs
+.codex-run/
+*.log
+*.pid
+*.sqlite
+*.sqlite3
+*.db
+*.pkg
+
+# Local build artifacts
+dist/
+build/
+*.egg-info/
+.~*
+
+# Private deployment secrets
+deploy/mac.shared.env
+wecom-gui/cli_anything/wecom_gui/utils/key.json

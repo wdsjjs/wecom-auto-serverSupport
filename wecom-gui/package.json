@@ -1,0 +1,15 @@
+{
+  "name": "cli-anything-wecom-gui-agent",
+  "private": true,
+  "scripts": {
+    "dev": "set -a; . ./.env.local; set +a; PYTHONPATH=${WECOM_GUI_PYTHONPATH:-} ${WECOM_GUI_PYTHON:-python3} -u -m cli_anything.wecom_gui agent --mode auto --poll 0.5 --scan-interval 1 --inbox-limit 5 --max-drafts 4 --last 12 --log-interval 5",
+    "dev:dry": "set -a; . ./.env.local; set +a; PYTHONPATH=${WECOM_GUI_PYTHONPATH:-} ${WECOM_GUI_PYTHON:-python3} -u -m cli_anything.wecom_gui agent --mode dry-run --poll 0.5 --scan-interval 1 --inbox-limit 5 --max-drafts 4 --last 12 --log-interval 5",
+    "doctor": "set -a; . ./.env.local; set +a; PYTHONPATH=${WECOM_GUI_PYTHONPATH:-} ${WECOM_GUI_PYTHON:-python3} -m cli_anything.wecom_gui --json doctor",
+    "queue": "set -a; . ./.env.local; set +a; PYTHONPATH=${WECOM_GUI_PYTHONPATH:-} ${WECOM_GUI_PYTHON:-python3} -m cli_anything.wecom_gui --json queue list --limit 20",
+    "agent:start": "./scripts/wecom-agent start",
+    "agent:stop": "./scripts/wecom-agent stop",
+    "agent:restart": "./scripts/wecom-agent restart",
+    "agent:status": "./scripts/wecom-agent status",
+    "agent:logs": "./scripts/wecom-agent logs"
+  }
+}

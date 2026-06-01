@@ -1,0 +1,208 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120">
+  <defs>
+    <style>
+      .bg{fill:#f7f8fb}
+      .title{font:700 34px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#172033}
+      .subtitle{font:400 17px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#5d687a}
+      .lane-title{font:700 20px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#172033}
+      .box-title{font:700 18px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#172033}
+      .box-text{font:400 14px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#455066}
+      .small{font:400 12px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#6a7386}
+      .lane{fill:#fff;stroke:#d9deea;stroke-width:1.5}
+      .wecom{fill:#e9f6fb;stroke:#5aa6bd}
+      .ax{fill:#eef5ff;stroke:#7a9ed6}
+      .agent{fill:#fff3e8;stroke:#df9a42}
+      .ai{fill:#edf8ee;stroke:#7dbb80}
+      .kb{fill:#fff9e4;stroke:#c4a531}
+      .warn{fill:#fff1d6;stroke:#d89922;stroke-width:2}
+      .arrow{stroke:#62708a;stroke-width:2.2;fill:none;marker-end:url(#arrow)}
+      .arrow-blue{stroke:#3286a8;stroke-width:2.4;fill:none;marker-end:url(#arrow-blue)}
+      .arrow-green{stroke:#4c9b55;stroke-width:2.4;fill:none;marker-end:url(#arrow-green)}
+      .arrow-orange{stroke:#c67625;stroke-width:2.4;fill:none;marker-end:url(#arrow-orange)}
+      .dash{stroke-dasharray:7 7}
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#62708a"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#3286a8"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#4c9b55"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#c67625"/>
+    </marker>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1800" height="1120"/>
+  <text class="title" x="70" y="70">UDA WeCom Agent 当前架构总览</text>
+  <text class="subtitle" x="70" y="105">主链路：企业微信无障碍采集 → 本机队列状态机 → AI 并发池 → csbot 知识/工具 → 发送前复核 → 企业微信发送</text>
+
+  <rect class="lane" x="60" y="145" rx="18" ry="18" width="305" height="875"/>
+  <rect class="lane" x="400" y="145" rx="18" ry="18" width="315" height="875"/>
+  <rect class="lane" x="750" y="145" rx="18" ry="18" width="365" height="875"/>
+  <rect class="lane" x="1150" y="145" rx="18" ry="18" width="285" height="875"/>
+  <rect class="lane" x="1470" y="145" rx="18" ry="18" width="270" height="875"/>
+
+  <text class="lane-title" x="92" y="190">1. 企业微信桌面端</text>
+  <text class="lane-title" x="430" y="190">2. macOS AX / Swift</text>
+  <text class="lane-title" x="782" y="190">3. wecom-gui 本机 Agent</text>
+  <text class="lane-title" x="1182" y="190">4. AI 并发池</text>
+  <text class="lane-title" x="1502" y="190">5. csbot / 知识库</text>
+
+  <g transform="translate(90 235)">
+    <rect class="wecom" rx="14" width="245" height="92"/>
+    <text class="box-title" x="20" y="32">左侧会话列表</text>
+    <text class="box-text" x="20" y="58">客户名 / 预览 / 标签 / 时间</text>
+    <text class="small" x="20" y="78">只把真实未读加入候选</text>
+  </g>
+  <g transform="translate(90 370)">
+    <rect class="wecom" rx="14" width="245" height="98"/>
+    <text class="box-title" x="20" y="32">当前聊天窗口</text>
+    <text class="box-text" x="20" y="58">最近 6 条现场读取</text>
+    <text class="small" x="20" y="78">文本 / 图片占位 / 气泡坐标</text>
+  </g>
+  <g transform="translate(90 505)">
+    <rect class="wecom" rx="14" width="245" height="94"/>
+    <text class="box-title" x="20" y="32">图片预览窗口</text>
+    <text class="box-text" x="20" y="58">双击图片气泡打开</text>
+    <text class="small" x="20" y="78">只截预览图区域</text>
+  </g>
+  <g transform="translate(90 825)">
+    <rect class="wecom" rx="14" width="245" height="96"/>
+    <text class="box-title" x="20" y="32">输入框与发送</text>
+    <text class="box-text" x="20" y="58">AX 输入优先</text>
+    <text class="small" x="20" y="78">剪贴板粘贴为兜底</text>
+  </g>
+
+  <g transform="translate(430 235)">
+    <rect class="ax" rx="14" width="255" height="92"/>
+    <text class="box-title" x="20" y="32">轻量扫描</text>
+    <text class="box-text" x="20" y="58">扫描左栏/当前会话</text>
+    <text class="small" x="20" y="78">不截图，不 OCR，不点图片</text>
+  </g>
+  <g transform="translate(430 370)">
+    <rect class="ax" rx="14" width="255" height="98"/>
+    <text class="box-title" x="20" y="32">正式读取</text>
+    <text class="box-text" x="20" y="58">chat.read_current</text>
+    <text class="small" x="20" y="78">x/right 推断角色 + preview 修正</text>
+  </g>
+  <g transform="translate(430 505)">
+    <rect class="ax" rx="14" width="255" height="118"/>
+    <text class="box-title" x="20" y="32">图片捕获</text>
+    <text class="box-text" x="20" y="58">双击图片气泡</text>
+    <text class="small" x="20" y="78">screencapture 截预览 rect</text>
+    <text class="small" x="20" y="98">失败保留 [图片]，不中断</text>
+  </g>
+  <g transform="translate(430 825)">
+    <rect class="ax" rx="14" width="255" height="96"/>
+    <text class="box-title" x="20" y="32">发送执行</text>
+    <text class="box-text" x="20" y="58">写输入框 + Enter</text>
+    <text class="small" x="20" y="78">发送后复核可见消息</text>
+  </g>
+
+  <g transform="translate(790 225)">
+    <rect class="agent" rx="14" width="285" height="82"/>
+    <text class="box-title" x="20" y="31">agent_loop 主循环</text>
+    <text class="box-text" x="20" y="57">扫描 → draft → 发送 → 读取 pending</text>
+  </g>
+  <g transform="translate(790 335)">
+    <rect class="agent" rx="14" width="285" height="102"/>
+    <text class="box-title" x="20" y="32">reply_queue 状态机</text>
+    <text class="box-text" x="20" y="58">pending → reading → drafting</text>
+    <text class="small" x="20" y="80">ready → sending → done / failed / skipped</text>
+  </g>
+  <g transform="translate(790 470)">
+    <rect class="warn" rx="14" width="285" height="122"/>
+    <text class="box-title" x="20" y="32">新消息覆盖旧消息</text>
+    <text class="box-text" x="20" y="58">收到后 3 秒复查</text>
+    <text class="small" x="20" y="80">发现更新：直接用最新消息</text>
+    <text class="small" x="20" y="100">旧 future 按 hash 丢弃并让位</text>
+  </g>
+  <g transform="translate(790 625)">
+    <rect class="agent" rx="14" width="285" height="92"/>
+    <text class="box-title" x="20" y="32">本机 SQLite + 事件日志</text>
+    <text class="box-text" x="20" y="58">state.sqlite / events.jsonl</text>
+    <text class="small" x="20" y="78">queue、hash、reply、UID binding</text>
+  </g>
+  <g transform="translate(790 820)">
+    <rect class="agent" rx="14" width="285" height="102"/>
+    <text class="box-title" x="20" y="32">发送前复核</text>
+    <text class="box-text" x="20" y="58">重读当前会话</text>
+    <text class="small" x="20" y="80">最新客户消息不匹配则 stale_context</text>
+  </g>
+
+  <g transform="translate(1180 235)">
+    <rect class="ai" rx="14" width="225" height="88"/>
+    <text class="box-title" x="20" y="32">总并发 10</text>
+    <text class="box-text" x="20" y="58">ThreadPoolExecutor</text>
+    <text class="small" x="20" y="78">GUI 操作仍串行</text>
+  </g>
+  <g transform="translate(1180 355)">
+    <rect class="ai" rx="14" width="225" height="86"/>
+    <text class="box-title" x="20" y="32">文本池 7</text>
+    <text class="box-text" x="20" y="58">deepseek-v4-flash</text>
+  </g>
+  <g transform="translate(1180 475)">
+    <rect class="ai" rx="14" width="225" height="94"/>
+    <text class="box-title" x="20" y="32">图片池 3</text>
+    <text class="box-text" x="20" y="58">qwen3.6-flash</text>
+    <text class="small" x="20" y="78">随 prompt 附 @image.png</text>
+  </g>
+  <g transform="translate(1180 625)">
+    <rect class="ai" rx="14" width="225" height="96"/>
+    <text class="box-title" x="20" y="32">Provider=pi</text>
+    <text class="box-text" x="20" y="58">python -m csbot autonomous-reply</text>
+    <text class="small" x="20" y="78">返回 reply_text/action</text>
+  </g>
+
+  <g transform="translate(1500 220)">
+    <rect class="kb" rx="14" width="215" height="94"/>
+    <text class="box-title" x="20" y="32">csbot worker</text>
+    <text class="box-text" x="20" y="58">ai-knowledge / AGENTS.md</text>
+    <text class="small" x="20" y="78">自主检索 + JSON 合约</text>
+  </g>
+  <g transform="translate(1500 350)">
+    <rect class="kb" rx="14" width="215" height="100"/>
+    <text class="box-title" x="20" y="32">PostgreSQL 主库</text>
+    <text class="box-text" x="20" y="58">kb_docs / kb_aliases</text>
+    <text class="small" x="20" y="80">产品事实以 PG 为准</text>
+  </g>
+  <g transform="translate(1500 485)">
+    <rect class="kb" rx="14" width="215" height="100"/>
+    <text class="box-title" x="20" y="32">MEM0 global-kb</text>
+    <text class="box-text" x="20" y="58">辅助召回/画像/模糊指代</text>
+    <text class="small" x="20" y="80">不能覆盖 PG 事实</text>
+  </g>
+  <g transform="translate(1500 620)">
+    <rect class="kb" rx="14" width="215" height="102"/>
+    <text class="box-title" x="20" y="32">知识同步</text>
+    <text class="box-text" x="20" y="58">飞书表 + 微伴 FAQ</text>
+    <text class="small" x="20" y="80">sync all → PG → MEM0</text>
+  </g>
+  <g transform="translate(1500 820)">
+    <rect class="kb" rx="14" width="215" height="102"/>
+    <text class="box-title" x="20" y="32">外部工具</text>
+    <text class="box-text" x="20" y="58">飞书 handoff / 企微 API</text>
+    <text class="small" x="20" y="80">ClickHouse 订单/物流</text>
+  </g>
+
+  <path class="arrow-blue" d="M335 281 H430"/>
+  <path class="arrow-blue" d="M335 419 H430"/>
+  <path class="arrow-blue" d="M685 281 H790"/>
+  <path class="arrow-blue" d="M685 419 H790"/>
+  <path class="arrow-orange" d="M1075 396 H1180"/>
+  <path class="arrow-orange" d="M1075 531 H1180"/>
+  <path class="arrow-green" d="M1405 673 H1500"/>
+  <path class="arrow-green" d="M1405 403 H1500"/>
+  <path class="arrow-green" d="M1405 522 H1500"/>
+  <path class="arrow" d="M1500 872 H1405 V674"/>
+  <path class="arrow-orange" d="M1180 673 H1075 V870"/>
+  <path class="arrow-blue" d="M790 870 H685 V873 H335"/>
+  <path class="arrow-blue" d="M430 873 H335"/>
+  <path class="arrow dash" d="M1500 671 H1415 V535 H1500"/>
+  <path class="arrow dash" d="M1500 671 H1415 V400 H1500"/>
+
+  <rect x="70" y="1045" rx="12" ry="12" width="1660" height="42" fill="#ffffff" stroke="#d9deea"/>
+  <text class="small" x="90" y="1071">关键约束：扫描阶段保持轻量；正式处理才截图/图片模型；AI 可并发但 GUI 操作串行；发送前必须复核最新客户消息；旧 AI 结果不能覆盖新消息。</text>
+</svg>

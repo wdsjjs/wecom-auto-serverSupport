@@ -1,0 +1,732 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CSBot 调试</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --text: #17202a;
+      --muted: #697586;
+      --line: #d9dee7;
+      --accent: #0f766e;
+      --accent-2: #2563eb;
+      --danger: #b42318;
+      --ok: #047857;
+      --shadow: 0 18px 45px rgba(15, 23, 42, 0.12);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 28px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255,255,255,0.92);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    h1 {
+      font-size: 18px;
+      line-height: 1.2;
+      margin: 0;
+      font-weight: 700;
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 99px;
+      background: var(--ok);
+    }
+    main {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 24px;
+      display: grid;
+      grid-template-columns: minmax(360px, 440px) 1fr;
+      gap: 20px;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    .pane {
+      padding: 18px;
+    }
+    .label {
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      color: #344054;
+      margin-bottom: 8px;
+    }
+    input, textarea {
+      width: 100%;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      padding: 10px 11px;
+      font: inherit;
+      font-size: 14px;
+      line-height: 1.45;
+      color: var(--text);
+      background: #fff;
+      outline: none;
+    }
+    textarea {
+      resize: vertical;
+      min-height: 94px;
+    }
+    input:focus, textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
+    }
+    .field { margin-bottom: 16px; }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--muted);
+      user-select: none;
+    }
+    .check input {
+      width: 16px;
+      height: 16px;
+    }
+    .mode-options {
+      display: grid;
+      gap: 8px;
+    }
+    .mode-option {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      border: 1px solid #d0d7e2;
+      border-radius: 6px;
+      padding: 10px;
+      cursor: pointer;
+      background: #fff;
+    }
+    .mode-option input {
+      width: 16px;
+      height: 16px;
+      margin-top: 2px;
+      flex: 0 0 auto;
+    }
+    .mode-title {
+      display: block;
+      color: #344054;
+      font-size: 13px;
+      font-weight: 800;
+      line-height: 1.3;
+    }
+    .mode-note {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin-top: 2px;
+    }
+    button {
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+      font-size: 14px;
+      padding: 10px 14px;
+      cursor: pointer;
+      min-height: 40px;
+    }
+    button.secondary {
+      background: #fff;
+      color: #344054;
+      border-color: #cbd5e1;
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .result {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: calc(100vh - 112px);
+    }
+    .result-head {
+      padding: 18px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+    }
+    .result-title {
+      font-size: 16px;
+      font-weight: 800;
+      margin: 0 0 6px;
+    }
+    .metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .pill {
+      border: 1px solid #d0d7e2;
+      background: #f8fafc;
+      color: #344054;
+      border-radius: 99px;
+      padding: 5px 9px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .pill.ok { color: var(--ok); border-color: #a7f3d0; background: #ecfdf3; }
+    .pill.warn { color: #a15c07; border-color: #fedf89; background: #fffaeb; }
+    .pill.bad { color: var(--danger); border-color: #fecdca; background: #fef3f2; }
+    .reply-box {
+      padding: 18px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .reply-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 180px;
+      background: #fff;
+    }
+    .card-title {
+      font-size: 13px;
+      font-weight: 800;
+      color: #344054;
+      margin-bottom: 10px;
+    }
+    .reply-text {
+      white-space: pre-wrap;
+      font-size: 15px;
+      line-height: 1.65;
+    }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+      line-height: 1.55;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .empty {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+      padding: 24px;
+    }
+    dialog {
+      border: 0;
+      border-radius: 10px;
+      width: min(1180px, calc(100vw - 36px));
+      height: min(820px, calc(100vh - 36px));
+      box-shadow: var(--shadow);
+      padding: 0;
+    }
+    dialog::backdrop {
+      background: rgba(15, 23, 42, 0.42);
+    }
+    .modal {
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      background: #fff;
+    }
+    .modal-head {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+    .tabs {
+      display: flex;
+      gap: 6px;
+      padding: 10px 18px;
+      border-bottom: 1px solid var(--line);
+      overflow-x: auto;
+    }
+    .tab {
+      background: #fff;
+      color: #344054;
+      border: 1px solid #cbd5e1;
+      padding: 8px 10px;
+      min-height: 34px;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .tab.active {
+      background: #e6fffb;
+      border-color: #5eead4;
+      color: #115e59;
+    }
+    .modal-body {
+      overflow: auto;
+      padding: 18px;
+      background: #fbfcfd;
+    }
+    .trace-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .trace-item {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .hit-list {
+      display: grid;
+      gap: 10px;
+    }
+    .hit {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .hit h3 {
+      margin: 0 0 8px;
+      font-size: 14px;
+    }
+    .muted {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    @media (max-width: 920px) {
+      main { grid-template-columns: 1fr; padding: 14px; }
+      .result { min-height: auto; }
+      .reply-box { grid-template-columns: 1fr; }
+      .trace-grid { grid-template-columns: 1fr; }
+      header { padding: 0 16px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>CSBot 调试</h1>
+    <div class="status"><span class="dot"></span><span>固定召回 / Codex 自主检索</span></div>
+  </header>
+
+  <main>
+    <section class="pane">
+      <div class="field">
+        <label class="label" for="customerId">客户 ID</label>
+        <input id="customerId" value="debug-customer">
+      </div>
+      <div class="field">
+        <label class="label" for="query">客户问题</label>
+        <textarea id="query">女维怎么吃</textarea>
+      </div>
+      <div class="field">
+        <label class="label" for="context">上下文 JSON</label>
+        <textarea id="context">{"known_facts":{}}</textarea>
+      </div>
+      <div class="field">
+        <span class="label">运行模式</span>
+        <div class="mode-options">
+          <label class="mode-option">
+            <input type="radio" name="debugMode" value="autonomous" checked>
+            <span>
+              <span class="mode-title">Codex 自主检索</span>
+              <span class="mode-note">由 Codex worker 自主读取上下文并生成最终回复。</span>
+            </span>
+          </label>
+          <label class="mode-option">
+            <input type="radio" name="debugMode" value="fixed_dual">
+            <span>
+              <span class="mode-title">固定双召回</span>
+              <span class="mode-note">沿用 Script + MEM0 召回，再把合并上下文交给 Codex。</span>
+            </span>
+          </label>
+        </div>
+      </div>
+      <div class="field row">
+        <label class="check"><input id="runCodex" type="checkbox" checked> 启动 Codex 生成回复</label>
+      </div>
+      <div class="field">
+        <label class="label" for="codexTimeout">Codex 超时秒数</label>
+        <input id="codexTimeout" type="number" min="5" max="300" step="5" value="60">
+      </div>
+      <div class="row">
+        <button id="runBtn">运行测试</button>
+        <button class="secondary" id="examplesBtn" type="button">填入示例</button>
+      </div>
+    </section>
+
+    <section class="result">
+      <div class="result-head">
+        <div>
+          <p class="result-title">最终结果</p>
+          <div class="muted" id="summary">还没有运行测试。</div>
+          <div class="metrics" id="metrics"></div>
+        </div>
+        <div class="toolbar">
+          <button class="secondary" id="openTraceBtn" disabled>查看完整链路</button>
+          <button class="secondary" id="copyAllBtn" disabled>复制全部 JSON</button>
+        </div>
+      </div>
+      <div id="resultBody" class="empty">输入客户问题后点击运行。弹窗会按模式展示过程总览、Codex 输入输出、最终回复 JSON 和完整 JSON；固定双召回结果存在时会额外展示 Script/MEM0。</div>
+    </section>
+  </main>
+
+  <dialog id="traceDialog">
+    <div class="modal">
+      <div class="modal-head">
+        <div>
+          <strong>完整链路</strong>
+          <div class="muted" id="modalSub">调试链路 + Codex worker 输出</div>
+        </div>
+        <div class="toolbar">
+          <button class="secondary" id="copyTabBtn">复制当前页</button>
+          <button class="secondary" id="closeDialogBtn">关闭</button>
+        </div>
+      </div>
+      <div class="tabs" id="tabs"></div>
+      <div class="modal-body" id="modalBody"></div>
+    </div>
+  </dialog>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let lastRun = null;
+    let activeTab = "overview";
+
+    const baseTabs = [
+      ["overview", "过程总览"],
+      ["prompt", "Codex 输入"],
+      ["codex", "Codex 输出"],
+      ["reply", "最终回复 JSON"],
+      ["raw", "完整 JSON"]
+    ];
+
+    function selectedMode() {
+      const checked = document.querySelector('input[name="debugMode"]:checked');
+      return checked ? checked.value : "autonomous";
+    }
+
+    function modeLabel(mode) {
+      return mode === "autonomous" ? "Codex 自主检索" : "固定双召回";
+    }
+
+    function runMessage(mode, runCodex) {
+      if (mode === "autonomous") return "正在启动 Codex 自主检索...";
+      if (runCodex) return "正在固定双召回并启动 Codex worker...";
+      return "正在固定双召回...";
+    }
+
+    function responseMode(data) {
+      return data?.request?.mode || data?.mode || selectedMode();
+    }
+
+    function hasValue(value) {
+      return value !== undefined && value !== null;
+    }
+
+    function hasLegacyRetrieval(data) {
+      const retrieval = data?.retrieval || {};
+      const trace = data?.retrieval_trace || {};
+      if (responseMode(data) === "fixed_dual") return true;
+      return (Array.isArray(retrieval.script_hits) && retrieval.script_hits.length > 0) ||
+        (Array.isArray(retrieval.vector_hits) && retrieval.vector_hits.length > 0) ||
+        typeof trace.script_count === "number" ||
+        typeof trace.vector_count === "number";
+    }
+
+    function currentTabs() {
+      if (!lastRun || !hasLegacyRetrieval(lastRun)) return baseTabs;
+      return [
+        ["overview", "过程总览"],
+        ["script", "Script 召回"],
+        ["vector", "MEM0 召回"],
+        ["prompt", "Codex 输入"],
+        ["codex", "Codex 输出"],
+        ["reply", "最终回复 JSON"],
+        ["raw", "完整 JSON"]
+      ];
+    }
+
+    function asJson(value) {
+      return JSON.stringify(value, null, 2);
+    }
+
+    function escapeHtml(text) {
+      return String(text ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[ch]));
+    }
+
+    function pill(text, kind = "") {
+      return `<span class="pill ${kind}">${escapeHtml(text)}</span>`;
+    }
+
+    function renderMain(data) {
+      const codex = data.codex || {};
+      const reply = codex.reply || null;
+      const validation = codex.validation || {};
+      const trace = data.retrieval_trace || {};
+      const request = data.request || {};
+      const mode = responseMode(data);
+      const metrics = [pill(`mode ${mode}`, mode === "autonomous" ? "ok" : "")];
+      if (hasValue(trace.script_count)) metrics.push(pill(`script ${trace.script_count}`, trace.script_count ? "ok" : "warn"));
+      if (hasValue(trace.vector_count)) metrics.push(pill(`vector ${trace.vector_count}`, trace.vector_count ? "ok" : "warn"));
+      if (trace.answer_basis) metrics.push(pill(trace.answer_basis, trace.answer_basis === "script_first" ? "ok" : "warn"));
+      if (validation.ok === true) metrics.push(pill("reply valid", "ok"));
+      else if (validation.ok === false) metrics.push(pill(`reply invalid ${validation.reason || ""}`, "bad"));
+      else metrics.push(pill("reply unknown", "warn"));
+      if (codex.skipped) metrics.push(pill("codex skipped", "warn"));
+      if (hasValue(codex.exit_code)) metrics.push(pill(`exit ${codex.exit_code}`, codex.exit_code === 0 ? "ok" : "bad"));
+      else if (!codex.skipped) metrics.push(pill("exit unknown", "warn"));
+      if (codex.timeout || codex.timed_out) metrics.push(pill("timeout", "bad"));
+      if (codex.parse_error) metrics.push(pill("parse_error", "bad"));
+      $("summary").textContent = `${modeLabel(mode)} / ${request.query || "-"} / ${request.customer_id || "-"}`;
+      $("metrics").innerHTML = metrics.join("");
+      const replyText = reply ? reply.reply_text : "没有拿到可发送回复。";
+      $("resultBody").className = "reply-box";
+      $("resultBody").innerHTML = `
+        <div class="reply-card">
+          <div class="card-title">发给客户的话术</div>
+          <div class="reply-text">${escapeHtml(replyText)}</div>
+        </div>
+        <div class="reply-card">
+          <div class="card-title">Codex 回复 JSON</div>
+          <pre>${escapeHtml(asJson(reply || {}))}</pre>
+        </div>
+      `;
+      $("openTraceBtn").disabled = false;
+      $("copyAllBtn").disabled = false;
+    }
+
+    function renderTabs() {
+      const tabs = currentTabs();
+      if (!tabs.some(([id]) => id === activeTab)) activeTab = "overview";
+      $("tabs").innerHTML = tabs.map(([id, label]) =>
+        `<button class="tab ${id === activeTab ? "active" : ""}" data-tab="${id}">${label}</button>`
+      ).join("");
+      document.querySelectorAll("[data-tab]").forEach((button) => {
+        button.addEventListener("click", () => {
+          activeTab = button.dataset.tab;
+          renderDialog();
+        });
+      });
+    }
+
+    function hitList(hits, kind) {
+      if (!hits || hits.length === 0) return '<div class="empty">没有命中。</div>';
+      return `<div class="hit-list">${hits.map((hit, index) => `
+        <div class="hit">
+          <h3>${index + 1}. ${escapeHtml(hit.product || hit.metadata?.product || hit.type || kind)}</h3>
+          <div class="metrics">
+            ${pill(`score ${hit.score ?? "-"}`)}
+            ${hit.provider ? pill(hit.provider, "ok") : ""}
+            ${hit.business_type ? pill(hit.business_type) : ""}
+            ${hit.source ? pill(`${hit.source.sheet}:${hit.source.row}`) : ""}
+          </div>
+          <pre>${escapeHtml(asJson(hit))}</pre>
+        </div>
+      `).join("")}</div>`;
+    }
+
+    function tabContent() {
+      if (!lastRun) return "";
+      const retrieval = lastRun.retrieval || {};
+      const codex = lastRun.codex || {};
+      const trace = lastRun.retrieval_trace || {};
+      const mode = responseMode(lastRun);
+      if (activeTab === "overview") {
+        return `
+          <div class="trace-grid">
+            <div class="trace-item"><div class="card-title">请求</div><pre>${escapeHtml(asJson(lastRun.request))}</pre></div>
+            <div class="trace-item"><div class="card-title">运行模式</div><pre>${escapeHtml(asJson({
+              mode,
+              label: modeLabel(mode),
+              has_legacy_retrieval: hasLegacyRetrieval(lastRun)
+            }))}</pre></div>
+            <div class="trace-item"><div class="card-title">召回过程</div><pre>${escapeHtml(asJson(trace))}</pre></div>
+            <div class="trace-item"><div class="card-title">合并上下文</div><pre>${escapeHtml(asJson(retrieval.merged_context || {}))}</pre></div>
+            <div class="trace-item"><div class="card-title">Codex 状态</div><pre>${escapeHtml(asJson({
+              skipped: codex.skipped,
+              skip_reason: codex.skip_reason,
+              exit_code: codex.exit_code,
+              timeout: codex.timeout || codex.timed_out || false,
+              duration_ms: codex.duration_ms,
+              parse_error: codex.parse_error
+            }))}</pre></div>
+            <div class="trace-item"><div class="card-title">Codex CLI</div><pre>${escapeHtml(asJson(codex.codex_cli || {}))}</pre></div>
+            <div class="trace-item"><div class="card-title">Codex 校验</div><pre>${escapeHtml(asJson(codex.validation || {}))}</pre></div>
+          </div>
+        `;
+      }
+      if (activeTab === "script") return hitList(retrieval.script_hits || [], "script");
+      if (activeTab === "vector") return hitList(retrieval.vector_hits || [], "vector");
+      if (activeTab === "prompt") {
+        return `
+          <div class="trace-grid">
+            <div class="trace-item"><div class="card-title">prompt</div><pre>${escapeHtml(codex.prompt || "")}</pre></div>
+            <div class="trace-item"><div class="card-title">command</div><pre>${escapeHtml(asJson(codex.command || []))}</pre></div>
+          </div>
+        `;
+      }
+      if (activeTab === "codex") {
+        return `
+          <div class="trace-grid">
+            <div class="trace-item"><div class="card-title">状态</div><pre>${escapeHtml(asJson({
+              skipped: codex.skipped,
+              skip_reason: codex.skip_reason,
+              exit_code: codex.exit_code,
+              timeout: codex.timeout || codex.timed_out || false,
+              duration_ms: codex.duration_ms,
+              parse_error: codex.parse_error
+            }))}</pre></div>
+            <div class="trace-item"><div class="card-title">stdout</div><pre>${escapeHtml(codex.stdout || "")}</pre></div>
+            <div class="trace-item"><div class="card-title">stderr</div><pre>${escapeHtml(codex.stderr || "")}</pre></div>
+            <div class="trace-item"><div class="card-title">last_message</div><pre>${escapeHtml(codex.last_message || "")}</pre></div>
+          </div>
+        `;
+      }
+      if (activeTab === "reply") return `<pre>${escapeHtml(asJson(codex.reply || {}))}</pre>`;
+      return `<pre>${escapeHtml(asJson(lastRun))}</pre>`;
+    }
+
+    function renderDialog() {
+      renderTabs();
+      $("modalBody").innerHTML = tabContent();
+    }
+
+    function currentTabText() {
+      if (!lastRun) return "";
+      const retrieval = lastRun.retrieval || {};
+      const codex = lastRun.codex || {};
+      if (activeTab === "overview") return asJson({
+        request: lastRun.request,
+        mode: responseMode(lastRun),
+        retrieval_trace: lastRun.retrieval_trace,
+        merged_context: retrieval.merged_context,
+        codex_status: {
+          skipped: codex.skipped,
+          skip_reason: codex.skip_reason,
+          exit_code: codex.exit_code,
+          timeout: codex.timeout || codex.timed_out || false,
+          duration_ms: codex.duration_ms,
+          parse_error: codex.parse_error
+        },
+        codex_cli: codex.codex_cli || {},
+        validation: codex.validation
+      });
+      if (activeTab === "script") return asJson(retrieval.script_hits || []);
+      if (activeTab === "vector") return asJson(retrieval.vector_hits || []);
+      if (activeTab === "prompt") return asJson({ prompt: codex.prompt || "", command: codex.command || [] });
+      if (activeTab === "codex") return asJson({ stdout: codex.stdout, stderr: codex.stderr, last_message: codex.last_message, exit_code: codex.exit_code, timeout: codex.timeout || codex.timed_out || false, duration_ms: codex.duration_ms, parse_error: codex.parse_error });
+      if (activeTab === "reply") return asJson(codex.reply || {});
+      return asJson(lastRun);
+    }
+
+    async function run() {
+      let context = {};
+      const rawContext = $("context").value.trim();
+      if (rawContext) {
+        try {
+          context = JSON.parse(rawContext);
+        } catch (err) {
+          alert("上下文 JSON 格式不对：" + err.message);
+          return;
+        }
+      }
+      const mode = selectedMode();
+      $("runBtn").disabled = true;
+      $("runBtn").textContent = "运行中...";
+      $("resultBody").className = "empty";
+      $("resultBody").textContent = runMessage(mode, $("runCodex").checked);
+      try {
+        const resp = await fetch("/api/debug-run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode,
+            customer_id: $("customerId").value.trim(),
+            query: $("query").value.trim(),
+            context,
+            run_codex: $("runCodex").checked,
+            timeout: Number($("codexTimeout").value || 60)
+          })
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || resp.statusText);
+        lastRun = data;
+        renderMain(data);
+      } catch (err) {
+        $("resultBody").className = "empty";
+        $("resultBody").textContent = "运行失败：" + err.message;
+      } finally {
+        $("runBtn").disabled = false;
+        $("runBtn").textContent = "运行测试";
+      }
+    }
+
+    $("runBtn").addEventListener("click", run);
+    $("examplesBtn").addEventListener("click", () => {
+      const samples = [
+        "女维怎么吃",
+        "鱼油发货时间",
+        "1.5岁的小孩 藻油怎么吃",
+        "上次那个小孩吃的还能继续吗"
+      ];
+      const current = $("query").value.trim();
+      const idx = samples.indexOf(current);
+      $("query").value = samples[(idx + 1 + samples.length) % samples.length];
+    });
+    $("openTraceBtn").addEventListener("click", () => {
+      activeTab = "overview";
+      renderDialog();
+      $("traceDialog").showModal();
+    });
+    $("closeDialogBtn").addEventListener("click", () => $("traceDialog").close());
+    $("copyAllBtn").addEventListener("click", () => navigator.clipboard.writeText(asJson(lastRun || {})));
+    $("copyTabBtn").addEventListener("click", () => navigator.clipboard.writeText(currentTabText()));
+  </script>
+</body>
+</html>

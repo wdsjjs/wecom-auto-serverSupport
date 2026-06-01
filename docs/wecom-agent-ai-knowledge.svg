@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1080" viewBox="0 0 1800 1080">
+  <defs>
+    <style>
+      .bg{fill:#f7f8fb}.title{font:700 32px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#172033}.sub{font:400 16px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#5d687a}.section{font:700 20px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#172033}.box-title{font:700 17px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#172033}.txt{font:400 14px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#455066}.small{font:400 12px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#6a7386}.card{fill:#fff;stroke:#d9deea;stroke-width:1.5}.gui{fill:#fff3e8;stroke:#df9a42}.ai{fill:#edf8ee;stroke:#7dbb80}.kb{fill:#fff9e4;stroke:#c4a531}.ops{fill:#fce9f1;stroke:#bd6a88}.warn{fill:#fff1d6;stroke:#d89922;stroke-width:2}.arrow{stroke:#62708a;stroke-width:2.3;fill:none;marker-end:url(#arrow)}.green{stroke:#4c9b55}.orange{stroke:#c67625}.pink{stroke:#ad5576}.dash{stroke-dasharray:8 7}
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#62708a"/></marker>
+  </defs>
+  <rect class="bg" width="1800" height="1080"/>
+  <text class="title" x="70" y="70">AI / 知识库 / 外部工具链路</text>
+  <text class="sub" x="70" y="105">这张图只画 AI 生成和知识同步细节：wecom-gui 如何把现场上下文交给 csbot，csbot 如何用 PG、MEM0、飞书/微伴和业务工具生成最终回复。</text>
+
+  <text class="section" x="80" y="165">A. 运行时 AI 回复链路</text>
+  <text class="section" x="80" y="615">B. 知识同步链路</text>
+  <text class="section" x="1120" y="615">C. 业务工具与审计</text>
+
+  <g transform="translate(80 210)">
+    <rect class="gui" rx="16" width="270" height="112"/>
+    <text class="box-title" x="22" y="34">wecom-gui 上下文</text>
+    <text class="txt" x="22" y="62">最近 6 条现场消息</text>
+    <text class="txt" x="22" y="84">客户名 / UID / latest turn</text>
+    <text class="small" x="22" y="104">有图片则带 image_paths</text>
+  </g>
+  <g transform="translate(405 210)">
+    <rect class="gui" rx="16" width="285" height="112"/>
+    <text class="box-title" x="22" y="34">llm.draft_reply(provider=pi)</text>
+    <text class="txt" x="22" y="62">构造 context_json</text>
+    <text class="txt" x="22" y="84">调用 csbot autonomous-reply</text>
+    <text class="small" x="22" y="104">超时 300s</text>
+  </g>
+  <g transform="translate(745 210)">
+    <rect class="ai" rx="16" width="290" height="112"/>
+    <text class="box-title" x="22" y="34">csbot autonomous worker</text>
+    <text class="txt" x="22" y="62">build_autonomous_prompt</text>
+    <text class="txt" x="22" y="84">工作目录 ai-knowledge</text>
+    <text class="small" x="22" y="104">读取 AGENTS.md SOP</text>
+  </g>
+  <g transform="translate(1090 190)">
+    <rect class="ai" rx="16" width="280" height="86"/>
+    <text class="box-title" x="22" y="33">文本 worker</text>
+    <text class="txt" x="22" y="60">pi + deepseek-v4-flash</text>
+  </g>
+  <g transform="translate(1090 310)">
+    <rect class="ai" rx="16" width="280" height="100"/>
+    <text class="box-title" x="22" y="33">图片 worker</text>
+    <text class="txt" x="22" y="60">pi + qwen3.6-flash</text>
+    <text class="small" x="22" y="82">追加 @prompt.md 和 @image.png</text>
+  </g>
+  <g transform="translate(1430 210)">
+    <rect class="warn" rx="16" width="285" height="112"/>
+    <text class="box-title" x="22" y="34">JSON 回复合约</text>
+    <text class="txt" x="22" y="62">action: send / clarify</text>
+    <text class="txt" x="22" y="84">handoff / no_answer</text>
+    <text class="small" x="22" y="104">客户可见文本只取 reply_text</text>
+  </g>
+  <g transform="translate(745 420)">
+    <rect class="gui" rx="16" width="290" height="100"/>
+    <text class="box-title" x="22" y="33">Python 侧解析/防漏</text>
+    <text class="txt" x="22" y="60">safe_json_parse + validate</text>
+    <text class="small" x="22" y="82">拒绝思考链、调试文本、空回复</text>
+  </g>
+  <g transform="translate(1090 440)">
+    <rect class="gui" rx="16" width="280" height="78"/>
+    <text class="box-title" x="22" y="33">回到队列</text>
+    <text class="txt" x="22" y="60">ready → 发送前复核</text>
+  </g>
+
+  <path class="arrow orange" d="M350 266 H405"/><path class="arrow orange" d="M690 266 H745"/><path class="arrow green" d="M1035 246 H1090"/><path class="arrow green" d="M1035 286 C1060 286 1060 360 1090 360"/><path class="arrow green" d="M1370 235 H1430"/><path class="arrow green" d="M1370 360 C1400 360 1400 286 1430 286"/><path class="arrow" d="M1570 322 V470 H1035"/><path class="arrow orange" d="M1035 470 H1090"/>
+
+  <g transform="translate(80 660)">
+    <rect class="kb" rx="16" width="260" height="108"/>
+    <text class="box-title" x="22" y="34">飞书多维表</text>
+    <text class="txt" x="22" y="62">AI 知识库</text>
+    <text class="small" x="22" y="84">产品常规、起拍、价格、检测报告</text>
+  </g>
+  <g transform="translate(80 815)">
+    <rect class="kb" rx="16" width="260" height="108"/>
+    <text class="box-title" x="22" y="34">微伴 FAQ</text>
+    <text class="txt" x="22" y="62">快捷回复分组/内容</text>
+    <text class="small" x="22" y="84">跳过包含“过期”的数据</text>
+  </g>
+  <g transform="translate(405 735)">
+    <rect class="kb" rx="16" width="280" height="108"/>
+    <text class="box-title" x="22" y="34">csbot sync all</text>
+    <text class="txt" x="22" y="62">feishu sync → weiban sync</text>
+    <text class="small" x="22" y="84">rebuild kb_docs / kb_aliases</text>
+  </g>
+  <g transform="translate(745 660)">
+    <rect class="kb" rx="16" width="295" height="116"/>
+    <text class="box-title" x="22" y="34">PostgreSQL 主事实库</text>
+    <text class="txt" x="22" y="62">kb_docs / kb_aliases</text>
+    <text class="txt" x="22" y="84">feishu_sync_records / weiban_customer_service_faq</text>
+    <text class="small" x="22" y="104">产品事实、价格、用法以 PG 为准</text>
+  </g>
+  <g transform="translate(745 820)">
+    <rect class="kb" rx="16" width="295" height="108"/>
+    <text class="box-title" x="22" y="34">MEM0 global-kb</text>
+    <text class="txt" x="22" y="62">导入统一知识文本</text>
+    <text class="small" x="22" y="84">辅助召回/画像/模糊指代，不覆盖 PG</text>
+  </g>
+
+  <path class="arrow dash" d="M340 714 H405"/><path class="arrow dash" d="M340 869 H405 V789"/><path class="arrow dash" d="M685 789 H745"/><path class="arrow dash" d="M685 789 C715 789 715 874 745 874"/>
+
+  <g transform="translate(1120 660)">
+    <rect class="ops" rx="16" width="260" height="108"/>
+    <text class="box-title" x="22" y="34">csbot retrieve / kb search</text>
+    <text class="txt" x="22" y="62">先查 PG 事实</text>
+    <text class="small" x="22" y="84">普通产品问答、规格、禁忌、起拍</text>
+  </g>
+  <g transform="translate(1120 820)">
+    <rect class="ops" rx="16" width="260" height="108"/>
+    <text class="box-title" x="22" y="34">csbot mem search</text>
+    <text class="txt" x="22" y="62">查 MEM0 画像/偏好</text>
+    <text class="small" x="22" y="84">“上次那个”“我这种情况”等辅助</text>
+  </g>
+  <g transform="translate(1435 650)">
+    <rect class="ops" rx="16" width="280" height="92"/>
+    <text class="box-title" x="22" y="33">飞书 handoff</text>
+    <text class="txt" x="22" y="60">退款/投诉/人工/超时通知</text>
+  </g>
+  <g transform="translate(1435 770)">
+    <rect class="ops" rx="16" width="280" height="92"/>
+    <text class="box-title" x="22" y="33">企微 API / UID</text>
+    <text class="txt" x="22" y="60">客户绑定、外部联系人信息辅助</text>
+  </g>
+  <g transform="translate(1435 890)">
+    <rect class="ops" rx="16" width="280" height="92"/>
+    <text class="box-title" x="22" y="33">ClickHouse 只读</text>
+    <text class="txt" x="22" y="60">订单、物流、运营数据查询</text>
+  </g>
+
+  <path class="arrow pink" d="M1040 710 H1120"/><path class="arrow pink" d="M1040 874 H1120"/><path class="arrow pink" d="M1380 714 H1435"/><path class="arrow pink" d="M1380 874 C1410 874 1410 816 1435 816"/><path class="arrow pink" d="M1380 874 H1435 V936"/>
+
+  <rect x="70" y="990" rx="14" width="1660" height="50" fill="#ffffff" stroke="#d9deea"/>
+  <text class="txt" x="95" y="1022">事实边界：PG 是产品事实主库；MEM0 是召回和画像辅助；视觉模型只在图片任务中作为统一 worker 的输入，不绕过 csbot/AGENTS/SOP。</text>
+</svg>

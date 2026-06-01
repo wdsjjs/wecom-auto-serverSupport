@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1040" viewBox="0 0 1800 1040">
+  <defs>
+    <style>
+      .bg{fill:#f7f8fb}.title{font:700 32px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#172033}.sub{font:400 16px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#5d687a}.box-title{font:700 17px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#172033}.txt{font:400 14px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#455066}.small{font:400 12px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#6a7386}.step{fill:#fff;stroke:#d9deea;stroke-width:1.5}.scan{fill:#e9f6fb;stroke:#5aa6bd}.queue{fill:#fff3e8;stroke:#df9a42}.warn{fill:#fff1d6;stroke:#d89922;stroke-width:2}.ai{fill:#edf8ee;stroke:#7dbb80}.send{fill:#eef5ff;stroke:#7a9ed6}.bad{fill:#fdecea;stroke:#d93025}.arrow{stroke:#62708a;stroke-width:2.4;fill:none;marker-end:url(#arrow)}.dash{stroke-dasharray:8 7}.label{font:700 13px -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;fill:#62708a}
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M2,2 L10,6 L2,10 Z" fill="#62708a"/></marker>
+  </defs>
+  <rect class="bg" width="1800" height="1040"/>
+  <text class="title" x="70" y="70">消息生命周期：新消息如何覆盖旧消息</text>
+  <text class="sub" x="70" y="105">这张图只画运行时状态流，重点解释：为什么客户连续发消息时不再等旧 AI 完成，以及发送前如何避免回错旧问题。</text>
+
+  <g transform="translate(70 170)">
+    <rect class="scan" rx="16" width="260" height="116"/>
+    <text class="box-title" x="24" y="34">A. 发现新消息</text>
+    <text class="txt" x="24" y="62">左侧未读扫描</text>
+    <text class="txt" x="24" y="84">当前会话兜底检测</text>
+    <text class="small" x="24" y="104">扫描阶段不截图、不 OCR、不点图片</text>
+  </g>
+  <g transform="translate(390 170)">
+    <rect class="queue" rx="16" width="260" height="116"/>
+    <text class="box-title" x="24" y="34">B. 入队 pending</text>
+    <text class="txt" x="24" y="62">写 reply_queue</text>
+    <text class="txt" x="24" y="84">保存 title/preview/signature</text>
+    <text class="small" x="24" y="104">已有 active 且有新未读可替换</text>
+  </g>
+  <g transform="translate(710 170)">
+    <rect class="queue" rx="16" width="260" height="116"/>
+    <text class="box-title" x="24" y="34">C. claim reading</text>
+    <text class="txt" x="24" y="62">打开会话</text>
+    <text class="txt" x="24" y="84">读取最近 6 条现场历史</text>
+    <text class="small" x="24" y="104">正式处理阶段才允许图片捕获</text>
+  </g>
+  <g transform="translate(1030 170)">
+    <rect class="warn" rx="16" width="300" height="116"/>
+    <text class="box-title" x="24" y="34">D. 等 3 秒再复查</text>
+    <text class="txt" x="24" y="62">WECOM_AGENT_NEW_MESSAGE_DEBOUNCE_SECONDS=3</text>
+    <text class="txt" x="24" y="84">重新打开同一会话并重读</text>
+    <text class="small" x="24" y="104">用于合并客户连续发送的多条消息</text>
+  </g>
+  <g transform="translate(1410 170)">
+    <rect class="warn" rx="16" width="300" height="116"/>
+    <text class="box-title" x="24" y="34">E. 判断是否有更新</text>
+    <text class="txt" x="24" y="62">hash 或最新客户文本变化</text>
+    <text class="txt" x="24" y="84">有更新：直接替换为最新上下文</text>
+    <text class="small" x="24" y="104">未确认客户消息：回 pending 暂停旧 AI</text>
+  </g>
+
+  <path class="arrow" d="M330 228 H390"/><path class="arrow" d="M650 228 H710"/><path class="arrow" d="M970 228 H1030"/><path class="arrow" d="M1330 228 H1410"/>
+
+  <g transform="translate(70 405)">
+    <rect class="queue" rx="16" width="300" height="120"/>
+    <text class="box-title" x="24" y="35">F. mark_drafting</text>
+    <text class="txt" x="24" y="64">保存 last_message_hash</text>
+    <text class="txt" x="24" y="86">context_json 只放 latest + count</text>
+    <text class="small" x="24" y="106">不把完整 messages 长期存 SQLite</text>
+  </g>
+  <g transform="translate(440 405)">
+    <rect class="ai" rx="16" width="300" height="120"/>
+    <text class="box-title" x="24" y="35">G. 分配 AI 池</text>
+    <text class="txt" x="24" y="64">文本：7 个 deepseek-v4-flash</text>
+    <text class="txt" x="24" y="86">图片：3 个 qwen3.6-flash</text>
+    <text class="small" x="24" y="106">总并发 WECOM_AGENT_MAX_DRAFTS=10</text>
+  </g>
+  <g transform="translate(810 405)">
+    <rect class="ai" rx="16" width="300" height="120"/>
+    <text class="box-title" x="24" y="35">H. AI future 执行中</text>
+    <text class="txt" x="24" y="64">子进程 csbot autonomous-reply</text>
+    <text class="txt" x="24" y="86">可能耗时几十秒到数分钟</text>
+    <text class="small" x="24" y="106">期间继续扫描/读取其他客户</text>
+  </g>
+  <g transform="translate(1180 405)">
+    <rect class="warn" rx="16" width="300" height="120"/>
+    <text class="box-title" x="24" y="35">I. 旧请求让位</text>
+    <text class="txt" x="24" y="64">如果同 job 被新消息改回 pending</text>
+    <text class="txt" x="24" y="86">从 futures 中移除旧请求</text>
+    <text class="small" x="24" y="106">避免并发池被旧任务占满</text>
+  </g>
+  <g transform="translate(70 665)">
+    <rect class="ai" rx="16" width="300" height="120"/>
+    <text class="box-title" x="24" y="35">J. AI 完成回调</text>
+    <text class="txt" x="24" y="64">检查当前 job 仍是 drafting</text>
+    <text class="txt" x="24" y="86">检查 last_message_hash 一致</text>
+    <text class="small" x="24" y="106">不一致：丢弃旧回复/旧失败</text>
+  </g>
+  <g transform="translate(440 665)">
+    <rect class="queue" rx="16" width="300" height="120"/>
+    <text class="box-title" x="24" y="35">K. mark_ready</text>
+    <text class="txt" x="24" y="64">只把有效 reply_text 写入 ready</text>
+    <text class="txt" x="24" y="86">handoff/no_answer 也作为 action 记录</text>
+    <text class="small" x="24" y="106">AI 耗时/模型/错误写 events</text>
+  </g>
+  <g transform="translate(810 665)">
+    <rect class="send" rx="16" width="300" height="120"/>
+    <text class="box-title" x="24" y="35">L. 发送前复核</text>
+    <text class="txt" x="24" y="64">重新打开会话</text>
+    <text class="txt" x="24" y="86">最新客户消息必须仍匹配生成时 latest</text>
+    <text class="small" x="24" y="106">不匹配：stale_context，不发送</text>
+  </g>
+  <g transform="translate(1180 665)">
+    <rect class="send" rx="16" width="300" height="120"/>
+    <text class="box-title" x="24" y="35">M. 发送并验证</text>
+    <text class="txt" x="24" y="64">AX 输入框发送</text>
+    <text class="txt" x="24" y="86">发送后重读确认回复可见</text>
+    <text class="small" x="24" y="106">可见：done；不可见：failed</text>
+  </g>
+
+  <path class="arrow" d="M1560 286 V350 H220 V405"/>
+  <path class="arrow" d="M370 465 H440"/><path class="arrow" d="M740 465 H810"/><path class="arrow" d="M1110 465 H1180"/>
+  <path class="arrow" d="M1330 525 V600 H220 V665"/>
+  <path class="arrow" d="M370 725 H440"/><path class="arrow" d="M740 725 H810"/><path class="arrow" d="M1110 725 H1180"/>
+  <path class="arrow dash" d="M1480 465 H1585 V225 H1710"/>
+  <text class="label" x="1510" y="445">新消息继续进入 A/B/C</text>
+
+  <g transform="translate(1495 405)">
+    <rect class="bad" rx="16" width="245" height="120"/>
+    <text class="box-title" x="24" y="35">被避免的问题</text>
+    <text class="txt" x="24" y="64">旧问题 AI 慢慢生成</text>
+    <text class="txt" x="24" y="86">新问题排队等待</text>
+    <text class="small" x="24" y="106">旧回复覆盖新上下文</text>
+  </g>
+
+  <rect x="70" y="910" rx="14" width="1660" height="64" fill="#ffffff" stroke="#d9deea"/>
+  <text class="txt" x="95" y="940">核心原则：客户连续发消息时，以 3 秒复查后的最新现场上下文为准；任何旧 AI future 只能在 job 状态和 hash 都未变化时写回 ready。</text>
+  <text class="small" x="95" y="962">这解决“新消息要等旧消息生成完才处理”和“旧回复覆盖新消息”的问题。</text>
+</svg>
