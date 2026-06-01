@@ -60,16 +60,14 @@ def _latest_message_matching_preview(messages: list[dict], preview: str) -> dict
     return None
 
 
-def _latest_reply_for_title(title: str) -> str:
-    title_text = str(title or "").strip()
-    if not title_text:
+def _latest_reply_for_row(row: dict) -> str:
+    conversation_key = state.conversation_key_for_row(row)
+    if not conversation_key:
         return ""
-    for item in state.list_queue(limit=100):
-        if str(item.get("title") or "").strip() != title_text:
-            continue
-        reply_text = str(item.get("reply_text") or "").strip()
-        if reply_text:
-            return reply_text
+    item = state.get_job_by_conversation_key(conversation_key) or {}
+    reply_text = str(item.get("reply_text") or "").strip()
+    if reply_text:
+        return reply_text
     return ""
 
 
@@ -199,7 +197,7 @@ def enqueue_current_chat_if_changed(*, last: int, inbox_limit: int = 30) -> dict
     if latest.get("role_confidence") == "low":
         return {"ok": True, "enqueued": 0, "reason": "selected_conversation_low_role_confidence"}
     latest_text = str(latest.get("content") or latest.get("text") or "").strip()
-    if latest_text and _reply_match_key(latest_text) == _reply_match_key(_latest_reply_for_title(selected.get("title", ""))):
+    if latest_text and _reply_match_key(latest_text) == _reply_match_key(_latest_reply_for_row(selected)):
         return {"ok": True, "enqueued": 0, "reason": "latest_visible_message_is_own_reply"}
     row = {
         **selected,
@@ -209,7 +207,7 @@ def enqueue_current_chat_if_changed(*, last: int, inbox_limit: int = 30) -> dict
         "source": selected.get("source") or "current-chat",
     }
     signature = f"current|{row.get('title', '')}|{latest_text}"
-    existing = state.get_job_by_title(str(row.get("title") or ""))
+    existing = state.get_job_by_conversation_key(state.conversation_key_for_row(row))
     if _same_current_message(existing, signature=signature, message_hash=str(current.get("hash") or "")):
         return {
             "ok": True,

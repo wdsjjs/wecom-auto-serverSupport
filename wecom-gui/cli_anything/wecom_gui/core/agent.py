@@ -456,7 +456,11 @@ def _reason_text(reason: str) -> str:
 
 
 def _mode_text(mode: str) -> str:
-    return "真实发送" if mode == "auto" else "演练模式"
+    if mode == "auto":
+        return "真实发送"
+    if mode == "review":
+        return "网页审核后发送"
+    return "演练模式"
 
 
 def _format_counts(counts: dict[str, int]) -> str:
@@ -465,7 +469,8 @@ def _format_counts(counts: dict[str, int]) -> str:
         "processing": "处理中",
         "reading": "读取中",
         "drafting": "AI处理中",
-        "ready": "待发送",
+        "ready": "待审核",
+        "approved": "已审核待发送",
         "sending": "发送中",
         "done": "已完成",
         "failed": "失败",
@@ -866,7 +871,10 @@ def _drop_superseded_drafts(futures: dict[int, Future]) -> dict:
 
 
 def _send_one_ready(*, last: int, mode: str) -> dict:
-    job = state.claim_ready_to_send()
+    if mode == "review":
+        job = state.claim_approved_to_send()
+    else:
+        job = state.claim_ready_to_send()
     if job is None:
         return {"ok": True, "sent": 0, "reason": "queue_empty"}
 
@@ -896,7 +904,10 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
             )
             if not current.get("messages"):
                 reason = "send_recheck_empty_retry"
-                state.mark_ready(job["id"], reply_text=job["reply_text"])
+                if mode == "review":
+                    state.mark_approved_retry(job["id"], reply_text=job["reply_text"], reason=reason)
+                else:
+                    state.mark_ready(job["id"], reply_text=job["reply_text"])
                 state.append_event(
                     {
                         "type": "agent_send_recheck_empty",
@@ -984,8 +995,8 @@ def agent_loop(
     once: bool = False,
 ) -> dict:
     """Run the fast AI customer-service loop."""
-    if mode not in {"dry-run", "auto"}:
-        raise ValueError("mode must be dry-run or auto")
+    if mode not in {"dry-run", "auto", "review"}:
+        raise ValueError("mode must be dry-run, auto, or review")
 
     iterations = 0
     scanned = 0

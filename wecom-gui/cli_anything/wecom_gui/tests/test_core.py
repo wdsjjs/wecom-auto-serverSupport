@@ -3,14 +3,17 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from http.server import ThreadingHTTPServer
 from unittest import mock
+from urllib import request
 
 import pytest
 from click.testing import CliRunner
 
 from cli_anything.wecom_gui.core import agent, chat, inbox, llm, reply, state, watcher, worker
-from cli_anything.wecom_gui.core import sidebar_server
+from cli_anything.wecom_gui.core import review_server, sidebar_server
 from cli_anything.wecom_gui.core.sidebar_server import _bind_payload
 from cli_anything.wecom_gui.utils import macos_backend
 from cli_anything.wecom_gui.wecom_gui_cli import cli
@@ -2057,6 +2060,70 @@ def test_agent_send_recheck_allows_same_latest_text_with_misread_role(monkeypatc
     assert state.list_queue(status="done")[0]["title"] == "刘裕鑫"
 
 
+def test_review_mode_does_not_send_unapproved_ready_reply(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "鱼油怎么吃？", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    assert changed is True
+    latest = {"role": "用户", "text": "鱼油怎么吃？", "content": "鱼油怎么吃？"}
+    state.mark_drafting(item["id"], message_hash="hash1", messages=[latest], latest=latest)
+    state.mark_ready(item["id"], reply_text="鱼油建议随餐服用。")
+
+    sent = []
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: (_ for _ in ()).throw(AssertionError("should not open GUI")))
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_text",
+        lambda text, dry_run=False, submit=True: sent.append(text),
+    )
+
+    result = agent._send_one_ready(last=12, mode="review")
+
+    assert result["reason"] == "queue_empty"
+    assert sent == []
+    assert state.list_queue(status="ready")[0]["reply_text"] == "鱼油建议随餐服用。"
+
+
+def test_review_mode_sends_approved_reply(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "鱼油怎么吃？", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    assert changed is True
+    latest = {"role": "用户", "text": "鱼油怎么吃？", "content": "鱼油怎么吃？"}
+    state.mark_drafting(item["id"], message_hash="hash1", messages=[latest], latest=latest)
+    state.mark_ready(item["id"], reply_text="鱼油建议随餐服用。")
+    assert state.mark_approved(item["id"]) is True
+
+    reads = iter(
+        [
+            {
+                "hash": "precheck",
+                "messages": [{"role": "用户", "content": "鱼油怎么吃？", "text": "鱼油怎么吃？"}],
+            },
+            {
+                "hash": "after-send",
+                "messages": [
+                    {"role": "用户", "content": "鱼油怎么吃？", "text": "鱼油怎么吃？"},
+                    {"role": "客服", "content": "鱼油建议随餐服用。", "text": "鱼油建议随餐服用。"},
+                ],
+            },
+        ]
+    )
+    sent = []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_text",
+        lambda text, dry_run=False, submit=True: sent.append({"text": text, "dry_run": dry_run, "submit": submit}),
+    )
+
+    result = agent._send_one_ready(last=12, mode="review")
+
+    assert result["sent"] == 1
+    assert sent == [{"text": "鱼油建议随餐服用。", "dry_run": False, "submit": True}]
+    assert state.list_queue(status="done")[0]["title"] == "客户A"
+
+
 def test_agent_send_recheck_retries_empty_live_read(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "刘裕鑫", "preview": "鱼油怎么吃？", "time": "刚刚", "tags": ["@重庆邮电大学"], "raw": []}
@@ -2596,6 +2663,67 @@ def test_queue_lifecycle(monkeypatch, tmp_path):
     assert state.clear_queue() == 1
 
 
+def test_queue_isolates_same_title_by_external_uid(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    first_row = {
+        "title": "同名客户",
+        "preview": "第一位的问题",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "raw": [],
+        "external_userid": "wm_uid_001",
+    }
+    second_row = {
+        "title": "同名客户",
+        "preview": "第二位的问题",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "raw": [],
+        "external_userid": "wm_uid_002",
+    }
+
+    changed_first, first = state.enqueue_conversation(first_row, "sig-a")
+    changed_second, second = state.enqueue_conversation(second_row, "sig-b")
+
+    assert changed_first is True
+    assert changed_second is True
+    assert first["conversation_key"] == "uid:wm_uid_001"
+    assert second["conversation_key"] == "uid:wm_uid_002"
+    items = state.list_queue(status="pending")
+    assert len(items) == 2
+    assert sorted(item["preview"] for item in items) == ["第一位的问题", "第二位的问题"]
+
+
+def test_queue_isolates_same_title_by_visible_slot(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    first_row = {
+        "title": "同名客户",
+        "preview": "上方客户的问题",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "raw": [],
+        "source": "axuielement",
+        "click_y": 240.0,
+    }
+    second_row = {
+        "title": "同名客户",
+        "preview": "下方客户的问题",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "raw": [],
+        "source": "axuielement",
+        "click_y": 320.0,
+    }
+
+    changed_first, first = state.enqueue_conversation(first_row, "sig-a")
+    changed_second, second = state.enqueue_conversation(second_row, "sig-b")
+
+    assert changed_first is True
+    assert changed_second is True
+    assert first["conversation_key"] != second["conversation_key"]
+    assert len(state.list_queue(status="pending")) == 2
+
+
 def test_ready_queue_item_is_not_overwritten(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "旧问题", "time": "刚刚", "tags": ["@微信"], "raw": []}
@@ -2799,6 +2927,137 @@ def test_agent_debounce_keeps_initial_read_when_recheck_is_empty(monkeypatch, tm
     assert captured["messages"] == [{"role": "用户", "content": "订单现在到哪了？", "text": "订单现在到哪了？"}]
     stored = state.list_queue(status="drafting")[0]
     assert stored["last_message_hash"] == "initial-hash"
+
+
+def test_review_approve_and_reject_ready_items(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    ready_row = {"title": "客户A", "preview": "鱼油怎么吃", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    rejected_row = {"title": "客户B", "preview": "想退款", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(ready_row, "sig-ready")
+    state.enqueue_conversation(rejected_row, "sig-reject")
+    first = state.claim_pending_for_read()
+    second = state.claim_pending_for_read()
+    state.mark_drafting(
+        first["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "鱼油怎么吃"}],
+        latest={"role": "用户", "content": "鱼油怎么吃"},
+    )
+    state.mark_drafting(
+        second["id"],
+        message_hash="hash-b",
+        messages=[{"role": "用户", "content": "想退款"}],
+        latest={"role": "用户", "content": "想退款"},
+    )
+    state.mark_ready(first["id"], reply_text="每天一粒，随餐吃。")
+    state.mark_ready(second["id"], reply_text="我帮您转人工处理。")
+
+    assert review_server.approve_item(first["id"])["ok"] is True
+    assert state.get_job(first["id"])["status"] == "approved"
+    assert review_server.approve_item(first["id"])["ok"] is False
+
+    assert review_server.reject_item(second["id"])["ok"] is True
+    rejected = state.get_job(second["id"])
+    assert rejected["status"] == "skipped"
+    assert rejected["error"] == "review_rejected"
+
+
+def test_review_items_include_latest_context(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "旧预览", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "最新问题"}],
+        latest={"role": "用户", "content": "最新问题"},
+    )
+    state.mark_ready(job["id"], reply_text="审核回复")
+
+    items = review_server.list_review_items(status="ready")
+
+    assert len(items) == 1
+    assert items[0]["title"] == "客户A"
+    assert items[0]["latest_text"] == "最新问题"
+    assert items[0]["reply_text"] == "审核回复"
+    assert items[0]["conversation_key"]
+    assert items[0]["messages"][0]["role"] == "用户"
+    assert items[0]["messages"][0]["text"] == "最新问题"
+
+
+def test_mark_drafting_replaces_persisted_conversation_messages(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "旧预览", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[
+            {"role": "用户", "content": "第一条", "time": "10:00"},
+            {"role": "客服", "content": "已回复", "time": "10:01"},
+        ],
+        latest={"role": "用户", "content": "第一条"},
+    )
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-b",
+        messages=[{"role": "用户", "content": "第二条", "time": "10:02"}],
+        latest={"role": "用户", "content": "第二条"},
+    )
+
+    stored = state.list_conversation_messages(conversation_key=job["conversation_key"])
+
+    assert len(stored) == 1
+    assert stored[0]["message_hash"] == "hash-b"
+    assert stored[0]["role"] == "用户"
+    assert stored[0]["text"] == "第二条"
+
+
+def test_review_http_allows_actions_without_token(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "查订单", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "查订单"}],
+        latest={"role": "用户", "content": "查订单"},
+    )
+    state.mark_ready(job["id"], reply_text="请发我订单号。")
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), review_server.ReviewHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        with request.urlopen(f"{base}/api/review/items?status=ready", timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        assert payload["items"][0]["reply_text"] == "请发我订单号。"
+
+        approve_req = request.Request(
+            f"{base}/api/review/items/{job['id']}/approve",
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with request.urlopen(approve_req, timeout=5) as resp:
+            approved = json.loads(resp.read().decode("utf-8"))
+        assert approved["ok"] is True
+        assert state.get_job(job["id"])["status"] == "approved"
+
+        with request.urlopen(f"{base}/api/review/counts", timeout=5) as resp:
+            counts = json.loads(resp.read().decode("utf-8"))
+        assert counts["counts"]["approved"] == 1
+        for status in ["ready", "approved", "done", "skipped", "failed"]:
+            assert status in counts["counts"]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
 
 
 def test_finish_drafts_discards_stale_result_after_message_replaced(monkeypatch, tmp_path):
@@ -3466,6 +3725,43 @@ def test_fast_agent_skips_stale_context_before_send(monkeypatch, tmp_path):
     )
 
     result = agent._send_one_ready(last=12, mode="auto")
+
+    assert item["title"] == "客户A"
+    assert result["reason"] == "stale_context"
+    assert sent == []
+    assert state.list_queue(status="skipped")[0]["error"] == "stale_context"
+
+
+def test_review_mode_skips_stale_context_before_send(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "旧问题", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    _, item = state.enqueue_conversation(row, "sig1")
+    claimed = state.claim_pending_for_read()
+    state.mark_drafting(
+        claimed["id"],
+        message_hash="hash-old",
+        messages=[{"role": "用户", "content": "旧问题"}],
+        latest={"role": "用户", "content": "旧问题"},
+    )
+    state.mark_ready(claimed["id"], reply_text="旧回复")
+    assert state.mark_approved(claimed["id"]) is True
+    sent = []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=False: {
+            "ok": True,
+            "hash": "hash-new",
+            "messages": [{"role": "用户", "content": "新问题", "text": "新问题"}],
+        },
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_text",
+        lambda text, dry_run=False, submit=True: sent.append(text),
+    )
+
+    result = agent._send_one_ready(last=12, mode="review")
 
     assert item["title"] == "客户A"
     assert result["reason"] == "stale_context"

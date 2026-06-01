@@ -6,13 +6,14 @@ import json
 import os
 import sqlite3
 import time
+import hashlib
 from contextlib import contextmanager
 from pathlib import Path
 
 import fcntl
 
 
-ACTIVE_STATUSES = {"processing", "reading", "drafting", "ready", "sending"}
+ACTIVE_STATUSES = {"processing", "reading", "drafting", "ready", "approved", "sending"}
 REPLACEABLE_ACTIVE_STATUSES = {"processing", "reading", "drafting"}
 DONE_REOPEN_COOLDOWN_SECONDS = 60.0
 
@@ -63,11 +64,14 @@ def connect() -> sqlite3.Connection:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create queue tables if needed."""
+    if _reply_queue_needs_rebuild(conn):
+        _rebuild_reply_queue(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS reply_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL UNIQUE,
+            conversation_key TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL,
             preview TEXT NOT NULL DEFAULT '',
             time_text TEXT NOT NULL DEFAULT '',
             tags_json TEXT NOT NULL DEFAULT '[]',
@@ -88,10 +92,43 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(conn, "reply_queue", "conversation_key", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "reply_queue", "context_json", "TEXT")
     _ensure_column(conn, "reply_queue", "click_x", "REAL")
     _ensure_column(conn, "reply_queue", "click_y", "REAL")
     _ensure_column(conn, "reply_queue", "source", "TEXT")
+    _backfill_conversation_keys(conn)
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_reply_queue_conversation_key
+        ON reply_queue(conversation_key)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_key TEXT NOT NULL,
+            job_id INTEGER,
+            message_hash TEXT NOT NULL DEFAULT '',
+            seq INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL DEFAULT '',
+            time_text TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            role_confidence TEXT NOT NULL DEFAULT '',
+            media_json TEXT NOT NULL DEFAULT '[]',
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_conversation_messages_key
+        ON conversation_messages(conversation_key, created_at, seq)
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS wecom_customer_bindings (
@@ -114,10 +151,180 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _has_unique_title_constraint(conn: sqlite3.Connection) -> bool:
+    if not _table_exists(conn, "reply_queue"):
+        return False
+    for index in conn.execute("PRAGMA index_list(reply_queue)").fetchall():
+        if not index["unique"]:
+            continue
+        columns = [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
+        if columns == ["title"]:
+            return True
+    return False
+
+
+def _reply_queue_needs_rebuild(conn: sqlite3.Connection) -> bool:
+    if not _table_exists(conn, "reply_queue"):
+        return False
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(reply_queue)").fetchall()}
+    return "conversation_key" not in columns or _has_unique_title_constraint(conn)
+
+
+def _legacy_conversation_key(title: object) -> str:
+    value = str(title or "").strip()
+    return "legacy:" + hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _rebuild_reply_queue(conn: sqlite3.Connection) -> None:
+    backup = f"reply_queue_old_{int(time.time())}"
+    conn.execute(f"ALTER TABLE reply_queue RENAME TO {backup}")
+    conn.execute(
+        """
+        CREATE TABLE reply_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_key TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL,
+            preview TEXT NOT NULL DEFAULT '',
+            time_text TEXT NOT NULL DEFAULT '',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            raw_json TEXT NOT NULL DEFAULT '[]',
+            signature TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_message_hash TEXT,
+            context_json TEXT,
+            click_x REAL,
+            click_y REAL,
+            source TEXT,
+            reply_text TEXT,
+            error TEXT,
+            locked_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    old_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({backup})").fetchall()}
+    select_context = "context_json" if "context_json" in old_columns else "NULL AS context_json"
+    select_click_x = "click_x" if "click_x" in old_columns else "NULL AS click_x"
+    select_click_y = "click_y" if "click_y" in old_columns else "NULL AS click_y"
+    select_source = "source" if "source" in old_columns else "'' AS source"
+    rows = conn.execute(
+        f"""
+        SELECT id, title, preview, time_text, tags_json, raw_json, signature, status,
+               attempts, last_message_hash, {select_context}, {select_click_x},
+               {select_click_y}, {select_source}, reply_text, error, locked_at,
+               created_at, updated_at
+        FROM {backup}
+        ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            """
+            INSERT INTO reply_queue
+                (id, conversation_key, title, preview, time_text, tags_json, raw_json,
+                 signature, status, attempts, last_message_hash, context_json,
+                 click_x, click_y, source, reply_text, error, locked_at,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["id"],
+                _legacy_conversation_key(row["title"]),
+                row["title"],
+                row["preview"],
+                row["time_text"],
+                row["tags_json"],
+                row["raw_json"],
+                row["signature"],
+                row["status"],
+                row["attempts"],
+                row["last_message_hash"],
+                row["context_json"],
+                row["click_x"],
+                row["click_y"],
+                row["source"],
+                row["reply_text"],
+                row["error"],
+                row["locked_at"],
+                row["created_at"],
+                row["updated_at"],
+            ),
+        )
+    conn.execute(f"DROP TABLE {backup}")
+
+
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl_type: str) -> None:
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+
+
+def _backfill_conversation_keys(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, title
+        FROM reply_queue
+        WHERE COALESCE(conversation_key, '') = ''
+        """
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE reply_queue SET conversation_key = ? WHERE id = ?",
+            (_legacy_conversation_key(row["title"]), row["id"]),
+        )
+
+
+def _clean_key_part(value: object) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def _short_hash(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:20]
+
+
+def conversation_key_for_row(row: dict) -> str:
+    """Return the queue isolation key for a visible WeCom conversation row."""
+    for key in (
+        "conversation_key",
+        "external_userid",
+        "external_user_id",
+        "externalUserId",
+        "uid",
+        "user_id",
+        "conversation_id",
+        "chat_id",
+    ):
+        value = _clean_key_part(row.get(key))
+        if value:
+            if key == "conversation_key":
+                return value
+            prefix = "uid" if "user" in key.lower() or key == "uid" else "conversation"
+            return f"{prefix}:{value}"
+
+    title = _clean_key_part(row.get("title"))
+    tags = ",".join(_clean_key_part(tag) for tag in row.get("tags", []) if _clean_key_part(tag))
+    source = _clean_key_part(row.get("source"))
+    slot = ""
+    if row.get("click_y") is not None:
+        try:
+            slot = f"y{round(float(row.get('click_y')) / 12) * 12:.0f}"
+        except (TypeError, ValueError):
+            slot = ""
+    if not slot and row.get("index") is not None:
+        slot = f"i{_clean_key_part(row.get('index'))}"
+    if slot:
+        return "visible:" + _short_hash("|".join([title, tags, source, slot]))
+    return _legacy_conversation_key(title)
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
@@ -127,14 +334,14 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return item
 
 
-def _update_visible_row(conn: sqlite3.Connection, row: dict, signature: str, now: float) -> None:
+def _update_visible_row(conn: sqlite3.Connection, row: dict, signature: str, now: float, conversation_key: str) -> None:
     conn.execute(
         """
         UPDATE reply_queue
         SET preview = ?, time_text = ?, tags_json = ?, raw_json = ?,
             click_x = ?, click_y = ?, source = ?,
             signature = ?, updated_at = ?
-        WHERE title = ?
+        WHERE conversation_key = ?
         """,
         (
             row.get("preview", ""),
@@ -146,7 +353,7 @@ def _update_visible_row(conn: sqlite3.Connection, row: dict, signature: str, now
             row.get("source", ""),
             signature,
             now,
-            row.get("title", ""),
+            conversation_key,
         ),
     )
 
@@ -159,13 +366,14 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
     """
     now = time.time()
     row_has_unread = int(row.get("unread_count") or 0) > 0 or bool(row.get("unread"))
+    conversation_key = conversation_key_for_row(row)
     done_reopen_cooldown = float(
         os.environ.get("WECOM_GUI_DONE_REOPEN_COOLDOWN_SECONDS", DONE_REOPEN_COOLDOWN_SECONDS)
     )
     with connect() as conn:
         existing = conn.execute(
-            "SELECT * FROM reply_queue WHERE title = ?",
-            (row.get("title", ""),),
+            "SELECT * FROM reply_queue WHERE conversation_key = ?",
+            (conversation_key,),
         ).fetchone()
         if existing and existing["signature"] == signature:
             can_reopen_done = (
@@ -175,40 +383,40 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
             )
             can_reopen_inactive = existing["status"] in {"failed", "skipped"} and row_has_unread
             if can_reopen_done or can_reopen_inactive:
-                _update_visible_row(conn, row, signature, now)
+                _update_visible_row(conn, row, signature, now, conversation_key)
                 conn.execute(
                     """
                     UPDATE reply_queue
                     SET status = 'pending', error = NULL, locked_at = NULL,
                         context_json = NULL, last_message_hash = NULL, reply_text = NULL,
                         updated_at = ?
-                    WHERE title = ?
+                    WHERE conversation_key = ?
                     """,
-                    (now, row.get("title", "")),
+                    (now, conversation_key),
                 )
                 item = conn.execute(
-                    "SELECT * FROM reply_queue WHERE title = ?",
-                    (row.get("title", ""),),
+                    "SELECT * FROM reply_queue WHERE conversation_key = ?",
+                    (conversation_key,),
                 ).fetchone()
                 return True, _row_to_dict(item)
             return False, _row_to_dict(existing)
         if existing and existing["status"] in ACTIVE_STATUSES:
             same_preview = str(existing["preview"] or "").strip() == str(row.get("preview", "")).strip()
             if existing["status"] in REPLACEABLE_ACTIVE_STATUSES and row_has_unread and not same_preview:
-                _update_visible_row(conn, row, signature, now)
+                _update_visible_row(conn, row, signature, now, conversation_key)
                 conn.execute(
                     """
                     UPDATE reply_queue
                     SET status = 'pending', error = NULL, locked_at = NULL,
                         context_json = NULL, last_message_hash = NULL, reply_text = NULL,
                         updated_at = ?
-                    WHERE title = ?
+                    WHERE conversation_key = ?
                     """,
-                    (now, row.get("title", "")),
+                    (now, conversation_key),
                 )
                 item = conn.execute(
-                    "SELECT * FROM reply_queue WHERE title = ?",
-                    (row.get("title", ""),),
+                    "SELECT * FROM reply_queue WHERE conversation_key = ?",
+                    (conversation_key,),
                 ).fetchone()
                 return True, _row_to_dict(item)
             return False, _row_to_dict(existing)
@@ -218,14 +426,15 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
             and (existing["reply_text"] or "").strip()
             and (existing["reply_text"] or "").strip() == str(row.get("preview", "")).strip()
         ):
-            _update_visible_row(conn, row, signature, now)
+            _update_visible_row(conn, row, signature, now, conversation_key)
             item = conn.execute(
-                "SELECT * FROM reply_queue WHERE title = ?",
-                (row.get("title", ""),),
+                "SELECT * FROM reply_queue WHERE conversation_key = ?",
+                (conversation_key,),
             ).fetchone()
             return False, _row_to_dict(item)
 
         payload = (
+            conversation_key,
             row.get("title", ""),
             row.get("preview", ""),
             row.get("time", ""),
@@ -247,7 +456,7 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
                 SET preview = ?, time_text = ?, tags_json = ?, raw_json = ?,
                     click_x = ?, click_y = ?, source = ?,
                     signature = ?, status = ?, error = ?, updated_at = ?
-                WHERE title = ?
+                WHERE conversation_key = ?
                 """,
                 (
                     row.get("preview", ""),
@@ -261,22 +470,22 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
                     "pending",
                     None,
                     now,
-                    row.get("title", ""),
+                    conversation_key,
                 ),
             )
         else:
             conn.execute(
                 """
                 INSERT INTO reply_queue
-                    (title, preview, time_text, tags_json, raw_json,
+                    (conversation_key, title, preview, time_text, tags_json, raw_json,
                      click_x, click_y, source, signature, status, error, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 payload,
             )
         item = conn.execute(
-            "SELECT * FROM reply_queue WHERE title = ?",
-            (row.get("title", ""),),
+            "SELECT * FROM reply_queue WHERE conversation_key = ?",
+            (conversation_key,),
         ).fetchone()
         return True, _row_to_dict(item)
 
@@ -310,7 +519,28 @@ def get_job_by_title(title: str) -> dict | None:
     if not title:
         return None
     with connect() as conn:
-        row = conn.execute("SELECT * FROM reply_queue WHERE title = ?", (title,)).fetchone()
+        row = conn.execute(
+            """
+            SELECT * FROM reply_queue
+            WHERE title = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (title,),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def get_job_by_conversation_key(conversation_key: str) -> dict | None:
+    """Return a queued job by isolated conversation key."""
+    conversation_key = str(conversation_key or "").strip()
+    if not conversation_key:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM reply_queue WHERE conversation_key = ?",
+            (conversation_key,),
+        ).fetchone()
     return _row_to_dict(row) if row else None
 
 
@@ -485,6 +715,79 @@ def claim_ready_to_send() -> dict | None:
     return _claim_status("ready", "sending")
 
 
+def claim_approved_to_send() -> dict | None:
+    """Claim one web-approved job for final sending."""
+    return _claim_status("approved", "sending")
+
+
+def record_conversation_messages(
+    *,
+    conversation_key: str,
+    job_id: int | None,
+    message_hash: str,
+    messages: list[dict],
+) -> None:
+    """Persist the visible chat context used for drafting/review."""
+    if not conversation_key:
+        return
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM conversation_messages WHERE conversation_key = ?",
+            (conversation_key,),
+        )
+        for index, message in enumerate(messages):
+            text = str(message.get("content") or message.get("text") or "").strip()
+            media = message.get("media") if isinstance(message.get("media"), list) else []
+            conn.execute(
+                """
+                INSERT INTO conversation_messages
+                    (conversation_key, job_id, message_hash, seq, role, text,
+                     time_text, source, role_confidence, media_json, raw_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_key,
+                    job_id,
+                    message_hash,
+                    index,
+                    str(message.get("role") or ""),
+                    text,
+                    str(message.get("time") or ""),
+                    str(message.get("source") or ""),
+                    str(message.get("role_confidence") or ""),
+                    json.dumps(media, ensure_ascii=False),
+                    json.dumps(message, ensure_ascii=False),
+                    now,
+                ),
+            )
+
+
+def list_conversation_messages(*, conversation_key: str, limit: int = 20) -> list[dict]:
+    """Return persisted chat context for one conversation."""
+    conversation_key = str(conversation_key or "").strip()
+    if not conversation_key:
+        return []
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM conversation_messages
+            WHERE conversation_key = ?
+            ORDER BY seq ASC
+            LIMIT ?
+            """,
+            (conversation_key, limit),
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["media"] = json.loads(item.pop("media_json") or "[]")
+        item["raw"] = json.loads(item.pop("raw_json") or "{}")
+        items.append(item)
+    return items
+
+
 def mark_drafting(job_id: int, *, message_hash: str, messages: list[dict], latest: dict) -> None:
     now = time.time()
     latest_text = str(latest.get("content") or latest.get("text") or "").strip()
@@ -499,6 +802,8 @@ def mark_drafting(job_id: int, *, message_hash: str, messages: list[dict], lates
         "message_count": len(messages),
     }
     with connect() as conn:
+        row = conn.execute("SELECT conversation_key FROM reply_queue WHERE id = ?", (job_id,)).fetchone()
+        conversation_key = str(row["conversation_key"] if row else "")
         conn.execute(
             """
             UPDATE reply_queue
@@ -508,6 +813,12 @@ def mark_drafting(job_id: int, *, message_hash: str, messages: list[dict], lates
             """,
             (message_hash, json.dumps(context, ensure_ascii=False), now, job_id),
         )
+    record_conversation_messages(
+        conversation_key=conversation_key,
+        job_id=job_id,
+        message_hash=message_hash,
+        messages=messages,
+    )
 
 
 def mark_ready(job_id: int, *, reply_text: str) -> None:
@@ -522,6 +833,56 @@ def mark_ready(job_id: int, *, reply_text: str) -> None:
             """,
             (reply_text, now, job_id),
         )
+
+
+def mark_approved(job_id: int) -> bool:
+    """Approve a ready reply for agent-managed sending."""
+    now = time.time()
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE reply_queue
+            SET status = 'approved', error = NULL,
+                locked_at = NULL, updated_at = ?
+            WHERE id = ?
+              AND status = 'ready'
+              AND COALESCE(reply_text, '') != ''
+            """,
+            (now, job_id),
+        )
+        return cur.rowcount == 1
+
+
+def mark_approved_retry(job_id: int, *, reply_text: str, reason: str = "") -> None:
+    """Return an approved reply to the approved send queue after a retryable send check."""
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE reply_queue
+            SET status = 'approved', reply_text = ?, error = ?,
+                locked_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (reply_text, reason or None, now, job_id),
+        )
+
+
+def reject_ready(job_id: int, reason: str = "review_rejected") -> bool:
+    """Reject a ready reply from the review UI."""
+    now = time.time()
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE reply_queue
+            SET status = 'skipped', error = ?,
+                locked_at = NULL, updated_at = ?
+            WHERE id = ?
+              AND status = 'ready'
+            """,
+            (reason or "review_rejected", now, job_id),
+        )
+        return cur.rowcount == 1
 
 
 def mark_pending(job_id: int, reason: str = "") -> None:

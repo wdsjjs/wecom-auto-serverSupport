@@ -15,6 +15,7 @@ from cli_anything.wecom_gui.core import chat as chat_core
 from cli_anything.wecom_gui.core import inbox as inbox_core
 from cli_anything.wecom_gui.core import llm as llm_core
 from cli_anything.wecom_gui.core import reply as reply_core
+from cli_anything.wecom_gui.core import review_server
 from cli_anything.wecom_gui.core import sidebar_server
 from cli_anything.wecom_gui.core import state as state_core
 from cli_anything.wecom_gui.core import watcher
@@ -204,7 +205,7 @@ def queue_group() -> None:
 @click.option(
     "--status",
     default=None,
-    type=click.Choice(["pending", "processing", "reading", "drafting", "ready", "sending", "done", "failed", "skipped"]),
+    type=click.Choice(["pending", "processing", "reading", "drafting", "ready", "approved", "sending", "done", "failed", "skipped"]),
 )
 @click.option("--limit", default=50, show_default=True, type=click.IntRange(min=1))
 def queue_list(status: str | None, limit: int) -> None:
@@ -216,7 +217,7 @@ def queue_list(status: str | None, limit: int) -> None:
 @click.option(
     "--status",
     default=None,
-    type=click.Choice(["pending", "processing", "reading", "drafting", "ready", "sending", "done", "failed", "skipped"]),
+    type=click.Choice(["pending", "processing", "reading", "drafting", "ready", "approved", "sending", "done", "failed", "skipped"]),
 )
 def queue_clear(status: str | None) -> None:
     """Clear queued conversations."""
@@ -272,6 +273,14 @@ def sidebar_cmd(host: str, port: int) -> None:
     sidebar_server.serve_sidebar(host=host, port=port)
 
 
+@cli.command("review")
+@click.option("--host", default=None, help="Bind host. Defaults to WECOM_REVIEW_HOST or 0.0.0.0.")
+@click.option("--port", default=None, type=click.IntRange(min=1, max=65535), help="Bind port. Defaults to WECOM_REVIEW_PORT or 8122.")
+def review_cmd(host: str | None, port: int | None) -> None:
+    """Run the LAN reply review page and approval API."""
+    review_server.serve_review(host=host, port=port)
+
+
 @cli.command("worker")
 @click.option("--poll", default=2.0, show_default=True, type=click.FloatRange(min=1.0))
 @click.option("--last", default=12, show_default=True, type=click.IntRange(min=1))
@@ -290,7 +299,7 @@ def worker_cmd(poll: float, last: int, mode: str, once: bool) -> None:
 @click.option("--scroll-ticks", default=6, show_default=True, type=click.IntRange(min=1, max=120))
 @click.option("--deep-scan-interval", default=30.0, show_default=True, type=click.FloatRange(min=1.0))
 @click.option("--last", default=12, show_default=True, type=click.IntRange(min=1))
-@click.option("--mode", default="dry-run", show_default=True, type=click.Choice(["dry-run", "auto"]))
+@click.option("--mode", default="dry-run", show_default=True, type=click.Choice(["dry-run", "auto", "review"]))
 @click.option("--max-drafts", default=4, show_default=True, type=click.IntRange(min=1, max=16))
 @click.option("--log-interval", default=5.0, show_default=True, type=click.FloatRange(min=1.0))
 @click.option("--once", is_flag=True, help="Run one fast-agent tick then exit.")

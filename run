@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+AGENT_DIR="$ROOT_DIR/wecom-gui"
+ENV_FILE="$AGENT_DIR/.env.local"
+APP_NAME="企业微信"
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+APP_NAME="${WECOM_GUI_APP_NAME:-$APP_NAME}"
+if [[ -z "${SDKROOT:-}" && -d "/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk" ]]; then
+  export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk"
+fi
+
+is_app_running() {
+  osascript -e "tell application \"System Events\" to exists process \"$APP_NAME\"" 2>/dev/null | grep -qi true
+}
+
+focus_or_open_app() {
+  if is_app_running; then
+    osascript -e "tell application \"System Events\" to set frontmost of process \"$APP_NAME\" to true" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  echo "Starting $APP_NAME..."
+  if [[ -d "/Applications/$APP_NAME.app" ]]; then
+    open -a "$APP_NAME"
+  elif [[ "$APP_NAME" == "企业微信" && -d "/Applications/WeCom.app" ]]; then
+    open -a "WeCom"
+  else
+    open -a "$APP_NAME"
+  fi
+}
+
+wait_for_wecom() {
+  local attempts="${WECOM_RUN_WAIT_ATTEMPTS:-30}"
+  local delay="${WECOM_RUN_WAIT_DELAY:-1}"
+  local i
+  for ((i = 1; i <= attempts; i++)); do
+    if is_app_running; then
+      osascript -e "tell application \"System Events\" to set frontmost of process \"$APP_NAME\" to true" >/dev/null 2>&1 || true
+      return 0
+    fi
+    sleep "$delay"
+  done
+  echo "ERROR: $APP_NAME did not start after $attempts attempts." >&2
+  echo "Open $APP_NAME manually, grant Accessibility permission to Terminal/Codex if prompted, then run ./run again." >&2
+  return 1
+}
+
+wait_for_ax_geometry() {
+  local attempts="${WECOM_RUN_AX_ATTEMPTS:-20}"
+  local delay="${WECOM_RUN_AX_DELAY:-1}"
+  local i output
+  for ((i = 1; i <= attempts; i++)); do
+    output="$(cd "$AGENT_DIR" && ./scripts/wecom-agent preflight 2>&1 || true)"
+    if grep -q "Preflight OK:" <<<"$output"; then
+      return 0
+    fi
+    if (( i == attempts )); then
+      echo "$output" >&2
+      echo "ERROR: $APP_NAME is running, but automation preflight did not pass." >&2
+      echo "Check that $APP_NAME is logged in and visible, and that Terminal/Codex has Accessibility permission." >&2
+      return 1
+    fi
+    sleep "$delay"
+  done
+}
+
+focus_or_open_app
+wait_for_wecom
+wait_for_ax_geometry
+
+cd "$AGENT_DIR"
+./scripts/wecom-agent start
+if [[ "${WECOM_AGENT_MODE:-review}" == "review" ]]; then
+  ./scripts/wecom-agent review-start
+fi
+
+echo
+./scripts/wecom-agent status
+if [[ "${WECOM_AGENT_MODE:-review}" == "review" ]]; then
+  ./scripts/wecom-agent review-status
+fi
+echo
+echo "Log:"
+echo "  $AGENT_DIR/.codex-run/wecom-agent.log"
+if [[ "${WECOM_AGENT_MODE:-review}" == "review" ]]; then
+  echo "Review log:"
+  echo "  $AGENT_DIR/.codex-run/wecom-review.log"
+fi
+echo
+echo "Follow logs:"
+echo "  cd \"$AGENT_DIR\" && ./scripts/wecom-agent logs"

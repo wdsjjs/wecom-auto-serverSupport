@@ -9,6 +9,8 @@ PID_FILE="$RUN_DIR/wecom-agent.pid"
 ENV_FILE="${WECOM_AGENT_ENV:-$ROOT_DIR/.env.local}"
 SIDEBAR_SESSION_NAME="${WECOM_SIDEBAR_SESSION:-wecom-sidebar-8111}"
 SIDEBAR_LOG_FILE="${WECOM_SIDEBAR_LOG:-$RUN_DIR/wecom-sidebar.log}"
+REVIEW_SESSION_NAME="${WECOM_REVIEW_SESSION:-wecom-review}"
+REVIEW_LOG_FILE="${WECOM_REVIEW_LOG:-$RUN_DIR/wecom-review.log}"
 
 cd "$ROOT_DIR"
 mkdir -p "$RUN_DIR"
@@ -27,7 +29,7 @@ if [[ -z "${SDKROOT:-}" && -d "/Library/Developer/CommandLineTools/SDKs/MacOSX15
   export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk"
 fi
 
-MODE="${WECOM_AGENT_MODE:-auto}"
+MODE="${WECOM_AGENT_MODE:-review}"
 POLL="${WECOM_AGENT_POLL:-0.5}"
 SCAN_INTERVAL="${WECOM_AGENT_SCAN_INTERVAL:-1}"
 INBOX_LIMIT="${WECOM_AGENT_INBOX_LIMIT:-8}"
@@ -216,6 +218,12 @@ sidebar_running() {
   printf '%s\n' "$listing" | awk -v name="$SIDEBAR_SESSION_NAME" '{ first = $1; sub("^[0-9]+[.]", "", first); if (first == name) found = 1 } END { exit found ? 0 : 1 }'
 }
 
+review_running() {
+  local listing
+  listing="$(screen -ls 2>/dev/null || true)"
+  printf '%s\n' "$listing" | awk -v name="$REVIEW_SESSION_NAME" '{ first = $1; sub("^[0-9]+[.]", "", first); if (first == name) found = 1 } END { exit found ? 0 : 1 }'
+}
+
 write_header() {
   {
     printf 'START_TS=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
@@ -309,7 +317,58 @@ stop_sidebar() {
   fi
 }
 
+start_review() {
+  if review_running; then
+    echo "already running: $REVIEW_SESSION_NAME"
+    tail -n 5 "$REVIEW_LOG_FILE" 2>/dev/null || true
+    return 0
+  fi
+  : > "$REVIEW_LOG_FILE"
+  local command
+  command="cd '$ROOT_DIR' && PYTHONPATH='$PYTHONPATH_VALUE' '$PYTHON_BIN' -u -m cli_anything.wecom_gui review >> '$REVIEW_LOG_FILE' 2>&1"
+  screen -dmS "$REVIEW_SESSION_NAME" zsh -lc "$command"
+  sleep 1
+  echo "started: $REVIEW_SESSION_NAME"
+  tail -n 10 "$REVIEW_LOG_FILE"
+}
+
+stop_review() {
+  if review_running; then
+    screen -S "$REVIEW_SESSION_NAME" -X quit
+    echo "stopped: $REVIEW_SESSION_NAME"
+  else
+    echo "not running: $REVIEW_SESSION_NAME"
+  fi
+  local stale_pids
+  stale_pids="$(pgrep -f "cli_anything\\.wecom_gui review" 2>/dev/null || true)"
+  if [[ -n "$stale_pids" ]]; then
+    printf '%s\n' "$stale_pids" | xargs kill 2>/dev/null || true
+    echo "stopped stale review process(es)"
+  fi
+}
+
+status_review() {
+  if review_running; then
+    echo "running: $REVIEW_SESSION_NAME"
+    screen -ls | grep "[.]${REVIEW_SESSION_NAME}[[:space:]]" || true
+  else
+    echo "stopped: $REVIEW_SESSION_NAME"
+  fi
+  if [[ -f "$REVIEW_LOG_FILE" ]]; then
+    echo "log: $REVIEW_LOG_FILE"
+    tail -n 5 "$REVIEW_LOG_FILE"
+  fi
+}
+
+logs_review() {
+  touch "$REVIEW_LOG_FILE"
+  tail -f "$REVIEW_LOG_FILE"
+}
+
 case "${1:-start}" in
+  preflight|--preflight-only)
+    preflight_agent
+    ;;
   start)
     start_agent
     ;;
@@ -327,6 +386,23 @@ case "${1:-start}" in
   logs)
     logs_agent
     ;;
+  review-start)
+    start_review
+    ;;
+  review-stop)
+    stop_review
+    ;;
+  review-restart)
+    stop_review
+    sleep 1
+    start_review
+    ;;
+  review-status)
+    status_review
+    ;;
+  review-logs)
+    logs_review
+    ;;
   sidebar-start)
     start_sidebar
     ;;
@@ -339,7 +415,7 @@ case "${1:-start}" in
     start_sidebar
     ;;
   *)
-    echo "usage: $0 {start|stop|restart|status|logs|sidebar-start|sidebar-stop|sidebar-restart}" >&2
+    echo "usage: $0 {preflight|start|stop|restart|status|logs|review-start|review-stop|review-restart|review-status|review-logs|sidebar-start|sidebar-stop|sidebar-restart}" >&2
     exit 2
     ;;
 esac

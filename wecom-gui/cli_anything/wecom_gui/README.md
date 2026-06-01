@@ -1,12 +1,16 @@
 # cli-anything-wecom-gui
 
-CLI-Anything harness for WeCom desktop GUI customer-service automation.
+`cli-anything-wecom-gui` drives the WeCom desktop app on macOS for
+customer-service workflows where no official external-contact send/receive API
+is available.
 
-This harness is for situations where external-contact customer messages cannot
-be handled through an official send/receive API. It drives the desktop GUI with
-macOS Accessibility and AppleScript.
+It reads visible conversations through macOS Accessibility, drafts replies,
+stores them in a local SQLite queue, and sends only through a locked,
+rechecked GUI path.
 
 ## Install
+
+From `wecom-gui`:
 
 ```bash
 pip install -e .
@@ -18,33 +22,135 @@ This exposes:
 cli-anything-wecom-gui
 ```
 
-## Quick Validation
+The repository's npm scripts are just shortcuts around the same Python module.
+
+## Validation
+
+Run these before any live sending:
 
 ```bash
 cli-anything-wecom-gui doctor
 cli-anything-wecom-gui app focus
-cli-anything-wecom-gui inbox scan --json
-cli-anything-wecom-gui chat open --name "客户A"
-cli-anything-wecom-gui chat read --last 10 --json
+cli-anything-wecom-gui inbox scan --limit 5
+cli-anything-wecom-gui chat read --last 12
 cli-anything-wecom-gui reply send --text "您好，我帮您看一下" --dry-run
 ```
 
-If your app is not named `企业微信`, `WeCom`, or `WeChat Work`, set:
+If the app name is not detected:
 
 ```bash
-export WECOM_GUI_APP_NAME="Your App Name"
+export WECOM_GUI_APP_NAME=企业微信
 ```
 
-## AI Drafting
+## Agent Modes
 
-UDA single-question drafting is the default provider:
+The fast agent scans, reads, drafts concurrently, then sends through one GUI
+lock.
+
+Dry run:
 
 ```bash
-export WECOM_GUI_UDA_API_KEY=...
-cli-anything-wecom-gui ai draft --last 10 --provider uda --json
+python -u -m cli_anything.wecom_gui agent --mode dry-run --poll 0.5 --scan-interval 1 --inbox-limit 5 --max-drafts 4 --last 12 --log-interval 5
 ```
 
-The request body is:
+Review mode:
+
+```bash
+python -u -m cli_anything.wecom_gui agent --mode review --poll 0.5 --scan-interval 1 --inbox-limit 5 --max-drafts 4 --last 12 --log-interval 5
+```
+
+Auto mode:
+
+```bash
+python -u -m cli_anything.wecom_gui agent --mode auto --poll 0.5 --scan-interval 1 --inbox-limit 5 --max-drafts 4 --last 12 --log-interval 5
+```
+
+Modes:
+
+- `dry-run`: generate drafts and mark work complete without sending.
+- `review`: generate drafts, wait for web approval, then recheck and send.
+- `auto`: recheck and send ready drafts automatically.
+
+## Review Page
+
+Start the review server:
+
+```bash
+python -m cli_anything.wecom_gui review --host 0.0.0.0 --port 8122
+```
+
+Or from `wecom-gui`:
+
+```bash
+npm run review
+```
+
+Or as a background screen session:
+
+```bash
+./scripts/wecom-agent review-start
+./scripts/wecom-agent review-status
+./scripts/wecom-agent review-logs
+```
+
+The server prints a URL with a token:
+
+```text
+http://192.168.x.x:8122/
+```
+
+The browser can list pending drafts, approve them, or reject them. Approval
+only moves a queue item from `ready` to `approved`; the agent still performs the
+send-time context check before touching WeCom.
+
+Review API:
+
+```text
+GET  /api/review/items?status=ready
+GET  /api/review/counts
+POST /api/review/items/{id}/approve
+POST /api/review/items/{id}/reject
+```
+
+The review page reads live queue items from the local SQLite state database
+under `~/.cli-anything-wecom-gui/state.sqlite`; it does not serve mock items.
+
+## Queue States
+
+```text
+pending       scanned and waiting to be opened
+reading       agent is opening/reading the chat
+drafting      AI draft is in flight
+ready         draft is ready; in review mode this means waiting for approval
+approved      reviewer approved the draft; agent may send after recheck
+sending       agent is reopening/rechecking/sending
+done          finished
+skipped       intentionally not sent
+failed        error while reading, drafting, or sending
+```
+
+Useful queue commands:
+
+```bash
+cli-anything-wecom-gui queue list --limit 20
+cli-anything-wecom-gui queue list --status ready
+cli-anything-wecom-gui queue list --status approved
+cli-anything-wecom-gui queue clear --status done
+```
+
+## Drafting Providers
+
+Provider selection is controlled by `WECOM_GUI_AI_PROVIDER`.
+
+Common values:
+
+- `pi`: local Pi coding-agent provider configured by the installer.
+- `uda`: UDA single-question API.
+- `codex`: Codex CLI based drafting.
+- `openai`: OpenAI-compatible HTTP endpoint.
+- `fallback`: safe static fallback for calibration.
+
+UDA format:
 
 ```json
 {
@@ -56,94 +162,59 @@ The request body is:
 }
 ```
 
-`ai draft` returns the reply as both `text` and `message`. It accepts both UDA
-response shapes: `data.message` and top-level `message`.
+The UDA response is read from `data.message` or top-level `message`.
 
-History behavior:
+## Filtering Defaults
 
-- Default: `WECOM_GUI_UDA_HISTORY_MODE=recent`, sends recent messages ending at
-  the latest `用户` message.
-- `WECOM_GUI_UDA_HISTORY_MAX=8` controls how many recent messages are included.
-- `WECOM_GUI_UDA_HISTORY_MODE=latest_user` sends only the latest user message.
-- `WECOM_GUI_UDA_HISTORY_MODE=full` sends all visible messages from `chat read`.
+By default the agent ignores:
 
-Without an API key, `ai draft` returns a safe fallback reply:
+- rows without `@微信`;
+- rows without unread badges;
+- external groups;
+- system or department rows;
+- very long technical text;
+- token/header/API-key-like text.
 
-```bash
-cli-anything-wecom-gui ai draft --last 10
+Important switches:
+
+```env
+WECOM_GUI_REQUIRE_WECHAT_TAG=1
+WECOM_GUI_REQUIRE_UNREAD=1
+WECOM_GUI_ALLOW_UNTAGGED=0
+WECOM_GUI_INCLUDE_EXTERNAL_GROUPS=0
 ```
 
-With an OpenAI-compatible endpoint:
+Keep these defaults for production. Relax them only while calibrating a target
+WeCom build.
+
+## npm Shortcuts
+
+From `wecom-gui`:
 
 ```bash
-export OPENAI_API_KEY=...
-export OPENAI_BASE_URL=https://api.openai.com/v1
-export OPENAI_MODEL=gpt-4o-mini
-cli-anything-wecom-gui ai draft --last 10 --provider openai
+npm run doctor
+npm run dev:dry
+./scripts/wecom-agent start
+./scripts/wecom-agent review-start
+npm run queue
+npm run agent:start
+npm run agent:stop
+npm run agent:logs
 ```
 
-## AI Agent Mode
-
-Recommended real customer-service loop:
+`npm run dev` starts `agent --mode auto` and is intended only for explicit auto
+mode testing. For review-gated production, prefer:
 
 ```bash
-export WECOM_GUI_UDA_API_KEY=...
-python -u -m cli_anything.wecom_gui agent --mode auto --poll 0.5 --scan-interval 1 --max-drafts 4 --last 12 --log-interval 5
+WECOM_AGENT_MODE=review ./scripts/wecom-agent start
+./scripts/wecom-agent review-start
 ```
 
-For a non-sending rehearsal:
+## Tests
 
 ```bash
-python -u -m cli_anything.wecom_gui agent --mode dry-run --poll 0.5 --scan-interval 1 --max-drafts 4 --last 12 --log-interval 5
+python -m pytest -q cli_anything/wecom_gui/tests
 ```
 
-`agent` behaves like an AI customer-service dispatcher:
-
-- scan inbox rows into the local SQLite queue;
-- briefly open new customer chats and read recent context;
-- send AI draft requests concurrently while continuing to scan/read others;
-- when a draft is ready, re-open that customer and send it;
-- skip stale replies if the customer's latest message changed while AI was
-  drafting.
-
-GUI operations are still serialized with a global process lock. AI waiting is
-not serialized, so several customers can have drafts in flight at the same time.
-
-Useful queue commands:
-
-```bash
-cli-anything-wecom-gui queue list --json
-cli-anything-wecom-gui queue list --status drafting --json
-cli-anything-wecom-gui queue list --status ready --json
-cli-anything-wecom-gui queue clear --status done
-```
-
-Modes:
-
-- `dry-run`: draft and log only.
-- `auto`: send automatically.
-
-By default, scan-only filters out very long technical text, token/header-like
-content, department rows, external group rows, rows without an `@微信` tag, and
-rows with `unread_count == 0`.
-Set `WECOM_GUI_ALLOW_UNTAGGED=1` only after verifying your WeCom build exposes
-single external contacts without tags. Set `WECOM_GUI_INCLUDE_EXTERNAL_GROUPS=1`
-only if group replies are deliberately in scope.
-Set `WECOM_GUI_REQUIRE_UNREAD=0` only for manual debugging of preview/time
-change detection.
-
-The older two-process queue flow is still available for debugging:
-
-```bash
-cli-anything-wecom-gui watch --scan-only --poll 5 --inbox-limit 12
-cli-anything-wecom-gui worker --poll 2 --last 12 --mode approve
-```
-
-The single-chat loop is still available for calibration:
-
-```bash
-cli-anything-wecom-gui watch --poll 5 --last 10 --mode approve
-```
-
-`inbox scan` and `chat open` are accessibility heuristics in this version. Use
-them to calibrate the target desktop before enabling `agent --mode auto`.
+Unit tests monkeypatch GUI backends and should not click the real desktop.
+Manual GUI validation still requires WeCom to be open and visible.

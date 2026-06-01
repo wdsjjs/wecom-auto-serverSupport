@@ -5,9 +5,12 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 cd "$ROOT_DIR/wecom-gui"
 ./scripts/wecom-agent stop
+./scripts/wecom-agent review-stop
 
 pkill -f 'cli_anything\.wecom_gui agent' 2>/dev/null || true
+pkill -f 'cli_anything\.wecom_gui review' 2>/dev/null || true
 pkill -f 'SCREEN -dmS wecom-agent' 2>/dev/null || true
+pkill -f 'SCREEN -dmS wecom-review' 2>/dev/null || true
 
 echo
 echo "已停止。"

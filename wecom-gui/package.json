@@ -6,6 +6,7 @@
     "dev:dry": "set -a; . ./.env.local; set +a; PYTHONPATH=${WECOM_GUI_PYTHONPATH:-} ${WECOM_GUI_PYTHON:-python3} -u -m cli_anything.wecom_gui agent --mode dry-run --poll 0.5 --scan-interval 1 --inbox-limit 5 --max-drafts 4 --last 12 --log-interval 5",
     "doctor": "set -a; . ./.env.local; set +a; PYTHONPATH=${WECOM_GUI_PYTHONPATH:-} ${WECOM_GUI_PYTHON:-python3} -m cli_anything.wecom_gui --json doctor",
     "queue": "set -a; . ./.env.local; set +a; PYTHONPATH=${WECOM_GUI_PYTHONPATH:-} ${WECOM_GUI_PYTHON:-python3} -m cli_anything.wecom_gui --json queue list --limit 20",
+    "review": "set -a; . ./.env.local; set +a; PYTHONPATH=${WECOM_GUI_PYTHONPATH:-} ${WECOM_GUI_PYTHON:-python3} -u -m cli_anything.wecom_gui review",
     "agent:start": "./scripts/wecom-agent start",
     "agent:stop": "./scripts/wecom-agent stop",
     "agent:restart": "./scripts/wecom-agent restart",
