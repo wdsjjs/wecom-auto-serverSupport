@@ -55,6 +55,7 @@ REVIEW_HTML = """<!doctype html>
         font-size: 14px;
       }
       button.primary { border-color: #165dff; background: #165dff; color: #fff; }
+      button.secondary { border-color: #165dff; color: #165dff; }
       button.danger { border-color: #d92d20; color: #d92d20; }
       button:disabled { opacity: .55; cursor: not-allowed; }
       .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -68,6 +69,7 @@ REVIEW_HTML = """<!doctype html>
         font-size: 13px;
         color: #4e5969;
       }
+      .count.active { border-color: #165dff; color: #165dff; background: #f2f6ff; }
       .count strong { color: #1f2329; margin-left: 4px; }
       .list { display: grid; gap: 12px; }
       .item {
@@ -95,6 +97,19 @@ REVIEW_HTML = """<!doctype html>
         line-height: 1.5;
       }
       .reply { background: #f2f6ff; border-color: #c9dcff; }
+      textarea.reply-editor {
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 112px;
+        resize: vertical;
+        border: 1px solid #c9dcff;
+        border-radius: 6px;
+        background: #f2f6ff;
+        color: #1f2329;
+        padding: 10px;
+        font: inherit;
+        line-height: 1.5;
+      }
       .conversation {
         border: 1px solid #e5e6eb;
         border-radius: 6px;
@@ -161,6 +176,7 @@ REVIEW_HTML = """<!doctype html>
       const countsEl = document.getElementById("counts");
       const listEl = document.getElementById("list");
       const refreshBtn = document.getElementById("refresh");
+      let selectedStatus = "ready";
       const labels = {
         pending: "待读取",
         reading: "读取中",
@@ -172,6 +188,8 @@ REVIEW_HTML = """<!doctype html>
         skipped: "已拒绝/跳过",
         failed: "失败"
       };
+      const visibleStatuses = ["pending", "reading", "drafting", "ready", "approved", "sending", "done", "skipped", "failed"];
+      const replyDrafts = new Map();
       function authHeaders(extra = {}) {
         return { ...extra };
       }
@@ -201,9 +219,10 @@ REVIEW_HTML = """<!doctype html>
         return data;
       }
       function renderCounts(counts) {
-        const keys = ["ready", "approved", "sending", "done", "skipped", "failed"];
-        countsEl.innerHTML = keys.map(key => (
-          `<div class="count">${labels[key] || key}<strong>${Number(counts[key] || 0)}</strong></div>`
+        countsEl.innerHTML = visibleStatuses.map(key => (
+          `<button class="count ${key === selectedStatus ? "active" : ""}" data-status="${key}">
+            ${labels[key] || key}<strong>${Number(counts[key] || 0)}</strong>
+          </button>`
         )).join("");
       }
       function roleClass(message) {
@@ -236,7 +255,7 @@ REVIEW_HTML = """<!doctype html>
       }
       function renderItems(items) {
         if (!items.length) {
-          listEl.innerHTML = '<div class="empty">暂无待审核回复。通过后仍需后台 agent 完成发送前复核。</div>';
+          listEl.innerHTML = `<div class="empty">暂无${escapeText(labels[selectedStatus] || selectedStatus)}记录。</div>`;
           return;
         }
         listEl.innerHTML = items.map(item => `
@@ -250,22 +269,50 @@ REVIEW_HTML = """<!doctype html>
             </div>
             <div class="label">会话上下文</div>
             ${renderMessages(item.messages, item.latest_text || item.preview || "")}
-            <div class="label">AI 回复</div>
-            <div class="box reply">${escapeText(item.reply_text || "")}</div>
+            <div class="label">回复内容</div>
+            ${item.status === "ready" ? `
+              <textarea class="reply-editor" data-id="${item.id}" placeholder="可以修改 AI 生成内容，或直接写客服自己的回复">${escapeText(replyTextFor(item))}</textarea>
+            ` : `<div class="box reply">${escapeText(item.reply_text || "")}</div>`}
             ${item.error ? `<div class="label">备注</div><div class="box error">${escapeText(item.error)}</div>` : ""}
-            <div class="actions">
-              <button class="danger" data-action="reject" data-id="${item.id}">拒绝</button>
-              <button class="primary" data-action="approve" data-id="${item.id}">通过</button>
-            </div>
+            ${renderActions(item)}
           </article>
         `).join("");
       }
+      function renderActions(item) {
+        if (item.status === "ready") {
+          return `
+            <div class="actions">
+              <button class="secondary" data-action="regenerate" data-id="${item.id}">重新生成</button>
+              <button class="secondary" data-action="save" data-id="${item.id}">保存修改</button>
+              <button class="danger" data-action="reject" data-id="${item.id}">拒绝</button>
+              <button class="primary" data-action="approve" data-id="${item.id}">通过</button>
+            </div>
+          `;
+        }
+        if (item.status === "skipped" || item.status === "failed") {
+          return `
+            <div class="actions">
+              <button class="secondary" data-action="regenerate" data-id="${item.id}">重新生成</button>
+            </div>
+          `;
+        }
+        return "";
+      }
+      function replyTextFor(item) {
+        const key = String(item.id);
+        return replyDrafts.has(key) ? replyDrafts.get(key) : (item.reply_text || "");
+      }
+      function isEditingReply() {
+        const active = document.activeElement;
+        return !!active && active.matches && active.matches("textarea.reply-editor");
+      }
       async function refresh() {
+        if (isEditingReply()) return;
         try {
           refreshBtn.disabled = true;
           const [counts, items] = await Promise.all([
             api("/api/review/counts"),
-            api("/api/review/items?status=ready")
+            api(`/api/review/items?status=${encodeURIComponent(selectedStatus)}`)
           ]);
           renderCounts(counts.counts || {});
           renderItems(items.items || []);
@@ -278,13 +325,25 @@ REVIEW_HTML = """<!doctype html>
       }
       async function act(id, action) {
         const buttons = document.querySelectorAll(`button[data-id="${id}"]`);
+        const editor = document.querySelector(`textarea[data-id="${id}"]`);
+        const body = {};
+        if ((action === "approve" || action === "save") && editor) {
+          const replyText = editor.value.trim();
+          if (!replyText) {
+            setStatus("回复内容不能为空。", true);
+            return;
+          }
+          body.reply_text = editor.value;
+          replyDrafts.set(String(id), editor.value);
+        }
         buttons.forEach(btn => btn.disabled = true);
         try {
           await api(`/api/review/items/${id}/${action}`, {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({})
+            body: JSON.stringify(body)
           });
+          replyDrafts.delete(String(id));
           await refresh();
         } catch (err) {
           setStatus(String(err.message || err), true);
@@ -295,6 +354,17 @@ REVIEW_HTML = """<!doctype html>
         const button = event.target.closest("button[data-action]");
         if (!button) return;
         act(button.dataset.id, button.dataset.action);
+      });
+      listEl.addEventListener("input", (event) => {
+        const editor = event.target.closest("textarea[data-id]");
+        if (!editor) return;
+        replyDrafts.set(String(editor.dataset.id), editor.value);
+      });
+      countsEl.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-status]");
+        if (!button) return;
+        selectedStatus = button.dataset.status || "ready";
+        refresh();
       });
       refreshBtn.addEventListener("click", refresh);
       refresh();
@@ -405,7 +475,7 @@ def _review_item(item: dict) -> dict:
 
 
 def list_review_items(*, status: str = "ready", limit: int = 100) -> list[dict]:
-    allowed = {"ready", "approved", "sending", "done", "skipped", "failed"}
+    allowed = {"pending", "reading", "drafting", "ready", "approved", "sending", "done", "skipped", "failed"}
     selected_status = status if status in allowed else "ready"
     items = state.list_queue(status=selected_status, limit=limit)
     return [_review_item(item) for item in items]
@@ -413,7 +483,7 @@ def list_review_items(*, status: str = "ready", limit: int = 100) -> list[dict]:
 
 def review_counts() -> dict[str, int]:
     counts = state.queue_counts()
-    for status in ("ready", "approved", "sending", "done", "skipped", "failed"):
+    for status in ("pending", "reading", "drafting", "ready", "approved", "sending", "done", "skipped", "failed"):
         counts.setdefault(status, 0)
     return counts
 

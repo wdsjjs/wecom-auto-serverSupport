@@ -3049,6 +3049,70 @@ def test_review_items_include_latest_context(monkeypatch, tmp_path):
     assert items[0]["messages"][0]["text"] == "最新问题"
 
 
+def test_review_items_include_reply_message_category(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "新问题", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[
+            {"role": "用户", "content": "新问题"},
+            {"role": "客服", "content": "旧回复"},
+        ],
+        latest={"role": "用户", "content": "新问题"},
+    )
+    state.mark_ready(job["id"], reply_text="审核回复")
+
+    item = review_server.list_review_items(status="ready")[0]
+
+    assert [message["message_type"] for message in item["messages"]] == ["customer", "reply"]
+
+
+def test_review_status_filters_include_rejected_items(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "退款", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "退款"}],
+        latest={"role": "用户", "content": "退款"},
+    )
+    state.mark_ready(job["id"], reply_text="我帮您转人工。")
+    assert review_server.reject_item(job["id"])["ok"] is True
+
+    skipped_items = review_server.list_review_items(status="skipped")
+    counts = review_server.review_counts()
+
+    assert len(skipped_items) == 1
+    assert skipped_items[0]["status"] == "skipped"
+    assert counts["skipped"] == 1
+
+
+def test_review_approve_can_use_human_edited_reply(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "查订单", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "查订单"}],
+        latest={"role": "用户", "content": "查订单"},
+    )
+    state.mark_ready(job["id"], reply_text="AI原文")
+
+    result = review_server.approve_item(job["id"], reply_text="客服改写")
+
+    assert result["ok"] is True
+    approved = state.get_job(job["id"])
+    assert approved["status"] == "approved"
+    assert approved["reply_text"] == "客服改写"
+
+
 def test_review_items_classify_customer_reply_and_unknown_messages(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "我想咨询", "time": "刚刚", "tags": ["@微信"], "raw": []}
