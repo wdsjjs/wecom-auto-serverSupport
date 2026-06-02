@@ -117,6 +117,35 @@ def test_done_queue_item_reopens_when_same_signature_still_has_unread(monkeypatc
     assert existing["reply_text"] is None
     assert state.list_queue(status="pending")[0]["title"] == "客户A"
 
+
+def test_read_only_done_item_is_not_reopened_by_same_unread_signature(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    monkeypatch.setenv("WECOM_GUI_DONE_REOPEN_COOLDOWN_SECONDS", "0")
+    row = {
+        "title": "客户A",
+        "preview": "[图片]",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "unread": True,
+        "unread_count": 1,
+        "raw": [],
+    }
+    signature = watcher._conversation_signature(row)
+    changed, item = state.enqueue_conversation(row, signature)
+    assert changed is True
+    state.mark_read_logged(
+        item["id"],
+        message_hash="read-hash",
+        messages=[{"role": "用户", "text": "[图片]", "media": [{"capture_mode": "preview"}]}],
+    )
+
+    changed_again, existing = state.enqueue_conversation(row, signature)
+
+    assert changed_again is False
+    assert existing["status"] == "done"
+    assert state.list_queue(status="pending") == []
+
+
 def test_conversation_filter_skips_system_rows():
     assert watcher._should_consider({"title": "企业微信团队", "preview": "登录"}) is False
     assert watcher._should_consider({"title": "客户咨询", "preview": "聊天已结束"}) is False

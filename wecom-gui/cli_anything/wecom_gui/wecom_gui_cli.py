@@ -303,6 +303,7 @@ def worker_cmd(poll: float, last: int, mode: str, once: bool) -> None:
 @click.option("--max-drafts", default=4, show_default=True, type=click.IntRange(min=1, max=16))
 @click.option("--log-interval", default=5.0, show_default=True, type=click.FloatRange(min=1.0))
 @click.option("--once", is_flag=True, help="Run one fast-agent tick then exit.")
+@click.option("--read-only", is_flag=True, help="Read and log queued chats without calling AI.")
 def agent_cmd(
     poll: float,
     scan_interval: float,
@@ -315,6 +316,7 @@ def agent_cmd(
     max_drafts: int,
     log_interval: float,
     once: bool,
+    read_only: bool,
 ) -> None:
     """Fast agent: scan, read, draft concurrently, then send."""
     _emit_or_fail(
@@ -330,6 +332,7 @@ def agent_cmd(
         max_drafts=max_drafts,
         log_interval=log_interval,
         once=once,
+        read_only=read_only,
     )
 
 

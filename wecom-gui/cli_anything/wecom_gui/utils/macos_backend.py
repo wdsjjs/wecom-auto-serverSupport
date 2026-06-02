@@ -1234,10 +1234,35 @@ def _click_image_and_capture(rect: dict) -> dict:
     return captured
 
 
+def _media_capture_mode() -> str:
+    mode = str(os.environ.get("WECOM_GUI_MEDIA_CAPTURE_MODE", "preview") or "preview").strip().lower()
+    if mode in {"0", "false", "none", "off"}:
+        return "off"
+    if mode in {"preview", "open"}:
+        return "preview"
+    return "bubble"
+
+
+def _capture_image_bubble(rect: dict) -> dict:
+    output_path = _image_capture_dir() / f"wecom-bubble-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.png"
+    captured = _screenshot_rect(rect, output_path)
+    captured["capture_mode"] = "bubble"
+    _append_event(
+        {
+            "type": "image_capture_result",
+            "mode": "bubble",
+            "rect": rect,
+            "capture": captured,
+        }
+    )
+    return captured
+
+
 def capture_chat_images(messages: list[dict]) -> list[dict]:
-    """Open and capture image bubbles only during formal queue processing."""
+    """Capture image bubbles only during formal queue processing."""
     if os.environ.get("WECOM_GUI_CAPTURE_IMAGES", "1") == "0":
         return messages
+    mode = _media_capture_mode()
     enriched: list[dict] = []
     for message in messages:
         copied = {**message}
@@ -1245,8 +1270,22 @@ def capture_chat_images(messages: list[dict]) -> list[dict]:
         for media in copied.get("media") or []:
             media_copy = {**media}
             rect = media_copy.get("rect") if isinstance(media_copy.get("rect"), dict) else {}
-            result = _click_image_and_capture(rect)
+            media_type = str(media_copy.get("type") or "image").strip().lower()
+            if media_type in {"sticker", "emoji", "animated_sticker"} or media_copy.get("skip_capture"):
+                media_copy["capture_ok"] = False
+                media_copy["capture_mode"] = "skipped"
+                media_copy["error"] = media_copy.get("error") or "media_capture_skipped"
+                media_items.append(media_copy)
+                continue
+            if mode == "off":
+                media_copy["capture_ok"] = False
+                media_copy["capture_mode"] = "off"
+                media_copy["error"] = "media_capture_disabled"
+                media_items.append(media_copy)
+                continue
+            result = _click_image_and_capture(rect) if mode == "preview" else _capture_image_bubble(rect)
             media_copy["capture_ok"] = bool(result.get("ok"))
+            media_copy["capture_mode"] = result.get("capture_mode") or mode
             if result.get("ok"):
                 media_copy["capture_path"] = result.get("path", "")
                 media_copy["capture_rect"] = result.get("rect", {})

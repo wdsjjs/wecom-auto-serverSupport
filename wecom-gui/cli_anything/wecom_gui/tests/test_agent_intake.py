@@ -89,6 +89,53 @@ def test_agent_binds_visible_sidebar_uid_before_drafting(monkeypatch, tmp_path):
     assert captured["customer_uid"] == "wm-visible"
     assert state.lookup_wecom_customer(customer_name="客户A")["uid"] == "wm-visible"
 
+
+def test_agent_read_only_logs_context_without_drafting(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "[图片]", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    changed, _item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    assert changed is True
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "hash": "read-hash",
+            "source": "accessibility-chat-table",
+            "capture_images": True,
+            "messages": [
+                {
+                    "role": "用户",
+                    "content": "[图片]",
+                    "text": "[图片]",
+                    "media": [{"type": "image", "capture_ok": True, "capture_mode": "preview"}],
+                }
+            ],
+        },
+    )
+
+    def fail_draft(*args, **kwargs):
+        raise AssertionError("read-only mode should not call AI")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fail_draft)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=12, executor=executor, futures=futures, max_drafts=1, read_only=True)
+
+    assert result["read_only"] is True
+    assert futures == {}
+    job = state.list_queue(status="done")[0]
+    assert job["last_message_hash"] == "read-hash"
+    assert job["reply_source"] == ""
+    assert json.loads(job["context_json"])["read_only"] is True
+    stored_messages = state.list_conversation_messages(conversation_key=job["conversation_key"])
+    assert stored_messages[0]["text"] == "[图片]"
+    events = (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert any(json.loads(line)["type"] == "agent_read_context" for line in events)
+    assert any(json.loads(line)["type"] == "agent_read_only_completed" for line in events)
+
+
 def test_agent_defers_when_live_chat_messages_missing(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "刘裕鑫", "preview": "老男复维多少钱", "time": "刚刚", "tags": ["@重庆邮电大学"], "raw": []}

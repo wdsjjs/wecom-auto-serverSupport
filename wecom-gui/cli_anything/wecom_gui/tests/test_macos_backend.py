@@ -135,6 +135,33 @@ def test_read_current_preserves_uncaptured_latest_turn_image_media(monkeypatch):
     assert captured_batches[0][1]["media"] == [{"rect": {"x": 2}}]
     assert data["messages"][1]["media"][0]["capture_ok"] is False
 
+
+def test_read_current_skips_animated_sticker_capture_from_preview(monkeypatch):
+    def fake_chat_messages(app_name=None, last=10, capture_images=False, include_image_media=None):
+        assert capture_images is False
+        assert include_image_media is True
+        return [
+            {
+                "role": "unknown",
+                "text": "[图片]",
+                "x": 337,
+                "right": 417,
+                "media": [{"type": "image", "rect": {"x": 2}}],
+            }
+        ]
+
+    def fail_capture(messages):
+        raise AssertionError("animated stickers should be marked before capture")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.chat_messages", fake_chat_messages)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.capture_chat_images", fail_capture)
+
+    data = chat.read_current(last=10, capture_images=False, media_preview="[动画表情]")
+
+    assert data["messages"][0]["text"] == "[动画表情]"
+    assert data["messages"][0]["media"][0]["type"] == "animated_sticker"
+    assert data["messages"][0]["media"][0]["skip_capture"] is True
+
 def test_hidden_image_row_rect_keeps_short_preview_bubbles(monkeypatch):
     monkeypatch.setenv("WECOM_GUI_MIN_IMAGE_BUBBLE_SIZE", "64")
 
@@ -392,6 +419,95 @@ def test_capture_images_true_reads_hidden_rows_and_captures(monkeypatch):
     assert messages[0]["text"] == "[图片]"
     assert calls["capture"] == 1
     assert hidden_flags == [(True, True)]
+
+
+def test_capture_chat_images_defaults_to_preview_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("WECOM_GUI_IMAGE_CAPTURE_DIR", str(tmp_path))
+    commands = []
+
+    def fake_swift(command):
+        commands.append(command)
+        if isinstance(command, list) and command[0] == "doubleclick":
+            return [{"ok": True}]
+        if command == "preview":
+            return [{"ok": True, "image": {"x": 100, "y": 120, "width": 300, "height": 200}}]
+        if command == "close-preview":
+            return [{"ok": True}]
+        return []
+
+    def fake_screenshot(rect, output_path):
+        output_path.write_bytes(b"\x89PNG\r\n\x1a\nfake image bytes")
+        return {"ok": True, "path": str(output_path), "rect": rect}
+
+    monkeypatch.delenv("WECOM_GUI_MEDIA_CAPTURE_MODE", raising=False)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._screenshot_rect", fake_screenshot)
+
+    messages = macos_backend.capture_chat_images(
+        [{"role": "用户", "text": "[图片]", "media": [{"type": "image", "rect": {"x": 1, "y": 2, "width": 80, "height": 80}}]}]
+    )
+
+    media = messages[0]["media"][0]
+    assert commands[0][0] == "doubleclick"
+    assert "preview" in commands
+    assert media["capture_ok"] is True
+    assert media["capture_mode"] == "preview"
+    assert media["capture_path"]
+
+
+def test_capture_chat_images_skips_animated_stickers(monkeypatch):
+    def fail_swift(command):
+        raise AssertionError("animated sticker should not touch preview capture")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fail_swift)
+
+    messages = macos_backend.capture_chat_images(
+        [
+            {
+                "role": "用户",
+                "text": "[动画表情]",
+                "media": [{"type": "animated_sticker", "rect": {"x": 1}, "skip_capture": True}],
+            }
+        ]
+    )
+
+    media = messages[0]["media"][0]
+    assert media["capture_ok"] is False
+    assert media["capture_mode"] == "skipped"
+    assert media["error"] == "media_capture_skipped"
+
+
+def test_capture_chat_images_preview_mode_uses_doubleclick(monkeypatch, tmp_path):
+    monkeypatch.setenv("WECOM_GUI_IMAGE_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("WECOM_GUI_MEDIA_CAPTURE_MODE", "preview")
+    commands = []
+
+    def fake_swift(command):
+        commands.append(command)
+        if isinstance(command, list) and command[0] == "doubleclick":
+            return [{"ok": True}]
+        if command == "preview":
+            return [{"ok": True, "image": {"x": 100, "y": 120, "width": 300, "height": 200}}]
+        if command == "close-preview":
+            return [{"ok": True}]
+        return []
+
+    def fake_screenshot(rect, output_path):
+        output_path.write_bytes(b"\x89PNG\r\n\x1a\nfake image bytes")
+        return {"ok": True, "path": str(output_path), "rect": rect}
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._screenshot_rect", fake_screenshot)
+
+    messages = macos_backend.capture_chat_images(
+        [{"role": "用户", "text": "[图片]", "media": [{"type": "image", "rect": {"x": 1, "y": 2, "width": 80, "height": 80}}]}]
+    )
+
+    assert commands[0][0] == "doubleclick"
+    assert "preview" in commands
+    assert messages[0]["media"][0]["capture_ok"] is True
+    assert messages[0]["media"][0]["capture_mode"] == "preview"
+
 
 def test_chat_messages_can_read_image_media_without_capture(monkeypatch):
     hidden_flags = []

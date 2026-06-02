@@ -704,6 +704,14 @@ def _record_customer_message_metric(
         )
 
 
+def _context_is_read_only(value: object) -> bool:
+    try:
+        context = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return False
+    return bool(isinstance(context, dict) and context.get("read_only") is True)
+
+
 def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
     """Insert/update a conversation job when the visible row changed.
 
@@ -725,6 +733,7 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
             can_reopen_done = (
                 existing["status"] == "done"
                 and row_has_unread
+                and not _context_is_read_only(existing["context_json"])
                 and now - float(existing["updated_at"] or 0) >= done_reopen_cooldown
             )
             can_reopen_inactive = existing["status"] in {"failed", "skipped"} and row_has_unread
@@ -1288,6 +1297,35 @@ def mark_drafting(job_id: int, *, message_hash: str, messages: list[dict], lates
             WHERE id = ?
             """,
             (message_hash, json.dumps(context, ensure_ascii=False), now, job_id),
+        )
+    record_conversation_messages(
+        conversation_key=conversation_key,
+        job_id=job_id,
+        message_hash=message_hash,
+        messages=messages,
+    )
+
+
+def mark_read_logged(job_id: int, *, message_hash: str, messages: list[dict], reason: str = "read_only") -> None:
+    """Finish a job after recording the read context without producing a reply."""
+    now = time.time()
+    context = {
+        "message_count": len(messages),
+        "read_only": True,
+        "reason": reason,
+    }
+    with connect() as conn:
+        row = conn.execute("SELECT conversation_key FROM reply_queue WHERE id = ?", (job_id,)).fetchone()
+        conversation_key = str(row["conversation_key"] if row else "")
+        conn.execute(
+            """
+            UPDATE reply_queue
+            SET status = 'done', last_message_hash = ?, context_json = ?,
+                reply_text = NULL, reply_source = '', error = ?,
+                locked_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (message_hash, json.dumps(context, ensure_ascii=False), reason, now, job_id),
         )
     record_conversation_messages(
         conversation_key=conversation_key,

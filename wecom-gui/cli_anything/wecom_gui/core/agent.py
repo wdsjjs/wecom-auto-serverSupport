@@ -133,6 +133,11 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
+def _read_only_enabled() -> bool:
+    value = str(os.environ.get("WECOM_AGENT_READ_ONLY", "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _short(text: str | None, limit: int = 90) -> str:
     value = (text or "").replace("\n", " ").strip()
     if len(value) <= limit:
@@ -174,14 +179,14 @@ def _latest_from_unread_preview(messages: list[dict], preview: str | None) -> tu
     if not preview_text:
         return messages, None
 
-    if preview_text == "[图片]":
+    if preview_text in {"[图片]", "[动画表情]"}:
         for idx in range(len(messages) - 1, -1, -1):
             message = messages[idx]
-            if _message_text(message).strip() != "[图片]" and not _message_has_image(message):
+            if _message_text(message).strip() not in {"[图片]", "[动画表情]"} and not _message_has_image(message):
                 continue
             patched = [dict(item) for item in messages]
             original_role = str(patched[idx].get("role") or "").strip()
-            text = _message_text(patched[idx]).strip() or "[图片]"
+            text = preview_text if preview_text == "[动画表情]" else (_message_text(patched[idx]).strip() or "[图片]")
             patched[idx] = {
                 **patched[idx],
                 "role": "用户",
@@ -242,7 +247,7 @@ def _append_preview_to_user_turn(
 ) -> tuple[list[dict], dict | None]:
     """Add real unread preview text when AX only exposes the latest image row."""
     preview_text = str(preview or "").strip()
-    if not preview_text or preview_text == "[图片]":
+    if not preview_text or preview_text in {"[图片]", "[动画表情]"}:
         return messages, None
     reply_text = str(existing_reply or "").strip()
     if reply_text and _texts_match(reply_text, preview_text):
@@ -308,7 +313,16 @@ def _read_current_with_retry(
     sleep_delay = delay if delay is not None else float(os.environ.get("WECOM_AGENT_READ_RETRY_DELAY", "0.35"))
     current: dict = {"ok": True, "source": "unread", "message_count": 0, "hash": "", "messages": []}
     for index in range(max(1, max_attempts)):
-        current = chat.read_current(last=last, capture_images=capture_images)
+        try:
+            current = chat.read_current(
+                last=last,
+                capture_images=capture_images,
+                media_preview=expected_visible_text,
+            )
+        except TypeError as exc:
+            if "media_preview" not in str(exc):
+                raise
+            current = chat.read_current(last=last, capture_images=capture_images)
         if capture_images:
             messages, appended = _append_preview_to_user_turn(
                 current.get("messages", []),
@@ -454,6 +468,30 @@ def _reason_text(reason: str) -> str:
     if reason == "queue_empty":
         return "当前没有待处理会话"
     return reason
+
+
+def _log_read_context(title: str, job: dict, current: dict) -> None:
+    messages = current.get("messages", [])
+    media_count = sum(len(message.get("media") or []) for message in messages if isinstance(message, dict))
+    state.append_event(
+        {
+            "type": "agent_read_context",
+            "job_id": job.get("id"),
+            "conversation": title,
+            "source": current.get("source"),
+            "hash": current.get("hash"),
+            "message_count": len(messages),
+            "media_count": media_count,
+            "capture_images": current.get("capture_images"),
+            "preview": job.get("preview", ""),
+            "messages": messages,
+        }
+    )
+    _log(
+        f"[AI客服] 读取明细：{title}，hash={_short(str(current.get('hash') or ''), 16)}，"
+        f"消息数={len(messages)}，媒体数={media_count}｜"
+        f"{_short(json.dumps(messages, ensure_ascii=False), 220)}"
+    )
 
 
 def _mode_text(mode: str) -> str:
@@ -642,7 +680,14 @@ def _bind_visible_uid(title: str) -> str:
     return str(binding.get("uid") or "")
 
 
-def _read_one_pending(*, last: int, executor: ThreadPoolExecutor, futures: dict[int, Future], max_drafts: int) -> dict:
+def _read_one_pending(
+    *,
+    last: int,
+    executor: ThreadPoolExecutor,
+    futures: dict[int, Future],
+    max_drafts: int,
+    read_only: bool = False,
+) -> dict:
     job = state.claim_pending_for_read()
     if job is None:
         return {"ok": True, "read": 0, "reason": "queue_empty"}
@@ -663,6 +708,25 @@ def _read_one_pending(*, last: int, executor: ThreadPoolExecutor, futures: dict[
             f"[AI客服] 聊天读取结果：{title}，source={current.get('source')}，"
             f"消息数={len(current.get('messages', []))}"
         )
+        _log_read_context(title, job, current)
+        if read_only or _read_only_enabled():
+            state.mark_read_logged(
+                job["id"],
+                message_hash=str(current.get("hash") or ""),
+                messages=current.get("messages", []),
+                reason="read_only",
+            )
+            state.append_event(
+                {
+                    "type": "agent_read_only_completed",
+                    "job_id": job["id"],
+                    "conversation": title,
+                    "hash": current.get("hash"),
+                    "message_count": len(current.get("messages", [])),
+                }
+            )
+            _log(f"[AI客服] 只读模式：已记录读取结果，不调用AI：{title}")
+            return {"ok": True, "read": 1, "drafting": 0, "read_only": True, "conversation": title}
 
         current, latest, reason = _resolve_latest_for_job(title, job, current)
         if latest is None:
@@ -1085,6 +1149,7 @@ def agent_loop(
     deep_scan_interval: float = 30.0,
     log_interval: float = 5.0,
     once: bool = False,
+    read_only: bool = False,
 ) -> dict:
     """Run the fast AI customer-service loop."""
     if mode not in {"dry-run", "auto", "review"}:
@@ -1100,12 +1165,14 @@ def agent_loop(
     next_log_at = 0.0
     futures: dict[int, Future] = {}
     last_scan: dict | None = None
+    read_only_mode = read_only or _read_only_enabled()
 
     text_workers = _pool_limit("text", max_drafts)
     image_workers = _pool_limit("image", max_drafts)
     _log(
         "[AI客服] 启动："
-        f"模式={_mode_text(mode)}，扫描间隔={scan_interval}s，轮询间隔={poll}s，"
+        f"模式={_mode_text(mode)}，读取模式={'只读不调AI' if read_only_mode else '正常调用AI'}，"
+        f"扫描间隔={scan_interval}s，轮询间隔={poll}s，"
         f"左侧每页扫描前{inbox_limit}条，滚动扫描页数={scan_pages}，"
         f"滚动深扫间隔={deep_scan_interval}s，读取最近{last}条聊天记录，"
         f"最多并发AI={max_drafts}，文本池={text_workers}，图片池={image_workers}"
@@ -1169,7 +1236,13 @@ def agent_loop(
             sent += send_result.get("sent", 0)
 
             while len(futures) < max_drafts:
-                intake = _read_one_pending(last=last, executor=executor, futures=futures, max_drafts=max_drafts)
+                intake = _read_one_pending(
+                    last=last,
+                    executor=executor,
+                    futures=futures,
+                    max_drafts=max_drafts,
+                    read_only=read_only_mode,
+                )
                 read += intake.get("read", 0)
                 if intake.get("reason") == "queue_empty" or str(intake.get("reason") or "").endswith("_pool_full"):
                     break

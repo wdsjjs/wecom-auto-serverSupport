@@ -177,6 +177,49 @@ def test_agent_reclassifies_image_preview_even_if_role_is_service(monkeypatch, t
     assert captured["messages"][-1]["role_confidence"] == "preview_fallback"
     assert captured["messages"][-1]["original_role"] == "客服"
 
+
+def test_agent_reclassifies_animated_sticker_preview_even_if_role_is_service(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "LeoFree", "preview": "[动画表情]", "time": "刚刚", "tags": ["@微信"], "unread": True, "raw": []}
+    state.enqueue_conversation(row, watcher._conversation_signature(row))
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=6, capture_images=True, media_preview=None: {
+            "hash": "misread-sticker",
+            "source": "accessibility-chat-table",
+            "messages": [
+                {
+                    "role": "客服",
+                    "content": "[动画表情]",
+                    "text": "[动画表情]",
+                    "media": [{"type": "animated_sticker", "capture_ok": False, "capture_mode": "skipped"}],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
+    captured = {}
+
+    def fake_draft(messages, **kwargs):
+        captured["messages"] = messages
+        return {"ok": True, "text": "收到表情。", "message": "收到表情。"}
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fake_draft)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=6, executor=executor, futures=futures, max_drafts=1)
+        assert result["drafting"] == 1
+        next(iter(futures.values())).result()
+
+    assert captured["messages"][-1]["role"] == "用户"
+    assert captured["messages"][-1]["role_confidence"] == "preview_fallback"
+    assert captured["messages"][-1]["text"] == "[动画表情]"
+    assert captured["messages"][-1]["media"][0]["type"] == "animated_sticker"
+
+
 def test_latest_preview_turn_excludes_misread_old_service_reply():
     messages = [
         {"role": "用户", "role_confidence": "medium", "text": "这是哪里的景色？", "content": "这是哪里的景色？"},

@@ -127,7 +127,38 @@ def _strip_old_media(messages: list[dict]) -> list[dict]:
     return stripped
 
 
-def read_current(last: int = 10, app_name: str | None = None, *, capture_images: bool = True) -> dict:
+def _mark_latest_media_from_preview(messages: list[dict], preview: str | None) -> list[dict]:
+    preview_text = str(preview or "").strip()
+    if preview_text not in {"[动画表情]", "[表情]", "[动画]"}:
+        return messages
+    patched = [dict(message) for message in messages]
+    for index in range(len(patched) - 1, -1, -1):
+        media_items = patched[index].get("media")
+        if not isinstance(media_items, list) or not media_items:
+            continue
+        patched[index]["text"] = preview_text
+        patched[index]["content"] = preview_text
+        patched[index]["media"] = [
+            {
+                **media,
+                "type": "animated_sticker",
+                "skip_capture": True,
+                "error": "animated_sticker_not_captured",
+            }
+            for media in media_items
+            if isinstance(media, dict)
+        ]
+        return patched
+    return messages
+
+
+def read_current(
+    last: int = 10,
+    app_name: str | None = None,
+    *,
+    capture_images: bool = True,
+    media_preview: str | None = None,
+) -> dict:
     """Read the latest visible text lines as chat context."""
     try:
         gui_messages = macos_backend.chat_messages(
@@ -140,6 +171,7 @@ def read_current(last: int = 10, app_name: str | None = None, *, capture_images:
         gui_messages = macos_backend.chat_messages(app_name, last=last, capture_images=False)
     if gui_messages:
         gui_messages = infer_roles(gui_messages)
+        gui_messages = _mark_latest_media_from_preview(gui_messages, media_preview)
         if capture_images:
             gui_messages = macos_backend.capture_chat_images(_strip_old_media(gui_messages))
         return {
