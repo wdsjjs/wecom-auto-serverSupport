@@ -126,7 +126,13 @@ def latest_user_turn_text(messages: list[dict]) -> str:
 
 
 def _message_has_image(message: dict) -> bool:
-    return bool(message_image_paths([message]) or message.get("media"))
+    for media in message.get("media") or []:
+        if not isinstance(media, dict):
+            continue
+        media_type = str(media.get("type") or "image").strip()
+        if media_type == "image" and not media.get("skip_capture"):
+            return True
+    return False
 
 
 def _is_preview_turn_anchor(message: dict) -> bool:
@@ -151,8 +157,8 @@ def latest_user_turn_messages(messages: list[dict]) -> list[dict]:
     for message in reversed(messages):
         role = message.get("role")
         text = str(message.get("content") or message.get("text") or "").strip()
-        has_media = bool(message.get("media"))
-        if not text and not has_media:
+        has_image = _message_has_image(message)
+        if not text and not has_image:
             continue
         if role == "用户":
             turn.append(message)

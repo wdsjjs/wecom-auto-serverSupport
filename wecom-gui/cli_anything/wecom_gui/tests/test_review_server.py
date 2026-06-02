@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import base64
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -257,6 +258,30 @@ def test_review_approve_can_use_human_edited_reply(monkeypatch, tmp_path):
     approved = state.get_job(job["id"])
     assert approved["status"] == "approved"
     assert approved["reply_text"] == "客服改写"
+
+
+def test_review_approve_edited_reply_creates_pending_issue_task(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "查订单", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "查订单"}],
+        latest={"role": "用户", "content": "查订单"},
+    )
+    state.mark_ready(job["id"], reply_text="AI原文")
+
+    result = review_server.approve_item(job["id"], reply_text="客服改写")
+
+    assert result["ok"] is True
+    tasks = review_server.list_review_items(status="issues")
+    assert len(tasks) == 1
+    assert tasks[0]["source"] == "review_edit"
+    assert tasks[0]["original_reply"] == "AI原文"
+    assert tasks[0]["final_reply"] == "客服改写"
+    assert review_server.review_counts()["issues"] == 1
 
 def test_review_items_classify_customer_reply_and_unknown_messages(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
@@ -516,6 +541,17 @@ def test_review_http_allows_actions_without_token(monkeypatch, tmp_path):
         httpd.server_close()
         thread.join(timeout=2)
 
+
+def test_review_page_primary_actions_are_send_only():
+    assert "data-action=\"regenerate\"" not in review_server.REVIEW_HTML
+    assert "data-action=\"reject\"" not in review_server.REVIEW_HTML
+    assert "data-action=\"save\"" not in review_server.REVIEW_HTML
+    assert "重新生成" not in review_server.REVIEW_HTML
+    assert "拒绝</button>" not in review_server.REVIEW_HTML
+    assert "保存修改" not in review_server.REVIEW_HTML
+    assert "data-action=\"complete-issue\"" in review_server.REVIEW_HTML
+
+
 def test_review_http_supports_save_approve_with_reply_and_regenerate(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "查订单", "time": "刚刚", "tags": ["@微信"], "raw": []}
@@ -608,6 +644,126 @@ def test_review_http_metrics_summary(monkeypatch, tmp_path):
     assert metrics["diagnostics"]["review_saved"] == 1
     assert metrics["diagnostics"]["human_edited_reply"] == 1
 
+
+def test_review_http_completes_reply_issue_task(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "查订单", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "查订单"}],
+        latest={"role": "用户", "content": "查订单"},
+    )
+    state.mark_ready(job["id"], reply_text="AI草稿")
+    assert review_server.approve_item(job["id"], reply_text="客服改写")["ok"] is True
+    task = state.list_reply_issue_tasks(status="pending")[0]
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), review_server.ReviewHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        complete_req = request.Request(
+            f"{base}/api/review/issues/{task['id']}/complete",
+            data=json.dumps({"issue_text": "AI没有说明订单号来源"}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with request.urlopen(complete_req, timeout=5) as resp:
+            completed = json.loads(resp.read().decode("utf-8"))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+    assert completed["ok"] is True
+    assert completed["item"]["status"] == "completed"
+    assert state.reply_issue_pending_count() == 0
+    assert state.list_reply_issue_tasks(status="completed")[0]["issue_text"] == "AI没有说明订单号来源"
+    assert state.metrics_summary(since_hours=24)["diagnostics"]["review_reply_issue"] == 1
+
+
+def test_review_http_wecom_status(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+
+    class FakeStatus:
+        ok = True
+        app_name = "企业微信"
+        app_running = True
+        accessibility_ok = True
+        osascript_ok = True
+        notes = []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.doctor_status", lambda: FakeStatus())
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), review_server.ReviewHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        with request.urlopen(f"{base}/api/review/wecom-status", timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+    assert payload["ok"] is True
+    assert payload["status"]["ok"] is True
+    assert payload["status"]["app_name"] == "企业微信"
+
+
+def test_review_upload_delete_and_approve_image_attachment(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "转人工", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "转人工"}],
+        latest={"role": "用户", "content": "转人工"},
+    )
+    state.mark_handoff_pending(
+        job["id"],
+        handoff_type="direct",
+        handoff_reason="客户要求人工",
+        reply_text="",
+    )
+    image_body = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+    uploaded = review_server.upload_attachment(
+        job["id"],
+        filename="answer.png",
+        content_type="image/png",
+        data_base64=base64.b64encode(image_body).decode("ascii"),
+    )
+
+    assert uploaded["ok"] is True
+    attachment = uploaded["item"]["reply_attachments"][0]
+    assert attachment["name"] == "answer.png"
+
+    deleted = review_server.delete_attachment(job["id"], attachment["id"])
+    assert deleted["ok"] is True
+    assert deleted["item"]["reply_attachments"] == []
+
+    uploaded_again = review_server.upload_attachment(
+        job["id"],
+        filename="answer.png",
+        content_type="image/png",
+        data_base64=base64.b64encode(image_body).decode("ascii"),
+    )
+    attachment_id = uploaded_again["item"]["reply_attachments"][0]["id"]
+    approved = review_server.approve_item(job["id"], reply_text="", attachment_ids=[attachment_id])
+
+    assert approved["ok"] is True
+    approved_job = state.get_job(job["id"])
+    assert approved_job["status"] == "approved"
+    assert approved_job["reply_text"] == ""
+    assert approved_job["reply_attachments"][0]["name"] == "answer.png"
+
 def test_review_mode_skips_stale_context_before_send(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "旧问题", "time": "刚刚", "tags": ["@微信"], "raw": []}
@@ -643,3 +799,309 @@ def test_review_mode_skips_stale_context_before_send(monkeypatch, tmp_path):
     assert result["reason"] == "stale_context"
     assert sent == []
     assert state.list_queue(status="skipped")[0]["error"] == "stale_context"
+
+def test_handoff_reply_stays_in_handoff_queue_until_finished(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "转人工", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    _, item = state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-handoff",
+        messages=[{"role": "用户", "content": "转人工", "text": "转人工"}],
+        latest={"role": "用户", "content": "转人工"},
+    )
+    state.mark_handoff_pending(
+        job["id"],
+        handoff_type="direct",
+        handoff_reason="客户要求人工",
+        reply_text="您好，我来帮您处理。",
+    )
+    assert review_server.approve_item(job["id"], reply_text="人工回复第一条")["ok"] is True
+
+    reads = iter(
+        [
+            {"hash": "precheck", "messages": [{"role": "用户", "content": "转人工", "text": "转人工"}]},
+            {
+                "hash": "after-send",
+                "messages": [
+                    {"role": "用户", "content": "转人工", "text": "转人工"},
+                    {"role": "客服", "content": "人工回复第一条", "text": "人工回复第一条"},
+                ],
+            },
+        ]
+    )
+    sent = []
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_text",
+        lambda text, dry_run=False, submit=True: sent.append(text),
+    )
+
+    result = agent._send_one_ready(last=12, mode="review")
+
+    assert item["title"] == "客户A"
+    assert result["sent"] == 1
+    assert sent == ["人工回复第一条"]
+    handoff_item = review_server.list_review_items(status="handoff")[0]
+    assert handoff_item["handoff_waiting"] is True
+    assert handoff_item["handoff_attention"] is False
+    assert handoff_item["reply_text"] == "人工回复第一条"
+    assert handoff_item["messages"][-1]["message_type"] == "reply"
+    assert handoff_item["messages"][-1]["text"] == "人工回复第一条"
+    issue_tasks = review_server.list_review_items(status="issues")
+    assert issue_tasks[0]["source"] == "handoff_reply"
+    assert issue_tasks[0]["final_reply"] == "人工回复第一条"
+    assert state.get_job(job["id"])["reply_source"] == "human"
+    assert review_server.save_item(job["id"], reply_text="人工回复第二条")["ok"] is True
+    assert review_server.approve_item(job["id"], reply_text="人工回复第二条")["ok"] is True
+    state.mark_handoff_waiting(
+        job["id"],
+        message_hash="hash-second",
+        reply_text="人工回复第二条",
+        reply_source="human",
+    )
+    assert review_server.review_counts()["issues"] == 2
+    assert review_server.finish_item(job["id"])["ok"] is True
+    assert review_server.review_counts()["handoff"] == 0
+    assert state.get_job(job["id"])["status"] == "done"
+
+def test_handoff_duplicate_visible_reply_is_not_sent_again(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "转人工", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-handoff",
+        messages=[{"role": "用户", "content": "转人工", "text": "转人工"}],
+        latest={"role": "用户", "content": "转人工"},
+    )
+    state.mark_handoff_pending(
+        job["id"],
+        handoff_type="direct",
+        handoff_reason="客户要求人工",
+        reply_text="您好，我来处理。",
+    )
+    assert review_server.approve_item(job["id"], reply_text="人工回复第一条")["ok"] is True
+
+    sent = []
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=False: {
+            "hash": "after-send",
+            "messages": [
+                {"role": "用户", "content": "转人工", "text": "转人工"},
+                {"role": "客服", "content": "人工回复第一条", "text": "人工回复第一条"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_text",
+        lambda text, dry_run=False, submit=True: sent.append(text),
+    )
+
+    result = agent._send_one_ready(last=12, mode="review")
+
+    assert result["reason"] == "handoff_reply_already_visible"
+    assert sent == []
+    item = review_server.list_review_items(status="handoff")[0]
+    assert item["handoff_waiting"] is True
+    assert item["reply_text"] == "人工回复第一条"
+
+def test_handoff_new_message_returns_to_attention_without_ai(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    agent._HANDOFF_NOTIFY_KEYS.clear()
+    row = {"title": "客户A", "preview": "转人工", "time": "刚刚", "tags": ["@微信"], "raw": [], "unread": True}
+    _, item = state.enqueue_conversation(row, "sig1")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "转人工", "text": "转人工"}],
+        latest={"role": "用户", "content": "转人工"},
+    )
+    state.mark_handoff_pending(
+        job["id"],
+        handoff_type="direct",
+        handoff_reason="客户要求人工",
+        reply_text="您好，我来处理。",
+    )
+    state.mark_handoff_waiting(
+        job["id"],
+        message_hash="hash-sent",
+        reply_text="您好，我来处理。",
+        reply_source="human",
+    )
+
+    changed, reopened = state.enqueue_conversation(
+        {**row, "preview": "我还想问一下", "unread_count": 2},
+        "sig2",
+    )
+
+    assert item["title"] == "客户A"
+    assert changed is True
+    assert reopened["status"] == "pending"
+    assert reopened["handoff_type"] == "direct"
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "ok": True,
+            "hash": "hash-new",
+            "messages": [{"role": "用户", "content": "我还想问一下", "text": "我还想问一下"}],
+        },
+    )
+    notified = []
+    monkeypatch.setattr(
+        "csbot.ops_gateway.handoff_notify",
+        lambda **kwargs: notified.append(kwargs) or {"ok": True, "notified": True, "dry_run": False},
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.llm.draft_reply",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("handoff should not call AI")),
+    )
+
+    result = agent._read_one_pending(last=12, executor=ThreadPoolExecutor(max_workers=1), futures={}, max_drafts=1)
+
+    assert result["handoff"] == 1
+    assert review_server.review_counts()["handoff_attention"] == 1
+    item = review_server.list_review_items(status="handoff")[0]
+    assert item["handoff_attention"] is True
+    assert item["reply_text"] == ""
+    assert notified
+    assert notified[0]["customer_id"] == "客户A"
+    assert notified[0]["query"] == "我还想问一下"
+    assert notified[0]["dry_run"] is False
+    assert review_server.save_item(job["id"], reply_text="新的人工回复")["ok"] is True
+    assert review_server.approve_item(job["id"], reply_text="新的人工回复")["ok"] is True
+
+
+def test_direct_handoff_sends_feishu_notification(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    agent._HANDOFF_NOTIFY_KEYS.clear()
+    row = {"title": "客户A", "preview": "转人工", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "ok": True,
+            "hash": "hash-direct-handoff",
+            "messages": [{"role": "用户", "content": "我要转人工", "text": "我要转人工"}],
+        },
+    )
+    notified = []
+    monkeypatch.setattr(
+        "csbot.ops_gateway.handoff_notify",
+        lambda **kwargs: notified.append(kwargs) or {"ok": True, "notified": True, "dry_run": False},
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = agent._read_one_pending(last=12, executor=executor, futures={}, max_drafts=1)
+
+    assert result["handoff"] == 1
+    assert review_server.review_counts()["handoff"] == 1
+    assert notified
+    assert notified[0]["customer_id"] == "客户A"
+    assert notified[0]["query"] == "我要转人工"
+    assert notified[0]["dry_run"] is False
+
+
+def test_handoff_waiting_same_hash_does_not_trigger_attention(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "转人工", "time": "刚刚", "tags": ["@微信"], "raw": [], "unread": True}
+    state.enqueue_conversation(row, "sig1")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "转人工", "text": "转人工"}],
+        latest={"role": "用户", "content": "转人工"},
+    )
+    state.mark_handoff_pending(
+        job["id"],
+        handoff_type="direct",
+        handoff_reason="客户要求人工",
+        reply_text="您好，我来处理。",
+    )
+    state.mark_handoff_waiting(
+        job["id"],
+        message_hash="hash-sent",
+        reply_text="您好，我来处理。",
+        reply_source="human",
+    )
+    state.mark_pending(job["id"], "left_sidebar_retry")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "ok": True,
+            "hash": "hash-sent",
+            "messages": [
+                {"role": "用户", "content": "转人工", "text": "转人工"},
+                {"role": "客服", "content": "您好，我来处理。", "text": "您好，我来处理。"},
+            ],
+        },
+    )
+
+    result = agent._read_one_pending(last=12, executor=ThreadPoolExecutor(max_workers=1), futures={}, max_drafts=1)
+
+    assert result["reason"] == "handoff_waiting_same_hash"
+    assert review_server.review_counts()["handoff_attention"] == 0
+    item = review_server.list_review_items(status="handoff")[0]
+    assert item["handoff_waiting"] is True
+
+
+def test_handoff_latest_service_message_stays_open_without_ai_or_skip(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "人工回复", "time": "刚刚", "tags": ["@微信"], "raw": [], "unread": True}
+    state.enqueue_conversation(row, "sig1")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "转人工", "text": "转人工"}],
+        latest={"role": "用户", "content": "转人工"},
+    )
+    state.mark_handoff_pending(
+        job["id"],
+        handoff_type="direct",
+        handoff_reason="客户要求人工",
+        reply_text="您好，我来处理。",
+    )
+    state.mark_handoff_waiting(
+        job["id"],
+        message_hash="hash-sent",
+        reply_text="您好，我来处理。",
+        reply_source="human",
+    )
+    state.mark_pending(job["id"], "left_sidebar_retry")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "ok": True,
+            "hash": "hash-service-latest",
+            "messages": [
+                {"role": "用户", "content": "转人工", "text": "转人工"},
+                {"role": "客服", "content": "您好，我来处理。", "text": "您好，我来处理。"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.llm.draft_reply",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("handoff should not call AI")),
+    )
+
+    result = agent._read_one_pending(last=12, executor=ThreadPoolExecutor(max_workers=1), futures={}, max_drafts=1)
+
+    assert result["handoff"] == 0
+    assert state.get_job(job["id"])["status"] == "ready"
+    assert review_server.list_review_items(status="handoff")[0]["handoff_waiting"] is True

@@ -357,6 +357,85 @@ def test_metrics_summary_tracks_reply_source_handoff_and_latency(monkeypatch, tm
     assert summary["diagnostics"]["human_edited_reply"] == 1
 
 
+def test_handoff_waiting_preview_equal_reply_does_not_reopen(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {
+        "title": "客户A",
+        "preview": "转人工",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "raw": [],
+        "unread": True,
+        "unread_count": 1,
+    }
+    state.enqueue_conversation(row, "sig-a")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "转人工"}],
+        latest={"role": "用户", "content": "转人工"},
+    )
+    state.mark_handoff_pending(
+        job["id"],
+        handoff_type="direct",
+        handoff_reason="客户要求人工",
+        reply_text="我来处理。",
+    )
+    state.mark_handoff_waiting(
+        job["id"],
+        message_hash="hash-sent",
+        reply_text="我来处理。",
+        reply_source="human",
+    )
+    before = state.get_job(job["id"])
+
+    changed, item = state.enqueue_conversation(
+        {**row, "preview": "我来处理。", "time": "1分钟前", "unread_count": 2},
+        "sig-b",
+    )
+
+    assert changed is False
+    assert item["status"] == "ready"
+    assert item["error"] == state.HANDOFF_WAITING_ERROR
+    assert item["updated_at"] == before["updated_at"]
+
+
+def test_expire_stale_handoffs_closes_waiting_sessions(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    monkeypatch.setenv("WECOM_HANDOFF_SESSION_SECONDS", "600")
+    row = {"title": "客户A", "preview": "转人工", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "转人工"}],
+        latest={"role": "用户", "content": "转人工"},
+    )
+    state.mark_handoff_pending(
+        job["id"],
+        handoff_type="direct",
+        handoff_reason="客户要求人工",
+        reply_text="我来处理。",
+    )
+    state.mark_handoff_waiting(
+        job["id"],
+        message_hash="hash-sent",
+        reply_text="我来处理。",
+        reply_source="human",
+    )
+    waiting = state.get_job(job["id"])
+
+    assert state.expire_stale_handoffs(now=waiting["updated_at"] + 599) == 0
+    assert state.get_job(job["id"])["status"] == "ready"
+    assert state.expire_stale_handoffs(now=waiting["updated_at"] + 601) == 1
+    expired = state.get_job(job["id"])
+    assert expired["status"] == "done"
+    assert expired["handoff_type"] == ""
+    assert expired["error"] == "handoff_expired"
+
+
 def test_record_conversation_messages_tracks_image_metrics(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "[图片]", "time": "刚刚", "tags": ["@微信"], "raw": []}
@@ -390,6 +469,17 @@ def test_latest_user_message_accepts_low_confidence_for_unread_queue():
     )
 
     assert latest["content"] == "真实未读队列消息"
+
+def test_chat_role_inference_uses_right_aligned_edge_for_service():
+    messages = [
+        {"role": "unknown", "text": "客户问题", "x": 437, "width": 80, "right": 517},
+        {"role": "unknown", "text": "客服长回复", "x": 526, "width": 918, "right": 1444},
+        {"role": "unknown", "text": "客户追问", "x": 437, "width": 90, "right": 527},
+    ]
+
+    inferred = chat.infer_roles(messages)
+
+    assert [message["role"] for message in inferred] == ["用户", "客服", "用户"]
 
 def test_gui_lock_uses_state_dir(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)

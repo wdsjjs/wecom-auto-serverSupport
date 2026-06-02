@@ -23,6 +23,7 @@ from cli_anything.wecom_gui.utils import macos_backend
 _DRAFT_STARTED_AT: dict[int, float] = {}
 _DRAFT_POOL: dict[int, str] = {}
 _DRAFT_MESSAGE_HASH: dict[int, str] = {}
+_HANDOFF_NOTIFY_KEYS: set[str] = set()
 
 
 def _message_image_paths(messages: list[dict]) -> list[str]:
@@ -39,7 +40,10 @@ def _message_image_paths(messages: list[dict]) -> list[str]:
 
 def _message_has_image(message: dict) -> bool:
     for media in message.get("media") or []:
-        if isinstance(media, dict) and (media.get("type") or "image") == "image":
+        if not isinstance(media, dict):
+            continue
+        media_type = str(media.get("type") or "image").strip()
+        if media_type == "image" and not media.get("skip_capture"):
             return True
     return False
 
@@ -149,6 +153,90 @@ def _message_text(message: dict | None) -> str:
     if not message:
         return ""
     return str(message.get("content") or message.get("text") or "")
+
+
+def _handoff_customer_id(title: str) -> str:
+    binding = state.lookup_wecom_customer(customer_name=title) or {}
+    uid = str(binding.get("uid") or "").strip()
+    return uid or title or os.environ.get("WECOM_GUI_CSBOT_CUSTOMER_ID", "wecom-customer")
+
+
+def _handoff_notify_result_message(payload: dict | None) -> str:
+    data = payload if isinstance(payload, dict) else {}
+    if data.get("notified"):
+        return "sent"
+    if data.get("reason"):
+        return str(data.get("reason"))
+    if data.get("error"):
+        return str(data.get("error"))
+    if data.get("dry_run"):
+        return "dry_run"
+    if data.get("enabled") is False:
+        return "feishu_disabled"
+    if not data:
+        return "empty_result"
+    return "unknown"
+
+
+def _notify_handoff(
+    *,
+    job: dict,
+    title: str,
+    query: str,
+    reason: str,
+    kind: str,
+    message_hash: str = "",
+    extra_context: dict | None = None,
+) -> dict:
+    """Send one Feishu handoff notification for GUI-owned handoff events."""
+    notify_key = "|".join(
+        [
+            str(job.get("id") or ""),
+            str(kind or ""),
+            str(message_hash or job.get("last_message_hash") or ""),
+            _match_text(query)[:120],
+        ]
+    )
+    if notify_key in _HANDOFF_NOTIFY_KEYS:
+        return {"ok": True, "notified": False, "duplicate": True, "reason": "duplicate_handoff_notify"}
+    _HANDOFF_NOTIFY_KEYS.add(notify_key)
+    context = {
+        "source": "wecom-gui",
+        "conversation_title": title,
+        "conversation_key": str(job.get("conversation_key") or ""),
+        "job_id": job.get("id"),
+        "handoff_type": kind,
+        "message_hash": message_hash or job.get("last_message_hash") or "",
+        **(extra_context or {}),
+    }
+    try:
+        from csbot.ops_gateway import handoff_notify
+
+        result = handoff_notify(
+            customer_id=_handoff_customer_id(title),
+            query=query,
+            reason=reason or "需要人工处理",
+            context=context,
+            dry_run=False,
+        )
+    except Exception as exc:
+        result = {"ok": False, "notified": False, "error": str(exc)}
+    state.append_event(
+        {
+            "type": "agent_handoff_feishu_notify",
+            "job_id": job.get("id"),
+            "conversation": title,
+            "kind": kind,
+            "query": query,
+            "reason": reason,
+            "result": result,
+        }
+    )
+    if result.get("notified"):
+        _log(f"[AI客服] 飞书转人工通知已发送：{title}｜{kind}")
+    else:
+        _log(f"[AI客服] 飞书转人工通知未发送：{title}｜{_handoff_notify_result_message(result)}")
+    return result
 
 
 def _match_text(value: str | None) -> str:
@@ -298,6 +386,38 @@ def _latest_user_turn_contains(messages: list[dict], expected: str | None) -> bo
     if not expected_text:
         return False
     return any(_texts_match(text, expected_text) for text in _latest_user_turn_texts(messages))
+
+
+def _reply_already_visible(messages: list[dict], reply_text: str | None) -> bool:
+    final_reply = clean_customer_reply_text(reply_text or "")
+    return bool(final_reply and worker._messages_contain_text(messages, final_reply))
+
+
+def _handoff_waiting_same_hash(job: dict, current: dict) -> bool:
+    return (
+        bool(str(job.get("handoff_type") or "").strip())
+        and bool(str(job.get("last_message_hash") or "").strip())
+        and str(current.get("hash") or "").strip() == str(job.get("last_message_hash") or "").strip()
+        and _reply_already_visible(current.get("messages", []), job.get("reply_text"))
+    )
+
+
+def _keep_handoff_open(job: dict, current: dict, *, reason: str) -> dict:
+    state.mark_handoff_waiting(
+        job["id"],
+        message_hash=current.get("hash") or job.get("last_message_hash"),
+        reply_text=job.get("reply_text"),
+        reply_source=str(job.get("reply_source") or "") or "human",
+        attachments=job.get("reply_attachments") or [],
+    )
+    return {
+        "ok": True,
+        "read": 1,
+        "drafting": 0,
+        "handoff": 0,
+        "conversation": job.get("title") or "",
+        "reason": reason,
+    }
 
 
 def _read_current_with_retry(
@@ -728,8 +848,29 @@ def _read_one_pending(
             _log(f"[AI客服] 只读模式：已记录读取结果，不调用AI：{title}")
             return {"ok": True, "read": 1, "drafting": 0, "read_only": True, "conversation": title}
 
+        if _handoff_waiting_same_hash(job, current):
+            state.mark_handoff_waiting(
+                job["id"],
+                message_hash=current.get("hash"),
+                reply_text=job.get("reply_text"),
+                reply_source=str(job.get("reply_source") or "") or "human",
+                attachments=job.get("reply_attachments") or [],
+            )
+            _log(f"[AI客服] 转人工会话无新增聊天内容，继续等待：{title}")
+            return {
+                "ok": True,
+                "read": 1,
+                "drafting": 0,
+                "handoff": 0,
+                "conversation": title,
+                "reason": "handoff_waiting_same_hash",
+            }
+
         current, latest, reason = _resolve_latest_for_job(title, job, current)
         if latest is None:
+            if str(job.get("handoff_type") or "").strip():
+                _log(f"[AI客服] 转人工会话未读到新的客户消息，继续人工接管：{title}｜原因={_reason_text(reason or '')}")
+                return _keep_handoff_open(job, current, reason=reason or "handoff_no_customer_message")
             reason = reason or "latest_message_not_user:unknown"
             if reason == "read_empty_retry_exhausted":
                 state.mark_pending(job["id"], reason)
@@ -765,10 +906,40 @@ def _read_one_pending(
         current, latest, debounce_reason = _debounce_latest_message(title, job, current, latest, last=last)
         if latest is None:
             reason = debounce_reason or "debounce_latest_missing"
+            if str(job.get("handoff_type") or "").strip():
+                _log(f"[AI客服] 转人工会话复查后无新客户消息，继续人工接管：{title}")
+                return _keep_handoff_open(job, current, reason=reason)
             state.mark_pending(job["id"], reason)
             return {"ok": True, "read": 1, "drafting": 0, "conversation": title, "reason": reason}
 
         latest_turn_text = llm.latest_user_turn_text(current["messages"]) or _message_text(latest)
+        if str(job.get("handoff_type") or "").strip():
+            reason = str(job.get("handoff_reason") or "人工接管会话收到客户新消息").strip()
+            state.mark_drafting(
+                job["id"],
+                message_hash=current["hash"],
+                messages=current["messages"],
+                latest=latest,
+            )
+            state.mark_handoff_attention(job["id"])
+            _notify_handoff(
+                job=job,
+                title=title,
+                query=latest_turn_text,
+                reason=reason,
+                kind="handoff_attention",
+                message_hash=current["hash"],
+            )
+            state.append_event(
+                {
+                    "type": "agent_handoff_attention",
+                    "job_id": job["id"],
+                    "conversation": title,
+                    "latest": latest_turn_text,
+                }
+            )
+            _log(f"[AI客服] 转人工会话有新消息：{title}｜{_short(latest_turn_text)}")
+            return {"ok": True, "read": 1, "drafting": 0, "handoff": 1, "conversation": title}
         if handoff.detect_direct_handoff(latest_turn_text):
             reason = handoff.direct_handoff_reason(latest_turn_text)
             state.mark_drafting(
@@ -782,6 +953,14 @@ def _read_one_pending(
                 handoff_type="direct",
                 handoff_reason=reason,
                 reply_text=handoff.HANDOFF_REPLY_TEXT,
+            )
+            _notify_handoff(
+                job=job,
+                title=title,
+                query=latest_turn_text,
+                reason=reason,
+                kind="direct",
+                message_hash=current["hash"],
             )
             state.append_event(
                 {
@@ -918,13 +1097,15 @@ def _finish_drafts(futures: dict[int, Future]) -> dict:
             )
             _log(f"[AI客服] AI回复已生成：{title}｜{elapsed_text}｜池={pool}｜{_short(draft['text'], 140)}")
             if draft.get("action") == "handoff":
-                handoff_payload = (draft.get("raw") or {}).get("handoff") or {}
+                raw = draft.get("raw") if isinstance(draft.get("raw"), dict) else {}
+                codex = raw.get("codex") if isinstance(raw.get("codex"), dict) else {}
+                handoff_payload = codex.get("handoff") if isinstance(codex.get("handoff"), dict) else {}
                 if handoff_payload.get("notified"):
                     _log(f"[AI客服] 飞书转人工通知已发送：{title}")
                 else:
                     _log(
                         f"[AI客服] 飞书转人工通知未发送：{title}｜"
-                        f"{handoff_payload.get('reason') or handoff_payload.get('error') or 'unknown'}"
+                        f"{_handoff_notify_result_message(handoff_payload)}"
                     )
             ready += 1
         except Exception as exc:
@@ -1011,6 +1192,42 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 expected_visible_text=expected_latest_text,
                 capture_images=False,
             )
+            final_reply = clean_customer_reply_text(job["reply_text"])
+            is_handoff = bool(str(job.get("handoff_type") or "").strip())
+            if is_handoff and str(job.get("error") or "").strip() == state.HANDOFF_WAITING_ERROR:
+                state.mark_handoff_waiting(
+                    job["id"],
+                    message_hash=current.get("hash") or job.get("last_message_hash"),
+                    reply_text=final_reply,
+                    reply_source=str(job.get("reply_source") or "") or "human",
+                    attachments=job.get("reply_attachments") or [],
+                )
+                _log(f"[AI客服] 转人工会话仍在等待客户新消息，跳过重复发送：{title}")
+                return {"ok": True, "sent": 0, "waiting": 1, "conversation": title, "reason": "handoff_waiting"}
+            if is_handoff and _reply_already_visible(current.get("messages", []), final_reply):
+                state.mark_handoff_waiting(
+                    job["id"],
+                    message_hash=current.get("hash") or job.get("last_message_hash"),
+                    reply_text=final_reply,
+                    reply_source=str(job.get("reply_source") or "") or "human",
+                    attachments=job.get("reply_attachments") or [],
+                )
+                state.append_event(
+                    {
+                        "type": "agent_handoff_duplicate_send_skipped",
+                        "job_id": job["id"],
+                        "conversation": title,
+                        "reply": final_reply,
+                    }
+                )
+                _log(f"[AI客服] 转人工回复已在会话中可见，跳过重复发送：{title}｜{_short(final_reply, 140)}")
+                return {
+                    "ok": True,
+                    "sent": 0,
+                    "waiting": 1,
+                    "conversation": title,
+                    "reason": "handoff_reply_already_visible",
+                }
             latest = watcher.latest_user_message(current["messages"])
             latest_text = (latest or {}).get("content") or (latest or {}).get("text") or ""
 
@@ -1072,19 +1289,23 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 _log(f"[AI客服] 发送前复核：{title}，同一轮客户消息仍包含原问题，准备发送")
 
             if mode == "dry-run":
-                final_reply = clean_customer_reply_text(job["reply_text"])
                 state.mark_done(
                     job["id"],
                     message_hash=current["hash"],
                     reply_text=final_reply,
                     reply_source=str(job.get("reply_source") or "") or None,
+                    attachments=job.get("reply_attachments") or [],
                 )
                 _log(f"[AI客服] 演练模式，不发送：{title}｜{_short(final_reply, 140)}")
                 return {"ok": True, "sent": 0, "dry_run": True, "conversation": title}
 
             _log(f"[AI客服] 发送前复核：{title}，最新客户消息未变化，准备发送")
-            final_reply = clean_customer_reply_text(job["reply_text"])
-            reply.send_text(final_reply, dry_run=False, submit=True)
+            reply.send_message(
+                final_reply,
+                attachments=job.get("reply_attachments") or [],
+                dry_run=False,
+                submit=True,
+            )
             time.sleep(0.5)
             after_send = _read_current_with_retry(
                 last=last,
@@ -1107,7 +1328,16 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 message_hash=after_send["hash"],
                 reply_text=final_reply,
                 reply_source=str(job.get("reply_source") or "") or None,
+                attachments=job.get("reply_attachments") or [],
             )
+            if str(job.get("handoff_type") or "").strip():
+                state.mark_handoff_waiting(
+                    job["id"],
+                    message_hash=after_send["hash"],
+                    reply_text=final_reply,
+                    reply_source=str(job.get("reply_source") or "") or "human",
+                    attachments=job.get("reply_attachments") or [],
+                )
             state.append_event(
                 {"type": "agent_sent", "conversation": title, "hash": after_send["hash"], "reply": final_reply}
             )

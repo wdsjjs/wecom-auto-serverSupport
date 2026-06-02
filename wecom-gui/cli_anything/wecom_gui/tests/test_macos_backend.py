@@ -136,6 +136,38 @@ def test_read_current_preserves_uncaptured_latest_turn_image_media(monkeypatch):
     assert data["messages"][1]["media"][0]["capture_ok"] is False
 
 
+def test_read_current_does_not_capture_service_history_media(monkeypatch):
+    captured_batches = []
+
+    def fake_chat_messages(app_name=None, last=10, capture_images=False, include_image_media=None):
+        assert capture_images is False
+        assert include_image_media is True
+        return [
+            {
+                "role": "unknown",
+                "text": "[图片]",
+                "x": 574,
+                "right": 1444,
+                "media": [{"type": "image", "rect": {"x": 9}}],
+            },
+            {"role": "unknown", "text": "最新客户消息", "x": 337, "right": 450},
+        ]
+
+    def fake_capture(messages):
+        captured_batches.append(messages)
+        return messages
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.chat_messages", fake_chat_messages)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.capture_chat_images", fake_capture)
+
+    data = chat.read_current(last=10, capture_images=True)
+
+    assert len(captured_batches) == 1
+    assert captured_batches[0][0].get("media") is None
+    assert data["messages"][0]["role"] == "客服"
+    assert data["messages"][1]["role"] == "用户"
+
+
 def test_read_current_skips_animated_sticker_capture_from_preview(monkeypatch):
     def fake_chat_messages(app_name=None, last=10, capture_images=False, include_image_media=None):
         assert capture_images is False
@@ -161,6 +193,40 @@ def test_read_current_skips_animated_sticker_capture_from_preview(monkeypatch):
     assert data["messages"][0]["text"] == "[动画表情]"
     assert data["messages"][0]["media"][0]["type"] == "animated_sticker"
     assert data["messages"][0]["media"][0]["skip_capture"] is True
+
+
+def test_ax_chat_messages_marks_animated_sticker_media(monkeypatch):
+    def fake_swift(command):
+        if command == "geometry":
+            return [{"ok": True, "sidebar": {"x": 60, "width": 250}}]
+        return [
+            {
+                "index": 2,
+                "texts": [],
+                "x": 311,
+                "width": 1159,
+                "mediaElements": [
+                    {
+                        "mediaType": "animated_sticker",
+                        "skipCapture": True,
+                        "texts": ["动画表情"],
+                        "x": 420,
+                        "y": 300,
+                        "width": 118,
+                        "height": 118,
+                    }
+                ],
+            },
+        ]
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+
+    messages = macos_backend._ax_chat_messages(last=10)
+
+    assert messages[0]["text"] == "[动画表情]"
+    assert messages[0]["media"][0]["type"] == "animated_sticker"
+    assert messages[0]["media"][0]["skip_capture"] is True
+
 
 def test_hidden_image_row_rect_keeps_short_preview_bubbles(monkeypatch):
     monkeypatch.setenv("WECOM_GUI_MIN_IMAGE_BUBBLE_SIZE", "64")
@@ -475,6 +541,59 @@ def test_capture_chat_images_skips_animated_stickers(monkeypatch):
     assert media["capture_ok"] is False
     assert media["capture_mode"] == "skipped"
     assert media["error"] == "media_capture_skipped"
+
+
+def test_capture_chat_images_skips_sticker_hints(monkeypatch):
+    def fail_swift(command):
+        raise AssertionError("sticker hint should skip preview capture")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fail_swift)
+
+    messages = macos_backend.capture_chat_images(
+        [
+            {
+                "role": "用户",
+                "text": "[图片]",
+                "media": [{"type": "image", "texts": ["动画表情"], "rect": {"x": 1}}],
+            }
+        ]
+    )
+
+    media = messages[0]["media"][0]
+    assert media["type"] == "animated_sticker"
+    assert media["skip_capture"] is True
+    assert media["capture_mode"] == "skipped"
+
+
+def test_capture_chat_images_caches_previewless_media_as_skipped(monkeypatch):
+    calls = []
+    rect = {"x": 420, "y": 300, "width": 180, "height": 160}
+
+    def fake_swift(command):
+        calls.append(command)
+        if isinstance(command, list) and command[0] == "doubleclick":
+            return [{"ok": True}]
+        if command == "preview":
+            return [{"ok": False, "error": "preview_image_not_found"}]
+        if command == "close-preview":
+            return [{"ok": True}]
+        return []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+    macos_backend._MEDIA_SKIP_CACHE.clear()
+
+    first = macos_backend.capture_chat_images(
+        [{"role": "用户", "text": "[图片]", "media": [{"type": "image", "source": "axuielement-chat-media", "row": 3, "rect": rect}]}]
+    )
+    second = macos_backend.capture_chat_images(
+        [{"role": "用户", "text": "[图片]", "media": [{"type": "image", "source": "axuielement-chat-media", "row": 3, "rect": rect}]}]
+    )
+
+    doubleclicks = [command for command in calls if isinstance(command, list) and command[0] == "doubleclick"]
+    assert len(doubleclicks) == 1
+    assert first[0]["media"][0]["error"] == "preview_image_not_found"
+    assert second[0]["media"][0]["type"] == "animated_sticker"
+    assert second[0]["media"][0]["capture_mode"] == "skipped"
 
 
 def test_capture_chat_images_preview_mode_uses_doubleclick(monkeypatch, tmp_path):

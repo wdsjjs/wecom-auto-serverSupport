@@ -256,22 +256,36 @@ func collectMediaElements(_ element: AXUIElement, out: inout [[String: Any]], ma
     if let rect = rectPayload(element) {
         let width = rect["width", default: 0]
         let height = rect["height", default: 0]
+        let loweredValues = values.map { $0.lowercased() }
         let looksLikeNamedImage = values.contains { value in
             value.contains("图片") || value.lowercased().contains("image") || value.lowercased().contains("photo")
+        }
+        let looksLikeAnimatedMedia = loweredValues.contains { value in
+            value.contains("动画表情")
+                || value.contains("表情")
+                || value.contains("贴纸")
+                || value.contains("动图")
+                || value.contains("sticker")
+                || value.contains("emoji")
+                || value.contains("gif")
         }
         let roleLooksLikeMedia = elementRole == "AXImage"
             || elementRole == "AXImageView"
             || elementSubrole.lowercased().contains("image")
             || looksLikeNamedImage
+            || looksLikeAnimatedMedia
             || ((elementRole == "AXGroup" || elementRole == "AXButton") && values.isEmpty && width >= 48 && height >= 48)
         if roleLooksLikeMedia
             && width >= 32
             && height >= 32
             && width <= 640
             && height <= 640 {
+            let mediaType = looksLikeAnimatedMedia ? "animated_sticker" : "image"
             out.append([
                 "role": elementRole,
                 "subrole": elementSubrole,
+                "mediaType": mediaType,
+                "skipCapture": looksLikeAnimatedMedia,
                 "texts": values,
                 "x": rect["x", default: 0],
                 "y": rect["y", default: 0],

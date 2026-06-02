@@ -981,8 +981,18 @@ CHAT_NOISE_TEXTS = {
 }
 
 IMAGE_PLACEHOLDER_TEXTS = {"[图片]", "图片"}
+ANIMATED_STICKER_HINTS = (
+    "动画表情",
+    "表情",
+    "贴纸",
+    "动图",
+    "sticker",
+    "emoji",
+    "gif",
+)
 
 IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")
+_MEDIA_SKIP_CACHE: dict[str, float] = {}
 
 
 def _float_value(value: object, default: float = 0.0) -> float:
@@ -1038,6 +1048,59 @@ def _is_image_placeholder_content(content: str, content_parts: list[str]) -> boo
     if normalized in IMAGE_PLACEHOLDER_TEXTS:
         return True
     return bool(content_parts) and all("".join(part.split()) in IMAGE_PLACEHOLDER_TEXTS for part in content_parts)
+
+
+def _media_texts(media: dict) -> list[str]:
+    values: list[str] = []
+    raw_values = media.get("texts")
+    if isinstance(raw_values, list):
+        values.extend(str(value).strip() for value in raw_values if str(value).strip())
+    for key in ("text", "description", "title", "role", "subrole"):
+        value = str(media.get(key) or "").strip()
+        if value:
+            values.append(value)
+    return values
+
+
+def _is_animated_sticker_media(media: dict) -> bool:
+    media_type = str(media.get("type") or media.get("mediaType") or "").strip().lower()
+    if media_type in {"animated_sticker", "sticker", "emoji"}:
+        return True
+    if media.get("skip_capture") or media.get("skipCapture"):
+        return True
+    haystack = " ".join(_media_texts(media)).lower()
+    return any(hint in haystack for hint in ANIMATED_STICKER_HINTS)
+
+
+def _media_skip_cache_key(media: dict, rect: dict) -> str:
+    return "|".join(
+        [
+            str(media.get("source") or ""),
+            str(media.get("row") or ""),
+            str(int(_float_value(rect.get("x")))),
+            str(int(_float_value(rect.get("y")))),
+            str(int(_float_value(rect.get("width")))),
+            str(int(_float_value(rect.get("height")))),
+        ]
+    )
+
+
+def _remember_media_capture_skip(media: dict, rect: dict) -> None:
+    _MEDIA_SKIP_CACHE[_media_skip_cache_key(media, rect)] = time.time()
+
+
+def _media_capture_skip_cached(media: dict, rect: dict) -> bool:
+    key = _media_skip_cache_key(media, rect)
+    if not key.strip("|"):
+        return False
+    ttl = max(0.0, float(os.environ.get("WECOM_GUI_MEDIA_SKIP_CACHE_SECONDS", "900")))
+    created = _MEDIA_SKIP_CACHE.get(key)
+    if created is None:
+        return False
+    if ttl > 0 and time.time() - created > ttl:
+        _MEDIA_SKIP_CACHE.pop(key, None)
+        return False
+    return True
 
 
 def _chat_image_row_rect(item: dict, *, anchor_x: int | None = None) -> dict:
@@ -1122,7 +1185,17 @@ def _hidden_image_rows(last: int, sidebar_right: float, *, include_media: bool =
             "source": "axuielement-chat-hidden-image-row",
         }
         if include_media:
-            message["media"] = [{"type": "image", "rect": rect, "source": "axuielement-chat-hidden-image-row"}]
+            media = {"type": "image", "rect": rect, "source": "axuielement-chat-hidden-image-row", "row": message["row"]}
+            if _media_capture_skip_cached(media, rect):
+                media.update(
+                    {
+                        "type": "animated_sticker",
+                        "skip_capture": True,
+                        "error": "cached_media_capture_skipped",
+                    }
+                )
+                message["text"] = "[动画表情]"
+            message["media"] = [media]
         candidates.append(message)
     return candidates[-last:] if last > 0 else candidates
 
@@ -1271,7 +1344,14 @@ def capture_chat_images(messages: list[dict]) -> list[dict]:
             media_copy = {**media}
             rect = media_copy.get("rect") if isinstance(media_copy.get("rect"), dict) else {}
             media_type = str(media_copy.get("type") or "image").strip().lower()
-            if media_type in {"sticker", "emoji", "animated_sticker"} or media_copy.get("skip_capture"):
+            if (
+                media_type in {"sticker", "emoji", "animated_sticker"}
+                or media_copy.get("skip_capture")
+                or _is_animated_sticker_media(media_copy)
+                or _media_capture_skip_cached(media_copy, rect)
+            ):
+                media_copy["type"] = "animated_sticker"
+                media_copy["skip_capture"] = True
                 media_copy["capture_ok"] = False
                 media_copy["capture_mode"] = "skipped"
                 media_copy["error"] = media_copy.get("error") or "media_capture_skipped"
@@ -1291,6 +1371,8 @@ def capture_chat_images(messages: list[dict]) -> list[dict]:
                 media_copy["capture_rect"] = result.get("rect", {})
             else:
                 media_copy["error"] = result.get("error") or "capture_failed"
+                if media_copy["error"] in {"preview_image_not_found", "preview_not_found"}:
+                    _remember_media_capture_skip(media_copy, rect)
             media_items.append(media_copy)
         if media_items:
             copied["media"] = media_items
@@ -1359,10 +1441,25 @@ def _ax_chat_messages(
                 rect = _rect_from_item(media)
                 if not _is_chat_image_rect(rect):
                     continue
-                media_payload.append({"type": "image", "rect": rect, "source": "axuielement-chat-media"})
+                media_type = str(media.get("type") or media.get("mediaType") or "image").strip() or "image"
+                media_item = {
+                    "type": "animated_sticker" if _is_animated_sticker_media(media) else media_type,
+                    "rect": rect,
+                    "source": "axuielement-chat-media",
+                    "row": int(item.get("index") or len(messages) + 1),
+                }
+                texts = media.get("texts") if isinstance(media.get("texts"), list) else []
+                if texts:
+                    media_item["texts"] = texts
+                if media.get("skip_capture") or media.get("skipCapture") or _is_animated_sticker_media(media):
+                    media_item["skip_capture"] = True
+                media_payload.append(media_item)
             if media_payload:
                 message["media"] = media_payload
-                message["text"] = content or "[图片]"
+                if all(_is_animated_sticker_media(media) for media in media_payload):
+                    message["text"] = "[动画表情]" if _is_image_placeholder_content(content, content_parts) else content
+                else:
+                    message["text"] = content or "[图片]"
                 message["content"] = message["text"]
         messages.append(message)
     if include_hidden_images:
@@ -1658,3 +1755,25 @@ def paste_and_enter(text: str, *, submit: bool) -> dict:
     if submit:
         run_osascript('tell application "System Events" to key code 36')
     return {"ok": True, "submitted": submit, "chars": len(text)}
+
+
+def paste_file_and_enter(path: str | Path, *, submit: bool) -> dict:
+    """Paste one image file into the focused input and optionally submit."""
+    image_path = Path(path).expanduser()
+    if not validate_image_file(image_path):
+        raise RuntimeError(f"invalid image file: {image_path}")
+    safe_path = str(image_path).replace("\\", "\\\\").replace('"', '\\"')
+    script = f'''
+    set imageFile to POSIX file "{safe_path}"
+    tell application "Finder"
+      set the clipboard to imageFile
+    end tell
+    tell application "System Events"
+      keystroke "v" using command down
+      delay 0.2
+    end tell
+    '''
+    run_osascript(script)
+    if submit:
+        run_osascript('tell application "System Events" to key code 36')
+    return {"ok": True, "submitted": submit, "path": str(image_path), "method": "clipboard_file"}

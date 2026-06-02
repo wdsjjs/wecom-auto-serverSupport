@@ -48,3 +48,14 @@ def clean_customer_reply_text(text: object) -> str:
     result = "\n".join(cleaned_lines)
     result = re.sub(r"\n{3,}", "\n\n", result)
     return result.strip()
+
+
+def clean_history_message_text(text: object) -> str:
+    """Normalize chat-history display text without flattening readable lines."""
+    value = clean_customer_reply_text(text)
+    if not value:
+        return ""
+    lines = [re.sub(r"[ \t\u3000]+", " ", line).strip() for line in value.splitlines()]
+    result = "\n".join(lines)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()

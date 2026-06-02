@@ -3,20 +3,26 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AGENT_DIR="$ROOT_DIR/wecom-gui"
-ENV_FILE="$AGENT_DIR/.env.local"
+AGENT_SCRIPT="$AGENT_DIR/scripts/wecom-agent"
+ENV_FILE="${WECOM_AGENT_ENV:-$AGENT_DIR/.env.local}"
 APP_NAME="企业微信"
 QUIT_WECOM=0
 
 usage() {
   cat <<'EOF'
-Usage: ./stop [--quit-wecom]
+Usage: ./stop [options]
 
-Stops the background WeCom AI customer-service agent.
+Stops the WeCom AI customer-service services started by ./run.
 
 Options:
-  --quit-wecom   Also quit the Enterprise WeChat app after stopping the agent.
+  --quit-wecom   Also quit the Enterprise WeChat app.
   -h, --help     Show this help.
 EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -29,13 +35,13 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "ERROR: unknown option: $1" >&2
-      usage >&2
-      exit 2
+      die "unknown option: $1"
       ;;
   esac
   shift
 done
+
+[[ -x "$AGENT_SCRIPT" ]] || die "missing executable: $AGENT_SCRIPT"
 
 if [[ -f "$ENV_FILE" ]]; then
   set -a
@@ -46,23 +52,32 @@ fi
 
 APP_NAME="${WECOM_GUI_APP_NAME:-$APP_NAME}"
 
-if [[ ! -x "$AGENT_DIR/scripts/wecom-agent" ]]; then
-  echo "ERROR: missing executable: $AGENT_DIR/scripts/wecom-agent" >&2
-  exit 1
-fi
+kill_leftovers() {
+  local pattern="$1"
+  local pids
+
+  pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
+  [[ -n "$pids" ]] || return 0
+
+  printf '%s\n' "$pids" | xargs kill 2>/dev/null || true
+  sleep 0.5
+
+  pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
+  if [[ -n "$pids" ]]; then
+    printf '%s\n' "$pids" | xargs kill -9 2>/dev/null || true
+  fi
+}
 
 cd "$AGENT_DIR"
 
-./scripts/wecom-agent stop
-./scripts/wecom-agent review-stop
-./scripts/wecom-agent sidebar-stop
+echo "Stopping WeCom customer-service services..."
+"$AGENT_SCRIPT" stop
+"$AGENT_SCRIPT" review-stop
+"$AGENT_SCRIPT" sidebar-stop
 
-pkill -f 'cli_anything\.wecom_gui agent' 2>/dev/null || true
-pkill -f 'cli_anything\.wecom_gui review' 2>/dev/null || true
-pkill -f 'cli_anything\.wecom_gui sidebar' 2>/dev/null || true
-pkill -f 'SCREEN -dmS wecom-agent' 2>/dev/null || true
-pkill -f 'SCREEN -dmS wecom-review' 2>/dev/null || true
-pkill -f 'SCREEN -dmS wecom-sidebar-8111' 2>/dev/null || true
+kill_leftovers 'cli_anything\.wecom_gui agent'
+kill_leftovers 'cli_anything\.wecom_gui review'
+kill_leftovers 'cli_anything\.wecom_gui sidebar'
 
 if [[ "$QUIT_WECOM" == "1" ]]; then
   if osascript -e "tell application \"System Events\" to exists process \"$APP_NAME\"" 2>/dev/null | grep -qi true; then
@@ -74,6 +89,8 @@ if [[ "$QUIT_WECOM" == "1" ]]; then
 fi
 
 echo
-./scripts/wecom-agent status
+"$AGENT_SCRIPT" status
+"$AGENT_SCRIPT" review-status
+
 echo
 echo "Stopped."

@@ -74,15 +74,25 @@ def infer_roles(messages: list[dict]) -> list[dict]:
 
     left_threshold = (min(xs) + max(xs)) / 2 if len(set(xs)) >= 2 else None
     right_threshold = (min(rights) + max(rights)) / 2 if len(set(rights)) >= 2 else None
+    right_edge = max(rights) if rights else None
+    right_margin = 24
     enriched: list[dict] = []
     for msg in messages:
         x = msg.get("x")
         right = msg.get("right")
-        if isinstance(x, int) and left_threshold is not None and x < left_threshold:
-            role = "用户"
-            confidence = "medium"
+        if (
+            isinstance(right, int)
+            and right_edge is not None
+            and right >= right_edge - right_margin
+            and (not isinstance(x, int) or left_threshold is None or x >= left_threshold)
+        ):
+            role = "客服"
+            confidence = "high"
         elif isinstance(right, int) and right_threshold is not None:
             role = "客服" if right >= right_threshold else "用户"
+            confidence = "medium"
+        elif isinstance(x, int) and left_threshold is not None:
+            role = "客服" if x >= left_threshold else "用户"
             confidence = "medium"
         else:
             role = _normalized_role(msg.get("role"))
@@ -104,11 +114,20 @@ def _message_has_media(message: dict) -> bool:
     return bool(message.get("media"))
 
 
+def _message_is_user_turn_media(message: dict) -> bool:
+    if not _message_has_media(message):
+        return False
+    role = str(message.get("role") or "").strip()
+    return role != "客服"
+
+
 def _last_user_turn_start(messages: list[dict]) -> int:
     for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "用户" or _message_has_media(messages[index]):
+        if messages[index].get("role") == "用户" or _message_is_user_turn_media(messages[index]):
             start = index
-            while start > 0 and (messages[start - 1].get("role") == "用户" or _message_has_media(messages[start - 1])):
+            while start > 0 and (
+                messages[start - 1].get("role") == "用户" or _message_is_user_turn_media(messages[start - 1])
+            ):
                 start -= 1
             return start
     return len(messages)

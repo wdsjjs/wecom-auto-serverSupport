@@ -163,6 +163,28 @@ def test_reply_send_falls_back_to_clipboard_when_ax_fails(monkeypatch):
     assert data["dry_run"] is False
     assert calls == [("ax", "hello", True), ("clipboard", "hello", True)]
 
+def test_reply_send_message_supports_image_attachments(monkeypatch, tmp_path):
+    image_path = tmp_path / "reply.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+    calls = []
+
+    def fake_stage(text, dry_run=False, submit=True):
+        calls.append(("text", text, submit))
+        return {"ok": True, "submitted": submit, "chars": len(text)}
+
+    def fake_file(path, submit=True):
+        calls.append(("file", str(path), submit))
+        return {"ok": True, "submitted": submit, "path": str(path)}
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.reply.send_text", fake_stage)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.paste_file_and_enter", fake_file)
+
+    data = reply.send_message("hello", attachments=[{"type": "image", "path": str(image_path)}], submit=True)
+
+    assert data["ok"] is True
+    assert data["attachment_count"] == 1
+    assert calls == [("text", "hello", False), ("file", str(image_path), True)]
+
 def test_cli_reply_send_dry_run_json():
     runner = CliRunner()
     result = runner.invoke(cli, ["--json", "reply", "send", "--text", "hello", "--dry-run"])
