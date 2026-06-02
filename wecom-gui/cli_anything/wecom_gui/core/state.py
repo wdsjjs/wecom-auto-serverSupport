@@ -1444,11 +1444,6 @@ def _claim_status(from_status: str, to_status: str) -> dict | None:
         conn.close()
 
 
-def claim_next() -> dict | None:
-    """Claim one pending job for the legacy synchronous worker."""
-    return _claim_status("pending", "processing")
-
-
 def claim_pending_for_read() -> dict | None:
     """Claim one pending job for fast context intake."""
     return _claim_status("pending", "reading")

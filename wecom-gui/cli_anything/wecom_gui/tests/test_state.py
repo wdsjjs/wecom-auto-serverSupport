@@ -163,9 +163,9 @@ def test_queue_lifecycle(monkeypatch, tmp_path):
     changed_again, _ = state.enqueue_conversation(row, "sig1")
     assert changed_again is False
 
-    claimed = state.claim_next()
+    claimed = state.claim_pending_for_read()
     assert claimed["title"] == "客户A"
-    assert claimed["status"] == "processing"
+    assert claimed["status"] == "reading"
 
     state.mark_done(claimed["id"], message_hash="hash", reply_text="reply")
     done = state.list_queue(status="done")[0]

@@ -281,16 +281,6 @@ def review_cmd(host: str | None, port: int | None) -> None:
     review_server.serve_review(host=host, port=port)
 
 
-@cli.command("worker")
-@click.option("--poll", default=2.0, show_default=True, type=click.FloatRange(min=1.0))
-@click.option("--last", default=12, show_default=True, type=click.IntRange(min=1))
-@click.option("--mode", default="approve", show_default=True, type=click.Choice(["dry-run", "approve", "auto"]))
-@click.option("--once", is_flag=True, help="Process one queued item then exit.")
-def worker_cmd(poll: float, last: int, mode: str, once: bool) -> None:
-    """Process queued conversations one at a time."""
-    _emit_or_fail(worker_core.worker_loop, poll=poll, last=last, mode=mode, once=once)
-
-
 @cli.command("agent")
 @click.option("--poll", default=0.5, show_default=True, type=click.FloatRange(min=0.1))
 @click.option("--scan-interval", default=1.0, show_default=True, type=click.FloatRange(min=0.3))

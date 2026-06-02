@@ -1,4 +1,4 @@
-"""Queue scanner and worker for multi-conversation auto replies."""
+"""Queue scanning helpers for the fast WeCom agent."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import os
 import time
 import unicodedata
 
-from cli_anything.wecom_gui.core import chat, inbox, llm, reply, state, watcher
+from cli_anything.wecom_gui.core import chat, inbox, state, watcher
 from cli_anything.wecom_gui.utils import macos_backend
 
 
@@ -246,104 +246,3 @@ def scan_loop(*, poll: float, inbox_limit: int, once: bool = False) -> dict:
             break
         time.sleep(poll)
     return {"ok": True, "iterations": iterations, "enqueued": enqueued}
-
-
-def process_one(*, last: int, mode: str) -> dict:
-    """Claim and process one queued conversation."""
-    if mode not in {"dry-run", "approve", "auto"}:
-        raise ValueError("mode must be dry-run, approve, or auto")
-
-    with state.gui_lock():
-        job = state.claim_next()
-        if job is None:
-            return {"ok": True, "processed": 0, "reason": "queue_empty"}
-
-        title = job["title"]
-        try:
-            inbox.open_row(job)
-            time.sleep(0.5)
-            current = chat.read_current(last=last, capture_images=True)
-            latest = watcher.latest_user_message(current["messages"])
-            if latest is None:
-                reason = f"latest_message_not_user:{current['messages'][-1].get('role') if current['messages'] else None}"
-                state.mark_skipped(job["id"], reason)
-                state.append_event({"type": "queue_skipped", "conversation": title, "reason": reason})
-                print(f"[worker] skip {title}: {reason}")
-                return {"ok": True, "processed": 1, "sent": 0, "skipped": 1, "conversation": title, "reason": reason}
-
-            binding = state.lookup_wecom_customer(customer_name=title) or {}
-            draft = llm.draft_reply(
-                current["messages"],
-                customer_name=title,
-                customer_uid=str(binding.get("uid") or ""),
-            )
-            state.append_event(
-                {
-                    "type": "queue_draft",
-                    "conversation": title,
-                    "hash": current["hash"],
-                    "latest": latest,
-                    "draft": draft["text"],
-                    "mode": mode,
-                }
-            )
-            if mode == "dry-run":
-                state.mark_done(job["id"], message_hash=current["hash"], reply_text=draft["text"])
-                print(f"[worker] dry-run {title}: {draft['text']}")
-                return {"ok": True, "processed": 1, "sent": 0, "conversation": title, "reply": draft["text"]}
-            if mode == "approve":
-                print(f"\nConversation: {title}\nSuggested reply:\n{draft['text']}")
-                answer = input("Send this reply? [y/N] ").strip().lower()
-                if answer != "y":
-                    state.mark_skipped(job["id"], "not_approved")
-                    return {"ok": True, "processed": 1, "sent": 0, "conversation": title, "reason": "not_approved"}
-
-            reply.send_text(draft["text"], dry_run=False, submit=True)
-            time.sleep(0.5)
-            after_send = chat.read_current(last=last, capture_images=False)
-            if not _messages_contain_text(after_send["messages"], draft["text"]):
-                raise RuntimeError("sent_reply_not_visible")
-            state.mark_done(job["id"], message_hash=after_send["hash"], reply_text=draft["text"])
-            state.append_event(
-                {"type": "queue_sent", "conversation": title, "hash": after_send["hash"], "reply": draft["text"]}
-            )
-            state.record_metric(
-                "agent_sent",
-                conversation_key=str(job.get("conversation_key") or ""),
-                conversation=title,
-                job_id=job["id"],
-                reply_source="ai",
-                details={"source": "legacy_worker", "reply_preview": str(draft.get("text") or "")[:240]},
-            )
-            print(f"[worker] sent to {title}: {draft['text']}")
-            return {"ok": True, "processed": 1, "sent": 1, "conversation": title, "reply": draft["text"]}
-        except Exception as exc:
-            state.mark_failed(job["id"], str(exc))
-            state.append_event({"type": "queue_failed", "conversation": title, "error": str(exc)})
-            state.record_metric(
-                "agent_send_failed",
-                conversation_key=str(job.get("conversation_key") or ""),
-                conversation=title,
-                job_id=job["id"],
-                reply_source=str(job.get("reply_source") or "ai"),
-                details={"source": "legacy_worker", "error": str(exc)},
-            )
-            print(f"[worker] failed {title}: {exc}")
-            return {"ok": False, "processed": 1, "sent": 0, "failed": 1, "conversation": title, "error": str(exc)}
-
-
-def worker_loop(*, poll: float, last: int, mode: str, once: bool = False) -> dict:
-    """Continuously process queued conversations one at a time."""
-    iterations = 0
-    processed = 0
-    sent = 0
-    while True:
-        iterations += 1
-        result = process_one(last=last, mode=mode)
-        processed += result.get("processed", 0)
-        sent += result.get("sent", 0)
-        if once:
-            break
-        if result.get("reason") == "queue_empty":
-            time.sleep(poll)
-    return {"ok": True, "iterations": iterations, "processed": processed, "sent": sent}

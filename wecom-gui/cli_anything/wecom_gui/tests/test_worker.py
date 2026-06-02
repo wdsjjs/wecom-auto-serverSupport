@@ -224,10 +224,18 @@ def test_fast_agent_rechecks_without_resending_when_reply_not_visible_once(monke
     assert fallback == []
     assert state.list_queue(status="done")[0]["reply_text"] == "随餐服用"
 
-def test_worker_does_not_mark_done_when_sent_reply_is_not_visible(monkeypatch, tmp_path):
+def test_fast_agent_does_not_mark_done_when_sent_reply_is_not_visible(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "鱼油怎么吃", "time": "刚刚", "tags": ["@微信"], "raw": []}
     state.enqueue_conversation(row, "sig1")
+    claimed = state.claim_pending_for_read()
+    state.mark_drafting(
+        claimed["id"],
+        message_hash="hash1",
+        messages=[{"role": "用户", "content": "鱼油怎么吃", "text": "鱼油怎么吃"}],
+        latest={"role": "用户", "content": "鱼油怎么吃", "text": "鱼油怎么吃"},
+    )
+    state.mark_ready(claimed["id"], reply_text="随餐服用")
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda row: {"ok": True})
     monkeypatch.setattr(
         "cli_anything.wecom_gui.core.chat.read_current",
@@ -245,8 +253,9 @@ def test_worker_does_not_mark_done_when_sent_reply_is_not_visible(monkeypatch, t
         "cli_anything.wecom_gui.core.reply.send_text",
         lambda text, dry_run=False, submit=True: {"ok": True, "submitted": True},
     )
+    monkeypatch.setattr("cli_anything.wecom_gui.core.agent.time.sleep", lambda seconds: None)
 
-    result = worker.process_one(last=12, mode="auto")
+    result = agent._send_one_ready(last=12, mode="auto")
 
     assert result["ok"] is False
     assert result["sent"] == 0
