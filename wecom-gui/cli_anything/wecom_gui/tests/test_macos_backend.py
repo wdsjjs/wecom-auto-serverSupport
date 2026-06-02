@@ -252,6 +252,32 @@ def test_ax_chat_messages_filters_sidebar_rows(monkeypatch):
 
     assert [message["text"] for message in messages] == ["真正聊天消息"]
 
+
+def test_ax_conversation_rows_keeps_preview_after_wechat_tag(monkeypatch):
+    def fake_swift(command):
+        if command == "rows":
+            return [
+                {
+                    "index": 1,
+                    "texts": ["三水儿", "@微信", "你已添加了三水儿，现在可以开始聊天了。", "3分钟前"],
+                    "x": 60,
+                    "y": 40,
+                    "width": 250,
+                    "height": 90,
+                    "selected": True,
+                }
+            ]
+        return []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+
+    rows = macos_backend._ax_conversation_rows(limit=10)
+
+    assert rows[0]["title"] == "三水儿"
+    assert rows[0]["tags"] == ["@微信"]
+    assert rows[0]["preview"] == "你已添加了三水儿，现在可以开始聊天了。"
+    assert rows[0]["time"] == "3分钟前"
+
 def test_ax_chat_messages_accepts_chat_pane_on_sidebar_boundary(monkeypatch):
     def fake_swift(command):
         if command == "geometry":

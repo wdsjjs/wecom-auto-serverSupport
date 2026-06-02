@@ -116,6 +116,38 @@ One-time foreground dry run:
 python -u -m cli_anything.wecom_gui agent --mode dry-run --poll 0.5 --scan-interval 1 --inbox-limit 5 --max-drafts 4 --last 12 --log-interval 5
 ```
 
+Export the current WeCom window payload that would be passed to the Agent,
+without enqueueing, calling AI, or sending anything:
+
+```bash
+python -m cli_anything.wecom_gui --json agent-input --last 12 --output /tmp/wecom-agent-input.json
+```
+
+The JSON contains:
+
+- `read`: raw current-window read result, including message roles and hash.
+- `agent_input`: messages and customer identity passed to the GUI Agent layer.
+- `csbot_input`: query and context passed to the csbot autonomous Agent.
+
+## New Customer Welcome
+
+Newly added WeCom customers can appear without an unread badge. The agent treats
+sidebar previews like this as a fixed welcome trigger:
+
+```text
+你已添加了三水儿，现在可以开始聊天了。
+```
+
+Configure the fixed welcome text before using `auto` mode:
+
+```bash
+export WECOM_GUI_WELCOME_MESSAGE='替换成固定欢迎话术'
+```
+
+The welcome draft is marked `reply_source=welcome`. It does not call the ordinary
+AI drafter. With `WECOM_GUI_REQUIRE_UNREAD=1`, the scanner still enqueues this
+new-customer system preview even when the row has no red unread badge.
+
 ## Review Server
 
 Start:

@@ -15,7 +15,7 @@ import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from cli_anything.wecom_gui.core import chat, handoff, inbox, llm, reply, state, watcher, worker
+from cli_anything.wecom_gui.core import chat, handoff, inbox, llm, reply, state, watcher, worker, welcome
 from cli_anything.wecom_gui.core.text import clean_customer_reply_text
 from cli_anything.wecom_gui.utils import macos_backend
 
@@ -308,6 +308,18 @@ def _reply_already_visible(messages: list[dict], reply_text: str | None) -> bool
     return bool(final_reply and worker._messages_contain_text(messages, final_reply))
 
 
+def _latest_non_welcome_customer_message(messages: list[dict]) -> dict | None:
+    for message in reversed(messages):
+        text = _message_text(message).strip()
+        if not text:
+            continue
+        if welcome.is_new_customer_text(text) or text == "以上是打招呼内容":
+            continue
+        if message.get("role") == "用户":
+            return message
+    return None
+
+
 def _handoff_waiting_same_hash(job: dict, current: dict) -> bool:
     return (
         bool(str(job.get("handoff_type") or "").strip())
@@ -568,12 +580,14 @@ def _log_scan(scan: dict) -> None:
     unread = scan.get("unread", 0)
     enqueued = scan.get("enqueued", 0)
     ignored = scan.get("ignored", 0)
-    if not unread and not enqueued:
+    welcome_count = len(scan.get("welcome_items", []) or [])
+    if not unread and not enqueued and not welcome_count:
         return
 
     _log(
         "[AI客服] 扫描左侧会话："
-        f"{_required_tag_text()}={visible}，页数={pages}，未读={unread}，新入队={enqueued}，忽略={ignored}"
+        f"{_required_tag_text()}={visible}，页数={pages}，未读={unread}，"
+        f"新客户={welcome_count}，新入队={enqueued}，忽略={ignored}"
     )
     for row in scan.get("unread_items", [])[:5]:
         unread_count = int(row.get("unread_count") or 0)
@@ -696,6 +710,46 @@ def _draft_for_customer(messages: list[dict], customer_name: str, customer_uid: 
     return llm.draft_reply(messages, customer_name=customer_name, customer_uid=customer_uid)
 
 
+def _mark_welcome_ready(job: dict, current: dict, *, system_text: str) -> dict:
+    message_hash = str(current.get("hash") or "").strip() or welcome.message_hash(
+        str(job.get("conversation_key") or ""),
+        system_text,
+    )
+    message = {
+        "role": "system",
+        "content": system_text,
+        "text": system_text,
+        "source": "wecom-new-customer-system",
+        "role_confidence": "system",
+    }
+    messages = current.get("messages", []) or [message]
+    latest = message
+    state.mark_drafting(
+        job["id"],
+        message_hash=message_hash,
+        messages=messages,
+        latest=latest,
+    )
+    state.mark_ready(
+        job["id"],
+        reply_text=welcome.welcome_message(),
+        reply_source="welcome",
+        action="welcome",
+    )
+    state.append_event(
+        {
+            "type": "welcome_draft_ready",
+            "job_id": job["id"],
+            "conversation": job.get("title") or "",
+            "conversation_key": job.get("conversation_key") or "",
+            "system_text": system_text,
+            "reply_source": "welcome",
+        }
+    )
+    _log(f"[AI客服] 新客户欢迎草稿已生成：{job.get('title') or ''}｜{_short(system_text)}")
+    return {"ok": True, "read": 1, "drafting": 0, "ready": 1, "conversation": job.get("title") or "", "welcome": 1}
+
+
 def _bind_visible_uid(title: str) -> str:
     try:
         uid = macos_backend.current_external_user_id()
@@ -744,6 +798,10 @@ def _read_one_pending(
             f"消息数={len(current.get('messages', []))}"
         )
         _log_read_context(title, job, current)
+        welcome_system_text = welcome.system_text_from_messages(current.get("messages", [])) or welcome.system_text_from_row(job)
+        if welcome_system_text:
+            return _mark_welcome_ready(job, current, system_text=welcome_system_text)
+
         if read_only or _read_only_enabled():
             state.mark_read_logged(
                 job["id"],
@@ -1071,6 +1129,7 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
     context = json.loads(job.get("context_json") or "{}")
     expected_latest = context.get("latest") or {}
     expected_latest_text = expected_latest.get("content") or expected_latest.get("text") or ""
+    is_welcome = str(job.get("reply_source") or "").strip() == "welcome"
     try:
         with state.gui_lock():
             inbox.open_row(job)
@@ -1119,6 +1178,31 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
             latest = watcher.latest_user_message(current["messages"])
             latest_text = (latest or {}).get("content") or (latest or {}).get("text") or ""
 
+            if is_welcome:
+                customer_latest = _latest_non_welcome_customer_message(current.get("messages", []))
+                context_changed = (
+                    bool(str(job.get("last_message_hash") or "").strip())
+                    and bool(str(current.get("hash") or "").strip())
+                    and str(current.get("hash") or "").strip() != str(job.get("last_message_hash") or "").strip()
+                )
+                if context_changed and customer_latest is not None:
+                    reason = "welcome_context_changed"
+                    state.mark_skipped(job["id"], reason)
+                    state.append_event(
+                        {
+                            "type": "welcome_send_recheck_stale",
+                            "conversation": title,
+                            "expected": expected_latest_text,
+                            "actual": _message_text(customer_latest),
+                        }
+                    )
+                    _log(
+                        f"[AI客服] 跳过欢迎发送：{title}，原因=客户已发新消息；"
+                        f"最新消息：{_short(_message_text(customer_latest))}"
+                    )
+                    return {"ok": True, "sent": 0, "skipped": 1, "conversation": title, "reason": reason}
+                _log(f"[AI客服] 发送前复核：{title}，新客户欢迎场景仍有效，准备发送")
+
             role_misread_but_same_text = (
                 latest is None
                 and _last_visible_text_matches(current.get("messages", []), expected_latest_text)
@@ -1127,7 +1211,7 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 current.get("messages", []),
                 expected_latest_text,
             )
-            if not current.get("messages"):
+            if not current.get("messages") and not is_welcome:
                 reason = "send_recheck_empty_retry"
                 if mode == "review":
                     state.mark_approved_retry(job["id"], reply_text=job["reply_text"], reason=reason)
@@ -1143,6 +1227,8 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 _log(f"[AI客服] 发送前复核暂未读到聊天记录：{title}，延后重试发送")
                 return {"ok": True, "sent": 0, "retry": 1, "conversation": title, "reason": reason}
             if (
+                not is_welcome
+                and
                 (not latest or latest_text != expected_latest_text)
                 and not role_misread_but_same_text
                 and not same_turn_contains_expected

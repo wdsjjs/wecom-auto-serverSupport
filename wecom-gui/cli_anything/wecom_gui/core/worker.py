@@ -6,7 +6,7 @@ import os
 import time
 import unicodedata
 
-from cli_anything.wecom_gui.core import chat, inbox, state, watcher
+from cli_anything.wecom_gui.core import chat, inbox, state, watcher, welcome
 from cli_anything.wecom_gui.utils import macos_backend
 
 
@@ -142,18 +142,22 @@ def scan_once(*, inbox_limit: int, process_existing: bool = True, scan_pages: in
     scan = _scan_visible_pages(inbox_limit=inbox_limit, scan_pages=scan_pages, scroll_ticks=scroll_ticks)
     candidates = [row for row in scan["conversations"] if watcher._should_consider(row)]
     unread_rows = [row for row in candidates if _has_unread(row)]
+    welcome_rows = [row for row in candidates if welcome.is_new_customer_row(row) and not _has_unread(row)]
     require_unread = _requires_unread()
-    rows = unread_rows if require_unread else candidates
+    rows = [*unread_rows, *welcome_rows] if require_unread else candidates
     enqueued = 0
-    ignored_no_unread = len(candidates) - len(unread_rows) if require_unread else 0
+    ignored_no_unread = len(candidates) - len(unread_rows) - len(welcome_rows) if require_unread else 0
     ignored_existing = 0
     items: list[dict] = []
+    welcome_items: list[dict] = []
     for row in rows:
         signature = watcher._conversation_signature(row)
         changed, item = state.enqueue_conversation(row, signature)
         if changed:
             enqueued += 1
             items.append(item)
+            if welcome.is_new_customer_row(row):
+                welcome_items.append(row)
             state.append_event({"type": "queue_enqueued", "conversation": row})
         else:
             ignored_existing += 1
@@ -173,6 +177,7 @@ def scan_once(*, inbox_limit: int, process_existing: bool = True, scan_pages: in
         "items": items,
         "candidates": candidates,
         "unread_items": unread_rows,
+        "welcome_items": welcome_items,
         "pages_scanned": scan.get("pages_scanned", 1),
     }
 
@@ -190,13 +195,16 @@ def enqueue_current_chat_if_changed(*, last: int, inbox_limit: int = 30) -> dict
         return {"ok": True, "enqueued": 0, "reason": "selected_conversation_not_found"}
     if not watcher._should_consider(selected):
         return {"ok": True, "enqueued": 0, "reason": "selected_conversation_not_customer"}
+    is_welcome = welcome.is_new_customer_context(selected, current.get("messages", []))
     if latest is None:
         latest = _latest_message_matching_preview(current.get("messages", []), str(selected.get("preview") or ""))
-    if latest is None:
+    if latest is None and not is_welcome:
         return {"ok": True, "enqueued": 0, "reason": "latest_message_not_user"}
-    if latest.get("role_confidence") == "low":
+    if latest is not None and latest.get("role_confidence") == "low":
         return {"ok": True, "enqueued": 0, "reason": "selected_conversation_low_role_confidence"}
-    latest_text = str(latest.get("content") or latest.get("text") or "").strip()
+    latest_text = str((latest or {}).get("content") or (latest or {}).get("text") or "").strip()
+    if is_welcome and not latest_text:
+        latest_text = welcome.system_text_from_messages(current.get("messages", [])) or welcome.system_text_from_row(selected)
     if latest_text and _reply_match_key(latest_text) == _reply_match_key(_latest_reply_for_row(selected)):
         return {"ok": True, "enqueued": 0, "reason": "latest_visible_message_is_own_reply"}
     row = {

@@ -10,6 +10,7 @@ import click
 
 from cli_anything.wecom_gui import __version__
 from cli_anything.wecom_gui.core import agent as agent_core
+from cli_anything.wecom_gui.core import agent_input as agent_input_core
 from cli_anything.wecom_gui.core import app as app_core
 from cli_anything.wecom_gui.core import chat as chat_core
 from cli_anything.wecom_gui.core import inbox as inbox_core
@@ -279,6 +280,41 @@ def sidebar_cmd(host: str, port: int) -> None:
 def review_cmd(host: str | None, port: int | None) -> None:
     """Run the LAN reply review page and approval API."""
     review_server.serve_review(host=host, port=port)
+
+
+@cli.command("agent-input")
+@click.option("--last", default=12, show_default=True, type=click.IntRange(min=1))
+@click.option("--output", "output_path", default="", help="Write payload to this JSON file. Defaults to local state dir.")
+@click.option("--customer-name", default="", help="Override selected conversation/customer name.")
+@click.option("--customer-uid", default="", help="Override WeCom external_user_id / UID.")
+@click.option("--inbox-limit", default=30, show_default=True, type=click.IntRange(min=1))
+@click.option("--no-capture-images", is_flag=True, help="Do not capture image attachments while reading.")
+def agent_input_cmd(
+    last: int,
+    output_path: str,
+    customer_name: str,
+    customer_uid: str,
+    inbox_limit: int,
+    no_capture_images: bool,
+) -> None:
+    """Read current WeCom chat and export the payload that would be passed to Agent."""
+    try:
+        payload = agent_input_core.build_current_agent_input(
+            last=last,
+            capture_images=not no_capture_images,
+            customer_name=customer_name,
+            customer_uid=customer_uid,
+            inbox_limit=inbox_limit,
+        )
+        path = agent_input_core.write_agent_input_file(
+            payload,
+            output_path or agent_input_core.default_output_path(),
+        )
+        payload["output_path"] = str(path)
+        output.emit(payload, message=f"Agent input written to {path}")
+    except Exception as exc:
+        output.error(str(exc), code=type(exc).__name__)
+        raise click.exceptions.Exit(1)
 
 
 @cli.command("agent")

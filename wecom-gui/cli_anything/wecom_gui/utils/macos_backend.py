@@ -555,11 +555,11 @@ def _ax_conversation_rows(limit: int) -> list[dict]:
             continue
         x = float(item.get("x") or 0)
         width = float(item.get("width") or 0)
-        preview = texts[1] if len(texts) > 1 else ""
+        preview = ""
         time_text = ""
         tags: list[str] = []
         unread_count = 0
-        for text in texts[2:]:
+        for text in texts[1:]:
             if text.startswith("@") or any(marker in text for marker in tag_markers()):
                 tags.append(text)
             elif re.search(r"\d+分钟前|刚刚|\d{1,2}:\d{2}|星期|\\d+/\\d+", text):
@@ -935,43 +935,44 @@ def _extract_unread(parts: list[str]) -> tuple[list[str], int]:
 
 def _parse_conversation_parts(parts: list[str]) -> tuple[str, str, str, list[str]]:
     title = parts[0]
-    preview = parts[1] if len(parts) > 1 else ""
+    preview = ""
     time_text = ""
     tags: list[str] = []
     markers = tag_markers()
 
-    if len(parts) == 2 and any(marker in parts[1] for marker in markers):
-        maybe_title_preview = parts[0].split(" ", 1)
+    def _is_tag_text(value: str) -> bool:
+        return value.startswith("@") or value.startswith("·") or any(marker in value for marker in markers)
+
+    def _split_time_and_tag(value: str) -> tuple[str, str] | None:
+        match = re.match(r"^(刚刚|\d+分钟前|\d{1,2}:\d{2}|星期\S*|\\d+/\\d+)\s+(.+)$", value)
+        if not match:
+            return None
+        maybe_tag = match.group(2).strip()
+        if not _is_tag_text(maybe_tag):
+            return None
+        return match.group(1).strip(), maybe_tag
+
+    remaining = parts[1:]
+    if remaining and (_is_tag_text(remaining[0]) or _split_time_and_tag(remaining[0]) is not None):
+        maybe_title_preview = title.split(" ", 1)
         if len(maybe_title_preview) == 2:
             title, preview = maybe_title_preview
-        second = parts[1].split(" ", 1)
-        time_text = second[0]
-        if len(second) == 2:
-            tags.append(second[1])
-        return title, preview, time_text, tags
 
-    if len(parts) >= 2 and any(marker in parts[1] for marker in markers):
-        maybe_title_preview = parts[0].split(" ", 1)
-        if len(maybe_title_preview) == 2:
-            title, preview = maybe_title_preview
-        else:
-            preview = ""
-        second = parts[1].split(" ", 1)
-        time_text = second[0]
-        if len(second) == 2:
-            tags.append(second[1])
-        for part in parts[2:]:
+    for part in remaining:
+        split = _split_time_and_tag(part)
+        if split is not None:
+            maybe_time, maybe_tag = split
+            if not time_text:
+                time_text = maybe_time
+            tags.append(maybe_tag)
+        elif _is_tag_text(part):
             tags.append(part)
-        return title, preview, time_text, tags
-
-    preview = parts[1] if len(parts) > 1 else ""
-    for part in parts[2:]:
-        if part.startswith("@") or part.startswith("·") or any(marker in part for marker in markers):
-            tags.append(part)
-        elif not time_text:
+        elif re.search(r"\d+分钟前|刚刚|\d{1,2}:\d{2}|星期|\\d+/\\d+", part) and not time_text:
             time_text = part
+        elif not preview:
+            preview = part
         else:
-            tags.append(part)
+            preview = f"{preview} {part}".strip()
     return title, preview, time_text, tags
 
 

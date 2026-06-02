@@ -136,6 +136,50 @@ def test_agent_read_only_logs_context_without_drafting(monkeypatch, tmp_path):
     assert any(json.loads(line)["type"] == "agent_read_only_completed" for line in events)
 
 
+def test_agent_builds_welcome_draft_for_new_customer_system_message(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    monkeypatch.setenv("WECOM_GUI_WELCOME_MESSAGE", "欢迎加入")
+    row = {
+        "title": "三水儿",
+        "preview": "你已添加了三水儿，现在可以开始聊天了。",
+        "time": "3分钟前",
+        "tags": ["@微信"],
+        "raw": ["三水儿", "@微信", "你已添加了三水儿，现在可以开始聊天了。", "3分钟前"],
+    }
+    state.enqueue_conversation(row, watcher._conversation_signature(row))
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "hash": "welcome-hash",
+            "source": "accessibility-chat-table",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你已添加了三水儿，现在可以开始聊天了。",
+                    "text": "你已添加了三水儿，现在可以开始聊天了。",
+                }
+            ],
+        },
+    )
+
+    def fail_draft(*args, **kwargs):
+        raise AssertionError("welcome should not call the ordinary AI drafter")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fail_draft)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=12, executor=executor, futures=futures, max_drafts=1)
+
+    assert result["welcome"] == 1
+    assert futures == {}
+    ready = state.list_queue(status="ready")[0]
+    assert ready["reply_text"] == "欢迎加入"
+    assert ready["reply_source"] == "welcome"
+
+
 def test_agent_defers_when_live_chat_messages_missing(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "刘裕鑫", "preview": "老男复维多少钱", "time": "刚刚", "tags": ["@重庆邮电大学"], "raw": []}

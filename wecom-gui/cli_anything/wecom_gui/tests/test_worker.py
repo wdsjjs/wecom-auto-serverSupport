@@ -65,6 +65,35 @@ def test_finish_drafts_discards_stale_result_after_message_replaced(monkeypatch,
     assert pending["reply_text"] is None
     assert any("AI回复已丢弃：客户A" in line for line in logs)
 
+
+def test_scan_once_enqueues_new_customer_without_unread(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.inbox.scan_visible",
+        lambda limit=30: {
+            "ok": True,
+            "conversations": [
+                {
+                    "title": "三水儿",
+                    "preview": "你已添加了三水儿，现在可以开始聊天了。",
+                    "time": "3分钟前",
+                    "tags": ["@微信"],
+                    "raw": ["三水儿", "@微信", "你已添加了三水儿，现在可以开始聊天了。", "3分钟前"],
+                    "unread": False,
+                    "unread_count": 0,
+                }
+            ],
+        },
+    )
+
+    result = worker.scan_once(inbox_limit=30)
+
+    assert result["enqueued"] == 1
+    assert result["ignored_no_unread"] == 0
+    assert result["welcome_items"][0]["title"] == "三水儿"
+    item = state.list_queue(status="pending")[0]
+    assert item["preview"] == "你已添加了三水儿，现在可以开始聊天了。"
+
 def test_superseded_draft_is_untracked_before_pool_capacity_check(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "旧问题", "time": "刚刚", "tags": ["@微信"], "raw": [], "unread": True, "unread_count": 1}
