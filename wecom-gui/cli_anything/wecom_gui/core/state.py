@@ -12,6 +12,8 @@ from pathlib import Path
 
 import fcntl
 
+from cli_anything.wecom_gui.core.text import clean_customer_reply_text
+
 
 ACTIVE_STATUSES = {"processing", "reading", "drafting", "ready", "approved", "sending"}
 REPLACEABLE_ACTIVE_STATUSES = {"processing", "reading", "drafting"}
@@ -85,6 +87,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             click_y REAL,
             source TEXT,
             reply_text TEXT,
+            handoff_type TEXT NOT NULL DEFAULT '',
+            handoff_reason TEXT NOT NULL DEFAULT '',
             error TEXT,
             locked_at REAL,
             created_at REAL NOT NULL,
@@ -97,6 +101,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "reply_queue", "click_x", "REAL")
     _ensure_column(conn, "reply_queue", "click_y", "REAL")
     _ensure_column(conn, "reply_queue", "source", "TEXT")
+    _ensure_column(conn, "reply_queue", "handoff_type", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "reply_queue", "handoff_reason", "TEXT NOT NULL DEFAULT ''")
     _backfill_conversation_keys(conn)
     conn.execute(
         """
@@ -117,12 +123,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             time_text TEXT NOT NULL DEFAULT '',
             source TEXT NOT NULL DEFAULT '',
             role_confidence TEXT NOT NULL DEFAULT '',
+            message_type TEXT NOT NULL DEFAULT '',
             media_json TEXT NOT NULL DEFAULT '[]',
             raw_json TEXT NOT NULL DEFAULT '{}',
             created_at REAL NOT NULL
         )
         """
     )
+    _ensure_column(conn, "conversation_messages", "message_type", "TEXT NOT NULL DEFAULT ''")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_conversation_messages_key
@@ -205,6 +213,8 @@ def _rebuild_reply_queue(conn: sqlite3.Connection) -> None:
             click_y REAL,
             source TEXT,
             reply_text TEXT,
+            handoff_type TEXT NOT NULL DEFAULT '',
+            handoff_reason TEXT NOT NULL DEFAULT '',
             error TEXT,
             locked_at REAL,
             created_at REAL NOT NULL,
@@ -217,11 +227,14 @@ def _rebuild_reply_queue(conn: sqlite3.Connection) -> None:
     select_click_x = "click_x" if "click_x" in old_columns else "NULL AS click_x"
     select_click_y = "click_y" if "click_y" in old_columns else "NULL AS click_y"
     select_source = "source" if "source" in old_columns else "'' AS source"
+    select_handoff_type = "handoff_type" if "handoff_type" in old_columns else "'' AS handoff_type"
+    select_handoff_reason = "handoff_reason" if "handoff_reason" in old_columns else "'' AS handoff_reason"
     rows = conn.execute(
         f"""
         SELECT id, title, preview, time_text, tags_json, raw_json, signature, status,
                attempts, last_message_hash, {select_context}, {select_click_x},
-               {select_click_y}, {select_source}, reply_text, error, locked_at,
+               {select_click_y}, {select_source}, reply_text, {select_handoff_type},
+               {select_handoff_reason}, error, locked_at,
                created_at, updated_at
         FROM {backup}
         ORDER BY id
@@ -233,9 +246,10 @@ def _rebuild_reply_queue(conn: sqlite3.Connection) -> None:
             INSERT INTO reply_queue
                 (id, conversation_key, title, preview, time_text, tags_json, raw_json,
                  signature, status, attempts, last_message_hash, context_json,
-                 click_x, click_y, source, reply_text, error, locked_at,
+                 click_x, click_y, source, reply_text, handoff_type, handoff_reason,
+                 error, locked_at,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["id"],
@@ -254,6 +268,8 @@ def _rebuild_reply_queue(conn: sqlite3.Connection) -> None:
                 row["click_y"],
                 row["source"],
                 row["reply_text"],
+                row["handoff_type"],
+                row["handoff_reason"],
                 row["error"],
                 row["locked_at"],
                 row["created_at"],
@@ -553,6 +569,38 @@ def queue_counts() -> dict[str, int]:
     return {row["status"]: row["count"] for row in rows}
 
 
+def handoff_pending_count() -> int:
+    """Return ready items that require manual handoff handling."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM reply_queue
+            WHERE status = 'ready'
+              AND COALESCE(handoff_type, '') != ''
+            """
+        ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def list_ready_for_review(*, handoff: bool = False, limit: int = 100) -> list[dict]:
+    """List ready review jobs split by ordinary drafts vs handoff items."""
+    comparator = "!=" if handoff else "="
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM reply_queue
+            WHERE status = 'ready'
+              AND COALESCE(handoff_type, '') {comparator} ''
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
 def clear_queue(status: str | None = None) -> int:
     """Clear queued jobs and return deleted count."""
     with connect() as conn:
@@ -720,6 +768,22 @@ def claim_approved_to_send() -> dict | None:
     return _claim_status("approved", "sending")
 
 
+def _message_type_for_record(message: dict) -> str:
+    explicit = str(message.get("message_type") or "").strip().lower()
+    if explicit in {"customer", "reply", "unknown"}:
+        return explicit
+    role = str(message.get("role") or "").strip().lower()
+    if role in {"customer", "user", "human"} or "用户" in role or "客户" in role:
+        return "customer"
+    if (
+        role in {"reply", "service", "assistant", "agent", "staff", "ai", "bot"}
+        or "客服" in role
+        or "坐席" in role
+    ):
+        return "reply"
+    return "unknown"
+
+
 def record_conversation_messages(
     *,
     conversation_key: str,
@@ -743,8 +807,9 @@ def record_conversation_messages(
                 """
                 INSERT INTO conversation_messages
                     (conversation_key, job_id, message_hash, seq, role, text,
-                     time_text, source, role_confidence, media_json, raw_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     time_text, source, role_confidence, message_type, media_json,
+                     raw_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conversation_key,
@@ -756,6 +821,7 @@ def record_conversation_messages(
                     str(message.get("time") or ""),
                     str(message.get("source") or ""),
                     str(message.get("role_confidence") or ""),
+                    _message_type_for_record(message),
                     json.dumps(media, ensure_ascii=False),
                     json.dumps(message, ensure_ascii=False),
                     now,
@@ -786,6 +852,30 @@ def list_conversation_messages(*, conversation_key: str, limit: int = 20) -> lis
         item["raw"] = json.loads(item.pop("raw_json") or "{}")
         items.append(item)
     return items
+
+
+def get_conversation_media(*, message_id: int, media_index: int) -> dict | None:
+    """Return a recorded media entry by opaque DB id/index, never by path."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, media_json FROM conversation_messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        media_items = json.loads(row["media_json"] or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(media_items, list) or media_index < 0 or media_index >= len(media_items):
+        return None
+    media = media_items[media_index]
+    if not isinstance(media, dict):
+        return None
+    path = str(media.get("capture_path") or "").strip()
+    if not path or media.get("capture_ok") is False:
+        return None
+    return {**media, "message_id": message_id, "media_index": media_index, "capture_path": path}
 
 
 def mark_drafting(job_id: int, *, message_hash: str, messages: list[dict], latest: dict) -> None:
@@ -822,16 +912,45 @@ def mark_drafting(job_id: int, *, message_hash: str, messages: list[dict], lates
 
 
 def mark_ready(job_id: int, *, reply_text: str) -> None:
+    final_reply = clean_customer_reply_text(reply_text)
     now = time.time()
     with connect() as conn:
         conn.execute(
             """
             UPDATE reply_queue
-            SET status = 'ready', reply_text = ?, error = NULL,
+            SET status = 'ready', reply_text = ?, handoff_type = '',
+                handoff_reason = '', error = NULL,
                 locked_at = NULL, updated_at = ?
             WHERE id = ?
             """,
-            (reply_text, now, job_id),
+            (final_reply, now, job_id),
+        )
+
+
+def mark_handoff_pending(
+    job_id: int,
+    *,
+    handoff_type: str,
+    handoff_reason: str,
+    reply_text: str,
+) -> None:
+    """Move a job into review-visible manual handoff pending state."""
+    kind = str(handoff_type or "").strip().lower()
+    if kind not in {"direct", "indirect"}:
+        kind = "indirect"
+    reason = str(handoff_reason or "").strip() or "需要人工处理"
+    final_reply = clean_customer_reply_text(reply_text)
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE reply_queue
+            SET status = 'ready', reply_text = ?, handoff_type = ?,
+                handoff_reason = ?, error = NULL, locked_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (final_reply, kind, reason, now, job_id),
         )
 
 
@@ -849,7 +968,7 @@ def mark_approved(job_id: int, *, reply_text: str | None = None) -> bool:
         ).fetchone()
         if row is None or row["status"] != "ready":
             return False
-        final_reply = str(reply_text if reply_text is not None else row["reply_text"] or "").strip()
+        final_reply = clean_customer_reply_text(reply_text if reply_text is not None else row["reply_text"] or "")
         if not final_reply:
             return False
         cur = conn.execute(
@@ -866,7 +985,7 @@ def mark_approved(job_id: int, *, reply_text: str | None = None) -> bool:
 
 def save_reply(job_id: int, *, reply_text: str) -> bool:
     """Save a reviewer-authored reply and keep it waiting for approval."""
-    final_reply = str(reply_text or "").strip()
+    final_reply = clean_customer_reply_text(reply_text)
     if not final_reply:
         return False
     now = time.time()
@@ -903,8 +1022,8 @@ def regenerate_reply(job_id: int, reason: str = "review_regenerate") -> bool:
             """
             UPDATE reply_queue
             SET status = 'pending', reply_text = NULL, context_json = NULL,
-                last_message_hash = NULL, error = ?, locked_at = NULL,
-                updated_at = ?
+                last_message_hash = NULL, handoff_type = '', handoff_reason = '',
+                error = ?, locked_at = NULL, updated_at = ?
             WHERE id = ?
               AND status IN ('ready', 'failed', 'skipped')
             """,
@@ -921,6 +1040,7 @@ def regenerate_reply(job_id: int, reason: str = "review_regenerate") -> bool:
 
 def mark_approved_retry(job_id: int, *, reply_text: str, reason: str = "") -> None:
     """Return an approved reply to the approved send queue after a retryable send check."""
+    final_reply = clean_customer_reply_text(reply_text)
     now = time.time()
     with connect() as conn:
         conn.execute(
@@ -930,7 +1050,7 @@ def mark_approved_retry(job_id: int, *, reply_text: str, reason: str = "") -> No
                 locked_at = NULL, updated_at = ?
             WHERE id = ?
             """,
-            (reply_text, reason or None, now, job_id),
+            (final_reply, reason or None, now, job_id),
         )
 
 
@@ -965,6 +1085,7 @@ def mark_pending(job_id: int, reason: str = "") -> None:
 
 
 def mark_done(job_id: int, *, message_hash: str | None = None, reply_text: str | None = None) -> None:
+    final_reply = clean_customer_reply_text(reply_text) if reply_text is not None else None
     now = time.time()
     with connect() as conn:
         conn.execute(
@@ -974,7 +1095,7 @@ def mark_done(job_id: int, *, message_hash: str | None = None, reply_text: str |
                 error = NULL, locked_at = NULL, updated_at = ?
             WHERE id = ?
             """,
-            (message_hash, reply_text, now, job_id),
+            (message_hash, final_reply, now, job_id),
         )
 
 

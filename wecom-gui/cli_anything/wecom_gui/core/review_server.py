@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import socket
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from cli_anything.wecom_gui import __version__
 from cli_anything.wecom_gui.core import state
+from cli_anything.wecom_gui.core.text import clean_customer_reply_text
+from cli_anything.wecom_gui.utils import macos_backend
 
 
 DEFAULT_HOST = "0.0.0.0"
@@ -70,6 +74,7 @@ REVIEW_HTML = """<!doctype html>
         color: #4e5969;
       }
       .count.active { border-color: #165dff; color: #165dff; background: #f2f6ff; }
+      .count.handoff { border-color: #f97316; color: #c2410c; background: #fff7ed; }
       .count strong { color: #1f2329; margin-left: 4px; }
       .list { display: grid; gap: 12px; }
       .item {
@@ -139,6 +144,33 @@ REVIEW_HTML = """<!doctype html>
         border-color: #c9dcff;
       }
       .msg.unknown .bubble { color: #4e5969; }
+      .media-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+      .media-thumb {
+        max-width: 180px;
+        max-height: 180px;
+        border: 1px solid #e5e6eb;
+        border-radius: 6px;
+        background: #fff;
+      }
+      .media-failed {
+        border: 1px dashed #d92d20;
+        border-radius: 6px;
+        padding: 8px 10px;
+        color: #b42318;
+        background: #fff5f5;
+        font-size: 12px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 12px;
+        border: 1px solid #fed7aa;
+        color: #c2410c;
+        background: #fff7ed;
+      }
       .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
       .empty {
         border: 1px dashed #c9cdd4;
@@ -188,7 +220,7 @@ REVIEW_HTML = """<!doctype html>
         skipped: "已拒绝/跳过",
         failed: "失败"
       };
-      const visibleStatuses = ["pending", "reading", "drafting", "ready", "approved", "sending", "done", "skipped", "failed"];
+      const visibleStatuses = ["handoff", "pending", "reading", "drafting", "ready", "approved", "sending", "done", "skipped", "failed"];
       const replyDrafts = new Map();
       function authHeaders(extra = {}) {
         return { ...extra };
@@ -220,8 +252,8 @@ REVIEW_HTML = """<!doctype html>
       }
       function renderCounts(counts) {
         countsEl.innerHTML = visibleStatuses.map(key => (
-          `<button class="count ${key === selectedStatus ? "active" : ""}" data-status="${key}">
-            ${labels[key] || key}<strong>${Number(counts[key] || 0)}</strong>
+          `<button class="count ${key === selectedStatus ? "active" : ""} ${key === "handoff" ? "handoff" : ""}" data-status="${key}">
+            ${key === "handoff" ? "转人工待处理" : (labels[key] || key)}<strong>${Number(counts[key] || 0)}</strong>
           </button>`
         )).join("");
       }
@@ -242,16 +274,28 @@ REVIEW_HTML = """<!doctype html>
         return role || "消息";
       }
       function renderMessages(messages, fallbackText) {
-        const source = Array.isArray(messages) ? messages.filter(item => String(item.text || "").trim()) : [];
+        const source = Array.isArray(messages) ? messages.filter(item => String(item.text || "").trim() || (item.media || []).length) : [];
         if (!source.length) {
           return `<div class="box">${escapeText(fallbackText || "")}</div>`;
         }
         return `<div class="conversation">${source.map(message => `
           <div class="msg ${roleClass(message)}">
             <div class="msg-meta">${escapeText(roleLabel(message))}${message.time_text ? ` · ${escapeText(message.time_text)}` : ""}</div>
-            <div class="bubble">${escapeText(message.text || "")}</div>
+            <div class="bubble">
+              ${escapeText(message.text || "")}
+              ${renderMedia(message.media || [])}
+            </div>
           </div>
         `).join("")}</div>`;
+      }
+      function renderMedia(mediaItems) {
+        if (!Array.isArray(mediaItems) || !mediaItems.length) return "";
+        return `<div class="media-list">${mediaItems.map(media => {
+          if (media.capture_ok && media.url) {
+            return `<img class="media-thumb" src="${escapeText(media.url)}" alt="聊天图片" loading="lazy" />`;
+          }
+          return `<div class="media-failed">图片未能截取${media.error ? `：${escapeText(media.error)}` : ""}</div>`;
+        }).join("")}</div>`;
       }
       function renderItems(items) {
         if (!items.length) {
@@ -263,7 +307,10 @@ REVIEW_HTML = """<!doctype html>
             <div class="item-head">
               <div>
                 <div class="title">${escapeText(item.title || "未命名客户")}</div>
-                <div class="status">${escapeText(labels[item.status] || item.status)} · #${item.id}</div>
+                <div class="status">
+                  ${escapeText(labels[item.status] || item.status)} · #${item.id}
+                  ${item.handoff_pending ? `<span class="badge">${item.handoff_type === "direct" ? "直接转人工" : "AI转人工"}</span>` : ""}
+                </div>
               </div>
               <div class="meta">${escapeText(fmtTime(item.updated_at))}</div>
             </div>
@@ -273,6 +320,7 @@ REVIEW_HTML = """<!doctype html>
             ${item.status === "ready" ? `
               <textarea class="reply-editor" data-id="${item.id}" placeholder="可以修改 AI 生成内容，或直接写客服自己的回复">${escapeText(replyTextFor(item))}</textarea>
             ` : `<div class="box reply">${escapeText(item.reply_text || "")}</div>`}
+            ${item.handoff_pending ? `<div class="label">转人工原因</div><div class="box error">${escapeText(item.handoff_reason || "需要人工处理")}</div>` : ""}
             ${item.error ? `<div class="label">备注</div><div class="box error">${escapeText(item.error)}</div>` : ""}
             ${renderActions(item)}
           </article>
@@ -398,6 +446,28 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict:
     return value
 
 
+def _send_file_response(handler: BaseHTTPRequestHandler, path: Path) -> None:
+    try:
+        body = path.read_bytes()
+    except OSError:
+        _json_response(handler, 404, {"ok": False, "error": "media_not_found"})
+        return
+    if not macos_backend.validate_image_file(path):
+        _json_response(handler, 415, {"ok": False, "error": "invalid_image_file"})
+        return
+    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    if not content_type.startswith("image/"):
+        _json_response(handler, 415, {"ok": False, "error": "unsupported_media_type"})
+        return
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Cache-Control", "private, max-age=300")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 def _context_latest_text(item: dict) -> str:
     context_raw = str(item.get("context_json") or "").strip()
     if not context_raw:
@@ -434,7 +504,30 @@ def _fallback_messages(item: dict, latest_text: str) -> list[dict]:
     ]
 
 
+def _sanitize_media(message: dict) -> list[dict]:
+    media_items = message.get("media") if isinstance(message.get("media"), list) else []
+    sanitized: list[dict] = []
+    message_id = int(message.get("id") or 0)
+    for index, media in enumerate(media_items):
+        if not isinstance(media, dict):
+            continue
+        capture_ok = bool(media.get("capture_path")) and media.get("capture_ok", True) is not False
+        item = {
+            "type": str(media.get("type") or "image"),
+            "capture_ok": capture_ok,
+            "error": str(media.get("error") or ""),
+            "source": str(media.get("source") or ""),
+        }
+        if capture_ok and message_id:
+            item["url"] = f"/api/review/media/{message_id}/{index}"
+        sanitized.append(item)
+    return sanitized
+
+
 def _message_type(message: dict) -> str:
+    explicit = str(message.get("message_type") or "").strip().lower()
+    if explicit in {"customer", "reply", "unknown"}:
+        return explicit
     role = str(message.get("role") or "").strip().lower()
     if role in {"customer", "user", "human"} or "用户" in role or "客户" in role:
         return "customer"
@@ -448,7 +541,15 @@ def _message_type(message: dict) -> str:
 
 
 def _classified_messages(messages: list[dict]) -> list[dict]:
-    return [{**message, "message_type": _message_type(message)} for message in messages]
+    return [
+        {
+            **message,
+            "message_type": _message_type(message),
+            "media": _sanitize_media(message),
+            "text": clean_customer_reply_text(message.get("text") or ""),
+        }
+        for message in messages
+    ]
 
 
 def _review_item(item: dict) -> dict:
@@ -466,7 +567,10 @@ def _review_item(item: dict) -> dict:
         "preview": item.get("preview") or "",
         "latest_text": latest_text,
         "messages": messages,
-        "reply_text": item.get("reply_text") or "",
+        "reply_text": clean_customer_reply_text(item.get("reply_text") or ""),
+        "handoff_type": item.get("handoff_type") or "",
+        "handoff_reason": item.get("handoff_reason") or "",
+        "handoff_pending": bool(item.get("handoff_type")),
         "error": item.get("error") or "",
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
@@ -475,9 +579,14 @@ def _review_item(item: dict) -> dict:
 
 
 def list_review_items(*, status: str = "ready", limit: int = 100) -> list[dict]:
-    allowed = {"pending", "reading", "drafting", "ready", "approved", "sending", "done", "skipped", "failed"}
+    allowed = {"handoff", "pending", "reading", "drafting", "ready", "approved", "sending", "done", "skipped", "failed"}
     selected_status = status if status in allowed else "ready"
-    items = state.list_queue(status=selected_status, limit=limit)
+    if selected_status == "handoff":
+        items = state.list_ready_for_review(handoff=True, limit=limit)
+    elif selected_status == "ready":
+        items = state.list_ready_for_review(handoff=False, limit=limit)
+    else:
+        items = state.list_queue(status=selected_status, limit=limit)
     return [_review_item(item) for item in items]
 
 
@@ -485,6 +594,8 @@ def review_counts() -> dict[str, int]:
     counts = state.queue_counts()
     for status in ("pending", "reading", "drafting", "ready", "approved", "sending", "done", "skipped", "failed"):
         counts.setdefault(status, 0)
+    counts["handoff"] = state.handoff_pending_count()
+    counts["ready"] = len(state.list_ready_for_review(handoff=False, limit=1000000))
     return counts
 
 
@@ -563,6 +674,20 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/review/counts":
             _json_response(self, 200, {"ok": True, "counts": review_counts(), "ts": time.time()})
+            return
+        media_parts = [part for part in parsed.path.split("/") if part]
+        if len(media_parts) == 5 and media_parts[:3] == ["api", "review", "media"]:
+            try:
+                message_id = int(media_parts[3])
+                media_index = int(media_parts[4])
+            except ValueError:
+                _json_response(self, 400, {"ok": False, "error": "invalid_media_id"})
+                return
+            media = state.get_conversation_media(message_id=message_id, media_index=media_index)
+            if not media:
+                _json_response(self, 404, {"ok": False, "error": "media_not_found"})
+                return
+            _send_file_response(self, Path(str(media["capture_path"])))
             return
         _json_response(self, 404, {"ok": False, "error": "not_found"})
 

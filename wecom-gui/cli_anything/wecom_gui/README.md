@@ -117,6 +117,14 @@ POST /api/review/items/{id}/reject
 The review page reads live queue items from the local SQLite state database
 under `~/.cli-anything-wecom-gui/state.sqlite`; it does not serve mock items.
 
+SQLite schema notes:
+
+- `reply_queue` stores `handoff_type` and `handoff_reason` so direct customer
+  handoff requests and AI-decided handoffs can share the review queue.
+- `conversation_messages` stores stable `message_type` values
+  (`customer`, `reply`, or `unknown`) and image metadata in `media_json`.
+  Missing columns are added automatically by schema initialization.
+
 ## Queue States
 
 ```text

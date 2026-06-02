@@ -3135,6 +3135,193 @@ def test_review_items_classify_customer_reply_and_unknown_messages(monkeypatch, 
     assert [message["message_type"] for message in item["messages"]] == ["customer", "reply", "unknown"]
 
 
+def test_review_items_include_image_media_payloads_and_failures(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    image_path = tmp_path / "image.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+    row = {"title": "客户A", "preview": "[图片]", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[
+            {
+                "role": "用户",
+                "content": "[图片]",
+                "media": [
+                    {"type": "image", "capture_ok": True, "capture_path": str(image_path)},
+                    {"type": "image", "capture_ok": False, "error": "preview_not_found"},
+                ],
+            }
+        ],
+        latest={"role": "用户", "content": "[图片]"},
+    )
+    state.mark_ready(job["id"], reply_text="我看到了图片。")
+
+    message = review_server.list_review_items(status="ready")[0]["messages"][0]
+
+    assert message["media"][0]["capture_ok"] is True
+    assert message["media"][0]["url"].startswith("/api/review/media/")
+    assert "capture_path" not in message["media"][0]
+    assert message["media"][1]["capture_ok"] is False
+    assert message["media"][1]["error"] == "preview_not_found"
+
+
+def test_review_media_route_serves_only_recorded_captured_images(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    image_path = tmp_path / "image.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
+    row = {"title": "客户A", "preview": "[图片]", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[
+            {
+                "role": "用户",
+                "content": "[图片]",
+                "media": [{"type": "image", "capture_ok": True, "capture_path": str(image_path)}],
+            }
+        ],
+        latest={"role": "用户", "content": "[图片]"},
+    )
+    state.mark_ready(job["id"], reply_text="我看到了图片。")
+    message_id = state.list_conversation_messages(conversation_key=job["conversation_key"])[0]["id"]
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), review_server.ReviewHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        with request.urlopen(f"{base}/api/review/media/{message_id}/0", timeout=5) as resp:
+            body = resp.read()
+            content_type = resp.headers.get("Content-Type")
+        assert body.startswith(b"\x89PNG")
+        assert content_type == "image/png"
+
+        with pytest.raises(Exception):
+            request.urlopen(f"{base}/api/review/media/{message_id}/1", timeout=5)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+
+def test_review_classifies_white_plush_toy_reply_as_reply(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "这个白色毛绒玩具是什么？", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[
+            {"role": "用户", "content": "这个白色毛绒玩具是什么？"},
+            {"role": "assistant", "message_type": "reply", "content": "这个白色毛绒玩具看起来是小羊玩偶。"},
+            {"role": "用户", "content": "那能买吗？"},
+        ],
+        latest={"role": "用户", "content": "那能买吗？"},
+    )
+    state.mark_ready(job["id"], reply_text="我帮您确认一下。")
+
+    item = review_server.list_review_items(status="ready")[0]
+
+    assert item["messages"][1]["message_type"] == "reply"
+
+
+def test_direct_handoff_enters_handoff_queue_without_ai_draft(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "我要转人工", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=True: {
+        "hash": "hash-a",
+        "messages": [{"role": "用户", "content": "我要转人工", "text": "我要转人工"}],
+    })
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("AI should not draft direct handoff")))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = agent._read_one_pending(last=12, executor=executor, futures={}, max_drafts=1)
+
+    assert result["handoff"] == 1
+    item = review_server.list_review_items(status="handoff")[0]
+    assert item["handoff_pending"] is True
+    assert item["handoff_type"] == "direct"
+    assert "转人工" in item["handoff_reason"]
+
+
+def test_indirect_ai_handoff_enters_handoff_queue(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "这个问题很复杂", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "这个问题很复杂"}],
+        latest={"role": "用户", "content": "这个问题很复杂"},
+    )
+    future = mock.Mock()
+    future.done.return_value = True
+    future.result.return_value = {
+        "text": "您好，这个问题我帮您转人工客服确认处理，请您稍等。",
+        "action": "handoff",
+        "raw": {"codex": {"reply": {"decision_basis": "复杂售后问题"}}},
+    }
+    futures = {job["id"]: future}
+    agent._DRAFT_MESSAGE_HASH[job["id"]] = "hash-a"
+
+    result = agent._finish_drafts(futures)
+
+    assert result["ready"] == 1
+    item = review_server.list_review_items(status="handoff")[0]
+    assert item["handoff_type"] == "indirect"
+    assert item["handoff_reason"] == "复杂售后问题"
+
+
+def test_markdown_cleanup_for_review_save_approve_and_send(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "说明一下", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "说明一下", "text": "说明一下"}],
+        latest={"role": "用户", "content": "说明一下"},
+    )
+    state.mark_ready(job["id"], reply_text="# 标题\n**重点**\n* 项目一\n> 引用\n```json\n{}\n```\n<tag>内容</tag>")
+
+    saved = review_server.save_item(job["id"], reply_text="## 回复\n**您好**\n* 第一条\n_第二条_\n::debug{bad}")
+    assert saved["item"]["reply_text"] == "回复\n您好\n- 第一条\n第二条"
+    approved = review_server.approve_item(job["id"], reply_text="**最终**\n+ 清单")
+    assert approved["item"]["reply_text"] == "最终\n- 清单"
+
+    reads = iter(
+        [
+            {"hash": "precheck", "messages": [{"role": "用户", "content": "说明一下", "text": "说明一下"}]},
+            {
+                "hash": "after",
+                "messages": [
+                    {"role": "用户", "content": "说明一下", "text": "说明一下"},
+                    {"role": "客服", "content": "最终\n- 清单", "text": "最终\n- 清单"},
+                ],
+            },
+        ]
+    )
+    sent = []
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
+    monkeypatch.setattr("cli_anything.wecom_gui.core.reply.send_text", lambda text, dry_run=False, submit=True: sent.append(text))
+
+    result = agent._send_one_ready(last=12, mode="review")
+
+    assert result["sent"] == 1
+    assert sent == ["最终\n- 清单"]
+
+
 def test_mark_drafting_replaces_persisted_conversation_messages(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "旧预览", "time": "刚刚", "tags": ["@微信"], "raw": []}

@@ -15,7 +15,8 @@ import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from cli_anything.wecom_gui.core import chat, inbox, llm, reply, state, watcher, worker
+from cli_anything.wecom_gui.core import chat, handoff, inbox, llm, reply, state, watcher, worker
+from cli_anything.wecom_gui.core.text import clean_customer_reply_text
 from cli_anything.wecom_gui.utils import macos_backend
 
 
@@ -703,6 +704,32 @@ def _read_one_pending(*, last: int, executor: ThreadPoolExecutor, futures: dict[
             state.mark_pending(job["id"], reason)
             return {"ok": True, "read": 1, "drafting": 0, "conversation": title, "reason": reason}
 
+        latest_turn_text = llm.latest_user_turn_text(current["messages"]) or _message_text(latest)
+        if handoff.detect_direct_handoff(latest_turn_text):
+            reason = handoff.direct_handoff_reason(latest_turn_text)
+            state.mark_drafting(
+                job["id"],
+                message_hash=current["hash"],
+                messages=current["messages"],
+                latest=latest,
+            )
+            state.mark_handoff_pending(
+                job["id"],
+                handoff_type="direct",
+                handoff_reason=reason,
+                reply_text=handoff.HANDOFF_REPLY_TEXT,
+            )
+            state.append_event(
+                {
+                    "type": "agent_direct_handoff",
+                    "job_id": job["id"],
+                    "conversation": title,
+                    "reason": reason,
+                    "latest": latest_turn_text,
+                }
+            )
+            _log(f"[AI客服] 客户要求转人工：{title}｜{_short(latest_turn_text)}")
+            return {"ok": True, "read": 1, "drafting": 0, "handoff": 1, "conversation": title, "reason": reason}
         pool = _draft_pool_for_messages(current["messages"])
         if not _has_pool_capacity(pool, futures, max_drafts):
             state.mark_pending(job["id"], f"{pool}_pool_full")
@@ -715,7 +742,6 @@ def _read_one_pending(*, last: int, executor: ThreadPoolExecutor, futures: dict[
                 }
             )
             return {"ok": True, "read": 1, "drafting": 0, "conversation": title, "reason": f"{pool}_pool_full"}
-
         state.mark_drafting(
             job["id"],
             message_hash=current["hash"],
@@ -789,7 +815,26 @@ def _finish_drafts(futures: dict[int, Future]) -> dict:
                 )
                 _log(f"[AI客服] AI回复已丢弃：{title}，原因=旧消息已被新消息覆盖，{elapsed_text}，池={pool}")
                 continue
-            state.mark_ready(job_id, reply_text=draft["text"])
+            if draft.get("action") == "handoff":
+                raw = draft.get("raw") if isinstance(draft.get("raw"), dict) else {}
+                codex = raw.get("codex") if isinstance(raw.get("codex"), dict) else {}
+                reply_body = codex.get("reply") if isinstance(codex.get("reply"), dict) else {}
+                handoff_result = codex.get("handoff") if isinstance(codex.get("handoff"), dict) else {}
+                reason = str(
+                    reply_body.get("decision_basis")
+                    or handoff_result.get("reason")
+                    or handoff_result.get("error")
+                    or draft.get("text")
+                    or "AI 判断需要人工处理"
+                ).strip()
+                state.mark_handoff_pending(
+                    job_id,
+                    handoff_type="indirect",
+                    handoff_reason=reason,
+                    reply_text=draft["text"] or handoff.HANDOFF_REPLY_TEXT,
+                )
+            else:
+                state.mark_ready(job_id, reply_text=draft["text"])
             state.append_event(
                 {
                     "type": "agent_ready",
@@ -944,34 +989,36 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 _log(f"[AI客服] 发送前复核：{title}，同一轮客户消息仍包含原问题，准备发送")
 
             if mode == "dry-run":
-                state.mark_done(job["id"], message_hash=current["hash"], reply_text=job["reply_text"])
-                _log(f"[AI客服] 演练模式，不发送：{title}｜{_short(job['reply_text'], 140)}")
+                final_reply = clean_customer_reply_text(job["reply_text"])
+                state.mark_done(job["id"], message_hash=current["hash"], reply_text=final_reply)
+                _log(f"[AI客服] 演练模式，不发送：{title}｜{_short(final_reply, 140)}")
                 return {"ok": True, "sent": 0, "dry_run": True, "conversation": title}
 
             _log(f"[AI客服] 发送前复核：{title}，最新客户消息未变化，准备发送")
-            reply.send_text(job["reply_text"], dry_run=False, submit=True)
+            final_reply = clean_customer_reply_text(job["reply_text"])
+            reply.send_text(final_reply, dry_run=False, submit=True)
             time.sleep(0.5)
             after_send = _read_current_with_retry(
                 last=last,
-                expected_visible_text=job["reply_text"],
+                expected_visible_text=final_reply,
                 capture_images=False,
             )
-            if not worker._messages_contain_text(after_send["messages"], job["reply_text"]):
+            if not worker._messages_contain_text(after_send["messages"], final_reply):
                 _log(f"[AI客服] 发送后暂未读到回复，继续复核：{title}")
                 after_send = _read_current_with_retry(
                     last=last,
-                    expected_visible_text=job["reply_text"],
+                    expected_visible_text=final_reply,
                     capture_images=False,
                     attempts=max(2, int(os.environ.get("WECOM_AGENT_SEND_VERIFY_ATTEMPTS", "5"))),
                     delay=float(os.environ.get("WECOM_AGENT_SEND_VERIFY_DELAY", "0.45")),
                 )
-                if not worker._messages_contain_text(after_send["messages"], job["reply_text"]):
+                if not worker._messages_contain_text(after_send["messages"], final_reply):
                     raise RuntimeError("sent_reply_not_visible")
-            state.mark_done(job["id"], message_hash=after_send["hash"], reply_text=job["reply_text"])
+            state.mark_done(job["id"], message_hash=after_send["hash"], reply_text=final_reply)
             state.append_event(
-                {"type": "agent_sent", "conversation": title, "hash": after_send["hash"], "reply": job["reply_text"]}
+                {"type": "agent_sent", "conversation": title, "hash": after_send["hash"], "reply": final_reply}
             )
-            _log(f"[AI客服] 已发送给 {title}：{_short(job['reply_text'], 140)}")
+            _log(f"[AI客服] 已发送给 {title}：{_short(final_reply, 140)}")
             return {"ok": True, "sent": 1, "conversation": title}
     except Exception as exc:
         state.mark_failed(job["id"], str(exc))

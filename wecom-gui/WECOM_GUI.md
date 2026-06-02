@@ -148,6 +148,14 @@ POST /api/review/items/{id}/reject
 The review page reads live queue items from
 `~/.cli-anything-wecom-gui/state.sqlite`; it does not serve mock items.
 
+SQLite schema notes:
+
+- `reply_queue` includes `handoff_type` and `handoff_reason` for direct/AI
+  handoff review items. These columns are added automatically on startup.
+- `conversation_messages` includes persisted `message_type` values
+  (`customer`, `reply`, or `unknown`) plus `media_json`; review image URLs are
+  served only from recorded media rows and never from arbitrary file paths.
+
 ## Configuration
 
 Primary file:
