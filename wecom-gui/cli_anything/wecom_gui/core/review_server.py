@@ -604,6 +604,13 @@ def approve_item(job_id: int, *, reply_text: str | None = None) -> dict:
         return {"ok": False, "error": "not_ready", "id": job_id}
     item = state.get_job(job_id)
     state.append_event({"type": "review_approved", "job_id": job_id, "conversation": (item or {}).get("title")})
+    state.record_metric(
+        "review_approved",
+        conversation_key=str((item or {}).get("conversation_key") or ""),
+        conversation=str((item or {}).get("title") or ""),
+        job_id=job_id,
+        reply_source=str((item or {}).get("reply_source") or ""),
+    )
     return {"ok": True, "item": _review_item(item or {})}
 
 
@@ -612,6 +619,13 @@ def save_item(job_id: int, *, reply_text: str) -> dict:
         return {"ok": False, "error": "not_ready", "id": job_id}
     item = state.get_job(job_id)
     state.append_event({"type": "review_saved", "job_id": job_id, "conversation": (item or {}).get("title")})
+    state.record_metric(
+        "review_saved",
+        conversation_key=str((item or {}).get("conversation_key") or ""),
+        conversation=str((item or {}).get("title") or ""),
+        job_id=job_id,
+        reply_source=str((item or {}).get("reply_source") or "human"),
+    )
     return {"ok": True, "item": _review_item(item or {})}
 
 
@@ -622,6 +636,13 @@ def regenerate_item(job_id: int, *, reason: str = "review_regenerate") -> dict:
     state.append_event(
         {"type": "review_regenerate", "job_id": job_id, "conversation": (item or {}).get("title"), "reason": reason}
     )
+    state.record_metric(
+        "review_regenerate",
+        conversation_key=str((item or {}).get("conversation_key") or ""),
+        conversation=str((item or {}).get("title") or ""),
+        job_id=job_id,
+        details={"reason": reason},
+    )
     return {"ok": True, "item": _review_item(item or {})}
 
 
@@ -631,6 +652,13 @@ def reject_item(job_id: int, *, reason: str = "review_rejected") -> dict:
     item = state.get_job(job_id)
     state.append_event(
         {"type": "review_rejected", "job_id": job_id, "conversation": (item or {}).get("title"), "reason": reason}
+    )
+    state.record_metric(
+        "review_rejected",
+        conversation_key=str((item or {}).get("conversation_key") or ""),
+        conversation=str((item or {}).get("title") or ""),
+        job_id=job_id,
+        details={"reason": reason},
     )
     return {"ok": True, "item": _review_item(item or {})}
 
@@ -674,6 +702,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/review/counts":
             _json_response(self, 200, {"ok": True, "counts": review_counts(), "ts": time.time()})
+            return
+        if parsed.path == "/api/review/metrics":
+            params = parse_qs(parsed.query)
+            since_hours = float((params.get("since_hours") or ["24"])[0])
+            _json_response(self, 200, {"ok": True, "metrics": state.metrics_summary(since_hours=since_hours)})
             return
         media_parts = [part for part in parsed.path.split("/") if part]
         if len(media_parts) == 5 and media_parts[:3] == ["api", "review", "media"]:

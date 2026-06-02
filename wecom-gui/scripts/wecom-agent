@@ -40,11 +40,77 @@ MAX_DRAFTS="${WECOM_AGENT_MAX_DRAFTS:-2}"
 LAST_MESSAGES="${WECOM_AGENT_LAST:-4}"
 LOG_INTERVAL="${WECOM_AGENT_LOG_INTERVAL:-1}"
 
-PYTHON_BIN="${WECOM_GUI_PYTHON:-python}"
+if [[ -x "$ROOT_DIR/../.venv/bin/python" ]]; then
+  DEFAULT_PYTHON_BIN="$ROOT_DIR/../.venv/bin/python"
+else
+  DEFAULT_PYTHON_BIN="python3"
+fi
+PYTHON_BIN="${WECOM_GUI_PYTHON:-$DEFAULT_PYTHON_BIN}"
 PYTHONPATH_VALUE="${WECOM_GUI_PYTHONPATH:-}"
+
+wecom_process_exists() {
+  local app_name="$1"
+  osascript - "$app_name" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set appName to item 1 of argv
+  tell application "System Events"
+    if exists process appName then
+      return "yes"
+    else
+      return "no"
+    end if
+  end tell
+end run
+APPLESCRIPT
+}
+
+ensure_wecom_running() {
+  if [[ "${WECOM_GUI_AUTO_LAUNCH_WECOM:-1}" == "0" ]]; then
+    return 0
+  fi
+  if ! command -v osascript >/dev/null 2>&1 || ! command -v open >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local candidates=()
+  if [[ -n "${WECOM_GUI_APP_NAME:-}" ]]; then
+    candidates+=("${WECOM_GUI_APP_NAME}")
+  fi
+  candidates+=("企业微信" "WeCom" "WeChat Work")
+
+  local app_name
+  for app_name in "${candidates[@]}"; do
+    if [[ "$(wecom_process_exists "$app_name")" == "yes" ]]; then
+      open -a "$app_name" >/dev/null 2>&1 || true
+      echo "WeCom already running: $app_name"
+      return 0
+    fi
+  done
+
+  for app_name in "${candidates[@]}"; do
+    if open -a "$app_name" >/dev/null 2>&1; then
+      echo "launching WeCom: $app_name"
+      break
+    fi
+  done
+
+  local deadline=$((SECONDS + ${WECOM_GUI_LAUNCH_WAIT_SECONDS:-20}))
+  while (( SECONDS < deadline )); do
+    for app_name in "${candidates[@]}"; do
+      if [[ "$(wecom_process_exists "$app_name")" == "yes" ]]; then
+        open -a "$app_name" >/dev/null 2>&1 || true
+        echo "WeCom ready: $app_name"
+        return 0
+      fi
+    done
+    sleep 1
+  done
+}
 
 preflight_agent() {
   local failed=0
+
+  ensure_wecom_running
 
   if [[ ! -f "$ENV_FILE" ]]; then
     echo "ERROR: missing env file: $ENV_FILE" >&2
@@ -164,7 +230,7 @@ try:
     if os.environ.get("WECOM_GUI_NORMALIZE_FULLSCREEN", "0") == "1":
         normalized = macos_backend.normalize_window()
         if not normalized.get("ok"):
-            add_error(f"Swift AX helper failed to normalize WeCom window: {normalized}")
+            notes.append(f"normalize_window_warning={normalized}")
 except Exception as exc:
     add_error(f"WeCom GUI automation preflight failed: {type(exc).__name__}: {exc}")
 

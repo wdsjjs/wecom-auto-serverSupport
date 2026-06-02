@@ -832,25 +832,36 @@ def _finish_drafts(futures: dict[int, Future]) -> dict:
                     handoff_type="indirect",
                     handoff_reason=reason,
                     reply_text=draft["text"] or handoff.HANDOFF_REPLY_TEXT,
+                    duration_ms=elapsed_ms,
                 )
             else:
-                state.mark_ready(job_id, reply_text=draft["text"])
+                state.mark_ready(
+                    job_id,
+                    reply_text=draft["text"],
+                    reply_source="ai",
+                    duration_ms=elapsed_ms,
+                    action=str(draft.get("action") or ""),
+                )
             state.append_event(
                 {
                     "type": "agent_ready",
                     "job_id": job_id,
                     "reply": draft["text"],
                     "action": draft.get("action"),
+                    "duration_ms": elapsed_ms,
                     "handoff": (draft.get("raw") or {}).get("handoff"),
                 }
             )
             _log(f"[AI客服] AI回复已生成：{title}｜{elapsed_text}｜池={pool}｜{_short(draft['text'], 140)}")
             if draft.get("action") == "handoff":
-                handoff = (draft.get("raw") or {}).get("handoff") or {}
-                if handoff.get("notified"):
+                handoff_payload = (draft.get("raw") or {}).get("handoff") or {}
+                if handoff_payload.get("notified"):
                     _log(f"[AI客服] 飞书转人工通知已发送：{title}")
                 else:
-                    _log(f"[AI客服] 飞书转人工通知未发送：{title}｜{handoff.get('reason') or handoff.get('error') or 'unknown'}")
+                    _log(
+                        f"[AI客服] 飞书转人工通知未发送：{title}｜"
+                        f"{handoff_payload.get('reason') or handoff_payload.get('error') or 'unknown'}"
+                    )
             ready += 1
         except Exception as exc:
             current_job = state.get_job(job_id)
@@ -977,6 +988,14 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                         "actual": latest_text,
                     }
                 )
+                state.record_metric(
+                    "stale_context_skipped",
+                    conversation_key=str(job.get("conversation_key") or ""),
+                    conversation=title,
+                    job_id=job["id"],
+                    reply_source=str(job.get("reply_source") or ""),
+                    details={"expected": expected_latest_text, "actual": latest_text},
+                )
                 _log(
                     f"[AI客服] 跳过发送：{title}，原因：{_reason_text(reason)}；"
                     f"最新消息：{_short(latest_text)}"
@@ -990,7 +1009,12 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
 
             if mode == "dry-run":
                 final_reply = clean_customer_reply_text(job["reply_text"])
-                state.mark_done(job["id"], message_hash=current["hash"], reply_text=final_reply)
+                state.mark_done(
+                    job["id"],
+                    message_hash=current["hash"],
+                    reply_text=final_reply,
+                    reply_source=str(job.get("reply_source") or "") or None,
+                )
                 _log(f"[AI客服] 演练模式，不发送：{title}｜{_short(final_reply, 140)}")
                 return {"ok": True, "sent": 0, "dry_run": True, "conversation": title}
 
@@ -1014,15 +1038,36 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 )
                 if not worker._messages_contain_text(after_send["messages"], final_reply):
                     raise RuntimeError("sent_reply_not_visible")
-            state.mark_done(job["id"], message_hash=after_send["hash"], reply_text=final_reply)
+            state.mark_done(
+                job["id"],
+                message_hash=after_send["hash"],
+                reply_text=final_reply,
+                reply_source=str(job.get("reply_source") or "") or None,
+            )
             state.append_event(
                 {"type": "agent_sent", "conversation": title, "hash": after_send["hash"], "reply": final_reply}
+            )
+            state.record_metric(
+                "agent_sent",
+                conversation_key=str(job.get("conversation_key") or ""),
+                conversation=title,
+                job_id=job["id"],
+                reply_source=str(job.get("reply_source") or ""),
+                details={"reply_preview": final_reply[:240]},
             )
             _log(f"[AI客服] 已发送给 {title}：{_short(final_reply, 140)}")
             return {"ok": True, "sent": 1, "conversation": title}
     except Exception as exc:
         state.mark_failed(job["id"], str(exc))
         state.append_event({"type": "agent_send_failed", "conversation": title, "error": str(exc)})
+        state.record_metric(
+            "agent_send_failed",
+            conversation_key=str(job.get("conversation_key") or ""),
+            conversation=title,
+            job_id=job["id"],
+            reply_source=str(job.get("reply_source") or ""),
+            details={"error": str(exc)},
+        )
         _log(f"[AI客服] 发送失败：{title}，错误：{exc}")
         return {"ok": False, "sent": 0, "failed": 1, "conversation": title, "error": str(exc)}
 

@@ -307,11 +307,27 @@ def process_one(*, last: int, mode: str) -> dict:
             state.append_event(
                 {"type": "queue_sent", "conversation": title, "hash": after_send["hash"], "reply": draft["text"]}
             )
+            state.record_metric(
+                "agent_sent",
+                conversation_key=str(job.get("conversation_key") or ""),
+                conversation=title,
+                job_id=job["id"],
+                reply_source="ai",
+                details={"source": "legacy_worker", "reply_preview": str(draft.get("text") or "")[:240]},
+            )
             print(f"[worker] sent to {title}: {draft['text']}")
             return {"ok": True, "processed": 1, "sent": 1, "conversation": title, "reply": draft["text"]}
         except Exception as exc:
             state.mark_failed(job["id"], str(exc))
             state.append_event({"type": "queue_failed", "conversation": title, "error": str(exc)})
+            state.record_metric(
+                "agent_send_failed",
+                conversation_key=str(job.get("conversation_key") or ""),
+                conversation=title,
+                job_id=job["id"],
+                reply_source=str(job.get("reply_source") or "ai"),
+                details={"source": "legacy_worker", "error": str(exc)},
+            )
             print(f"[worker] failed {title}: {exc}")
             return {"ok": False, "processed": 1, "sent": 0, "failed": 1, "conversation": title, "error": str(exc)}
 

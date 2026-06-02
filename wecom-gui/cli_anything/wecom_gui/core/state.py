@@ -18,6 +18,13 @@ from cli_anything.wecom_gui.core.text import clean_customer_reply_text
 ACTIVE_STATUSES = {"processing", "reading", "drafting", "ready", "approved", "sending"}
 REPLACEABLE_ACTIVE_STATUSES = {"processing", "reading", "drafting"}
 DONE_REOPEN_COOLDOWN_SECONDS = 60.0
+HANDOFF_TERMS = ("人工", "转人工", "人工客服")
+LATENCY_BUCKETS = (
+    (5_000, "0-5s"),
+    (15_000, "5-15s"),
+    (30_000, "15-30s"),
+    (60_000, "30-60s"),
+)
 
 
 def state_dir() -> Path:
@@ -35,6 +42,26 @@ def append_event(event: dict) -> Path:
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
     return path
+
+
+def latency_bucket(duration_ms: object) -> str:
+    """Return a stable response-time bucket label."""
+    try:
+        value = float(duration_ms)
+    except (TypeError, ValueError):
+        return ""
+    for upper_bound, label in LATENCY_BUCKETS:
+        if value < upper_bound:
+            return label
+    return "60s+"
+
+
+def handoff_type_for_text(text: object) -> str:
+    """Classify explicit customer handoff requests."""
+    body = str(text or "").strip()
+    if not body:
+        return ""
+    return "direct" if any(term in body for term in HANDOFF_TERMS) else ""
 
 
 def db_path() -> Path:
@@ -89,6 +116,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             reply_text TEXT,
             handoff_type TEXT NOT NULL DEFAULT '',
             handoff_reason TEXT NOT NULL DEFAULT '',
+            reply_source TEXT NOT NULL DEFAULT '',
             error TEXT,
             locked_at REAL,
             created_at REAL NOT NULL,
@@ -103,6 +131,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "reply_queue", "source", "TEXT")
     _ensure_column(conn, "reply_queue", "handoff_type", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "reply_queue", "handoff_reason", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "reply_queue", "reply_source", "TEXT NOT NULL DEFAULT ''")
     _backfill_conversation_keys(conn)
     conn.execute(
         """
@@ -154,6 +183,46 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_wecom_customer_bindings_name
         ON wecom_customer_bindings(customer_name)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metric_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            conversation_key TEXT NOT NULL DEFAULT '',
+            conversation TEXT NOT NULL DEFAULT '',
+            job_id INTEGER,
+            reply_source TEXT NOT NULL DEFAULT '',
+            handoff_type TEXT NOT NULL DEFAULT '',
+            duration_ms REAL,
+            duration_bucket TEXT NOT NULL DEFAULT '',
+            details_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_metric_events_type_created
+        ON metric_events(event_type, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_metric_events_conversation_created
+        ON metric_events(conversation_key, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversation_metric_state (
+            conversation_key TEXT PRIMARY KEY,
+            conversation TEXT NOT NULL DEFAULT '',
+            last_reply_source TEXT NOT NULL DEFAULT '',
+            last_reply_at REAL,
+            updated_at REAL NOT NULL
+        )
         """
     )
     conn.commit()
@@ -215,6 +284,7 @@ def _rebuild_reply_queue(conn: sqlite3.Connection) -> None:
             reply_text TEXT,
             handoff_type TEXT NOT NULL DEFAULT '',
             handoff_reason TEXT NOT NULL DEFAULT '',
+            reply_source TEXT NOT NULL DEFAULT '',
             error TEXT,
             locked_at REAL,
             created_at REAL NOT NULL,
@@ -229,12 +299,13 @@ def _rebuild_reply_queue(conn: sqlite3.Connection) -> None:
     select_source = "source" if "source" in old_columns else "'' AS source"
     select_handoff_type = "handoff_type" if "handoff_type" in old_columns else "'' AS handoff_type"
     select_handoff_reason = "handoff_reason" if "handoff_reason" in old_columns else "'' AS handoff_reason"
+    select_reply_source = "reply_source" if "reply_source" in old_columns else "'' AS reply_source"
     rows = conn.execute(
         f"""
         SELECT id, title, preview, time_text, tags_json, raw_json, signature, status,
                attempts, last_message_hash, {select_context}, {select_click_x},
                {select_click_y}, {select_source}, reply_text, {select_handoff_type},
-               {select_handoff_reason}, error, locked_at,
+               {select_handoff_reason}, {select_reply_source}, error, locked_at,
                created_at, updated_at
         FROM {backup}
         ORDER BY id
@@ -247,9 +318,9 @@ def _rebuild_reply_queue(conn: sqlite3.Connection) -> None:
                 (id, conversation_key, title, preview, time_text, tags_json, raw_json,
                  signature, status, attempts, last_message_hash, context_json,
                  click_x, click_y, source, reply_text, handoff_type, handoff_reason,
-                 error, locked_at,
+                 reply_source, error, locked_at,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["id"],
@@ -270,6 +341,7 @@ def _rebuild_reply_queue(conn: sqlite3.Connection) -> None:
                 row["reply_text"],
                 row["handoff_type"],
                 row["handoff_reason"],
+                row["reply_source"],
                 row["error"],
                 row["locked_at"],
                 row["created_at"],
@@ -350,6 +422,224 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return item
 
 
+def _record_metric_event(
+    conn: sqlite3.Connection,
+    *,
+    event_type: str,
+    conversation_key: str = "",
+    conversation: str = "",
+    job_id: int | None = None,
+    reply_source: str = "",
+    handoff_type: str = "",
+    duration_ms: float | int | None = None,
+    details: dict | None = None,
+    created_at: float | None = None,
+) -> None:
+    event_type = str(event_type or "").strip()
+    if not event_type:
+        return
+    duration_value = None if duration_ms is None else float(duration_ms)
+    now = time.time() if created_at is None else float(created_at)
+    conn.execute(
+        """
+        INSERT INTO metric_events
+            (event_type, conversation_key, conversation, job_id, reply_source,
+             handoff_type, duration_ms, duration_bucket, details_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_type,
+            str(conversation_key or ""),
+            str(conversation or ""),
+            job_id,
+            str(reply_source or ""),
+            str(handoff_type or ""),
+            duration_value,
+            latency_bucket(duration_value),
+            json.dumps(details or {}, ensure_ascii=False),
+            now,
+        ),
+    )
+
+
+def record_metric(
+    event_type: str,
+    *,
+    conversation_key: str = "",
+    conversation: str = "",
+    job_id: int | None = None,
+    reply_source: str = "",
+    handoff_type: str = "",
+    duration_ms: float | int | None = None,
+    details: dict | None = None,
+) -> None:
+    """Persist one structured metrics event."""
+    with connect() as conn:
+        _record_metric_event(
+            conn,
+            event_type=event_type,
+            conversation_key=conversation_key,
+            conversation=conversation,
+            job_id=job_id,
+            reply_source=reply_source,
+            handoff_type=handoff_type,
+            duration_ms=duration_ms,
+            details=details,
+        )
+
+
+def _last_reply_source(conn: sqlite3.Connection, conversation_key: str) -> str:
+    row = conn.execute(
+        """
+        SELECT last_reply_source
+        FROM conversation_metric_state
+        WHERE conversation_key = ?
+        """,
+        (conversation_key,),
+    ).fetchone()
+    return str(row["last_reply_source"] if row else "").strip()
+
+
+def _set_last_reply_source(
+    conn: sqlite3.Connection,
+    *,
+    conversation_key: str,
+    conversation: str,
+    reply_source: str,
+    now: float,
+) -> None:
+    conversation_key = str(conversation_key or "").strip()
+    reply_source = str(reply_source or "").strip()
+    if not conversation_key or not reply_source:
+        return
+    conn.execute(
+        """
+        INSERT INTO conversation_metric_state
+            (conversation_key, conversation, last_reply_source, last_reply_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(conversation_key) DO UPDATE SET
+            conversation = excluded.conversation,
+            last_reply_source = excluded.last_reply_source,
+            last_reply_at = excluded.last_reply_at,
+            updated_at = excluded.updated_at
+        """,
+        (conversation_key, str(conversation or ""), reply_source, now, now),
+    )
+
+
+def metrics_summary(*, since_hours: float = 24.0) -> dict:
+    """Return SQLite-backed review/agent metrics for a recent time window."""
+    try:
+        hours = max(0.0, float(since_hours))
+    except (TypeError, ValueError):
+        hours = 24.0
+    now = time.time()
+    since = now - hours * 3600
+    with connect() as conn:
+        event_counts = {
+            row["event_type"]: row["count"]
+            for row in conn.execute(
+                """
+                SELECT event_type, COUNT(*) AS count
+                FROM metric_events
+                WHERE created_at >= ?
+                GROUP BY event_type
+                """,
+                (since,),
+            ).fetchall()
+        }
+        served_users = conn.execute(
+            """
+            SELECT COUNT(DISTINCT conversation_key) AS count
+            FROM metric_events
+            WHERE event_type = 'customer_message_received'
+              AND created_at >= ?
+              AND conversation_key != ''
+            """,
+            (since,),
+        ).fetchone()["count"]
+        source_counts = {
+            (row["reply_source"] or "unknown"): row["count"]
+            for row in conn.execute(
+                """
+                SELECT COALESCE(NULLIF(reply_source, ''), 'unknown') AS reply_source, COUNT(*) AS count
+                FROM metric_events
+                WHERE event_type = 'customer_message_received'
+                  AND created_at >= ?
+                GROUP BY COALESCE(NULLIF(reply_source, ''), 'unknown')
+                """,
+                (since,),
+            ).fetchall()
+        }
+        handoff_counts = {
+            (row["handoff_type"] or "unknown"): row["count"]
+            for row in conn.execute(
+                """
+                SELECT COALESCE(NULLIF(handoff_type, ''), 'unknown') AS handoff_type, COUNT(*) AS count
+                FROM metric_events
+                WHERE event_type = 'handoff'
+                  AND created_at >= ?
+                GROUP BY COALESCE(NULLIF(handoff_type, ''), 'unknown')
+                """,
+                (since,),
+            ).fetchall()
+        }
+        response_time_buckets = {label: 0 for _upper, label in LATENCY_BUCKETS}
+        response_time_buckets["60s+"] = 0
+        for row in conn.execute(
+            """
+            SELECT duration_bucket, COUNT(*) AS count
+            FROM metric_events
+            WHERE created_at >= ?
+              AND duration_bucket != ''
+              AND event_type IN ('ai_draft_ready', 'agent_sent')
+            GROUP BY duration_bucket
+            """,
+            (since,),
+        ).fetchall():
+            response_time_buckets[row["duration_bucket"]] = row["count"]
+        pending_handoff = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM reply_queue
+            WHERE status = 'ready'
+              AND COALESCE(handoff_type, '') != ''
+            """
+        ).fetchone()["count"]
+    return {
+        "since": since,
+        "until": now,
+        "since_hours": hours,
+        "served_users": int(served_users or 0),
+        "customer_messages": {
+            "after_ai_reply": int(source_counts.get("ai", 0)),
+            "after_human_reply": int(source_counts.get("human", 0)),
+            "unknown": int(source_counts.get("unknown", 0)),
+            "total": int(event_counts.get("customer_message_received", 0)),
+        },
+        "handoffs": {
+            "direct": int(handoff_counts.get("direct", 0)),
+            "indirect": int(handoff_counts.get("indirect", 0)),
+            "unknown": int(handoff_counts.get("unknown", 0)),
+            "pending": int(pending_handoff or 0),
+        },
+        "response_time_buckets": response_time_buckets,
+        "diagnostics": {
+            "review_approved": int(event_counts.get("review_approved", 0)),
+            "review_rejected": int(event_counts.get("review_rejected", 0)),
+            "review_saved": int(event_counts.get("review_saved", 0)),
+            "review_regenerate": int(event_counts.get("review_regenerate", 0)),
+            "human_edited_reply": int(event_counts.get("human_edited_reply", 0)),
+            "agent_sent": int(event_counts.get("agent_sent", 0)),
+            "agent_send_failed": int(event_counts.get("agent_send_failed", 0)),
+            "stale_context_skipped": int(event_counts.get("stale_context_skipped", 0)),
+            "image_message": int(event_counts.get("image_message", 0)),
+            "image_capture_failed": int(event_counts.get("image_capture_failed", 0)),
+            "ai_draft_ready": int(event_counts.get("ai_draft_ready", 0)),
+        },
+    }
+
+
 def _update_visible_row(conn: sqlite3.Connection, row: dict, signature: str, now: float, conversation_key: str) -> None:
     conn.execute(
         """
@@ -372,6 +662,46 @@ def _update_visible_row(conn: sqlite3.Connection, row: dict, signature: str, now
             conversation_key,
         ),
     )
+
+
+def _record_customer_message_metric(
+    conn: sqlite3.Connection,
+    *,
+    row: dict,
+    conversation_key: str,
+    job_id: int | None,
+    now: float,
+) -> None:
+    reply_source = _last_reply_source(conn, conversation_key) or "unknown"
+    preview = str(row.get("preview") or "").strip()
+    handoff_type = handoff_type_for_text(preview)
+    _record_metric_event(
+        conn,
+        event_type="customer_message_received",
+        conversation_key=conversation_key,
+        conversation=str(row.get("title") or ""),
+        job_id=job_id,
+        reply_source=reply_source,
+        handoff_type=handoff_type,
+        details={
+            "preview": preview,
+            "source": row.get("source") or "",
+            "unread_count": int(row.get("unread_count") or 0),
+        },
+        created_at=now,
+    )
+    if handoff_type:
+        _record_metric_event(
+            conn,
+            event_type="handoff",
+            conversation_key=conversation_key,
+            conversation=str(row.get("title") or ""),
+            job_id=job_id,
+            reply_source=reply_source,
+            handoff_type=handoff_type,
+            details={"reason": "customer_requested_handoff", "preview": preview},
+            created_at=now,
+        )
 
 
 def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
@@ -404,7 +734,9 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
                     """
                     UPDATE reply_queue
                     SET status = 'pending', error = NULL, locked_at = NULL,
-                        context_json = NULL, last_message_hash = NULL, reply_text = NULL,
+                        context_json = NULL, last_message_hash = NULL,
+                        reply_text = NULL, reply_source = '',
+                        handoff_type = '', handoff_reason = '',
                         updated_at = ?
                     WHERE conversation_key = ?
                     """,
@@ -414,6 +746,13 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
                     "SELECT * FROM reply_queue WHERE conversation_key = ?",
                     (conversation_key,),
                 ).fetchone()
+                _record_customer_message_metric(
+                    conn,
+                    row=row,
+                    conversation_key=conversation_key,
+                    job_id=item["id"] if item else None,
+                    now=now,
+                )
                 return True, _row_to_dict(item)
             return False, _row_to_dict(existing)
         if existing and existing["status"] in ACTIVE_STATUSES:
@@ -424,7 +763,9 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
                     """
                     UPDATE reply_queue
                     SET status = 'pending', error = NULL, locked_at = NULL,
-                        context_json = NULL, last_message_hash = NULL, reply_text = NULL,
+                        context_json = NULL, last_message_hash = NULL,
+                        reply_text = NULL, reply_source = '',
+                        handoff_type = '', handoff_reason = '',
                         updated_at = ?
                     WHERE conversation_key = ?
                     """,
@@ -434,6 +775,13 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
                     "SELECT * FROM reply_queue WHERE conversation_key = ?",
                     (conversation_key,),
                 ).fetchone()
+                _record_customer_message_metric(
+                    conn,
+                    row=row,
+                    conversation_key=conversation_key,
+                    job_id=item["id"] if item else None,
+                    now=now,
+                )
                 return True, _row_to_dict(item)
             return False, _row_to_dict(existing)
         if (
@@ -503,6 +851,13 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
             "SELECT * FROM reply_queue WHERE conversation_key = ?",
             (conversation_key,),
         ).fetchone()
+        _record_customer_message_metric(
+            conn,
+            row=row,
+            conversation_key=conversation_key,
+            job_id=item["id"] if item else None,
+            now=now,
+        )
         return True, _row_to_dict(item)
 
 
@@ -796,6 +1151,11 @@ def record_conversation_messages(
         return
     now = time.time()
     with connect() as conn:
+        title_row = conn.execute(
+            "SELECT title FROM reply_queue WHERE id = ?",
+            (job_id,),
+        ).fetchone() if job_id is not None else None
+        conversation = str(title_row["title"] if title_row else "")
         conn.execute(
             "DELETE FROM conversation_messages WHERE conversation_key = ?",
             (conversation_key,),
@@ -827,6 +1187,32 @@ def record_conversation_messages(
                     now,
                 ),
             )
+            for media_item in media:
+                if not isinstance(media_item, dict):
+                    continue
+                _record_metric_event(
+                    conn,
+                    event_type="image_message",
+                    conversation_key=conversation_key,
+                    conversation=conversation,
+                    job_id=job_id,
+                    details={
+                        "seq": index,
+                        "capture_ok": media_item.get("capture_ok"),
+                        "type": media_item.get("type") or "image",
+                    },
+                    created_at=now,
+                )
+                if media_item.get("capture_ok") is False:
+                    _record_metric_event(
+                        conn,
+                        event_type="image_capture_failed",
+                        conversation_key=conversation_key,
+                        conversation=conversation,
+                        job_id=job_id,
+                        details={"seq": index, "error": str(media_item.get("error") or "")},
+                        created_at=now,
+                    )
 
 
 def list_conversation_messages(*, conversation_key: str, limit: int = 20) -> list[dict]:
@@ -911,20 +1297,60 @@ def mark_drafting(job_id: int, *, message_hash: str, messages: list[dict], lates
     )
 
 
-def mark_ready(job_id: int, *, reply_text: str) -> None:
+def mark_ready(
+    job_id: int,
+    *,
+    reply_text: str,
+    reply_source: str = "ai",
+    duration_ms: float | int | None = None,
+    action: str = "",
+) -> None:
     final_reply = clean_customer_reply_text(reply_text)
+    source = str(reply_source or "ai").strip() or "ai"
+    action_value = str(action or "").strip()
     now = time.time()
     with connect() as conn:
+        row = conn.execute(
+            "SELECT conversation_key, title FROM reply_queue WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        conversation_key = str(row["conversation_key"] if row else "")
+        conversation = str(row["title"] if row else "")
         conn.execute(
             """
             UPDATE reply_queue
-            SET status = 'ready', reply_text = ?, handoff_type = '',
-                handoff_reason = '', error = NULL,
+            SET status = 'ready', reply_text = ?, reply_source = ?,
+                handoff_type = '', handoff_reason = '', error = NULL,
                 locked_at = NULL, updated_at = ?
             WHERE id = ?
             """,
-            (final_reply, now, job_id),
+            (final_reply, source, now, job_id),
         )
+        _record_metric_event(
+            conn,
+            event_type="ai_draft_ready",
+            conversation_key=conversation_key,
+            conversation=conversation,
+            job_id=job_id,
+            reply_source=source,
+            handoff_type="indirect" if action_value == "handoff" else "",
+            duration_ms=duration_ms,
+            details={"action": action_value, "reply_preview": final_reply[:240]},
+            created_at=now,
+        )
+        if action_value == "handoff":
+            _record_metric_event(
+                conn,
+                event_type="handoff",
+                conversation_key=conversation_key,
+                conversation=conversation,
+                job_id=job_id,
+                reply_source=source,
+                handoff_type="indirect",
+                duration_ms=duration_ms,
+                details={"reason": "ai_decision_handoff"},
+                created_at=now,
+            )
 
 
 def mark_handoff_pending(
@@ -933,6 +1359,7 @@ def mark_handoff_pending(
     handoff_type: str,
     handoff_reason: str,
     reply_text: str,
+    duration_ms: float | int | None = None,
 ) -> None:
     """Move a job into review-visible manual handoff pending state."""
     kind = str(handoff_type or "").strip().lower()
@@ -942,16 +1369,58 @@ def mark_handoff_pending(
     final_reply = clean_customer_reply_text(reply_text)
     now = time.time()
     with connect() as conn:
+        row = conn.execute(
+            "SELECT conversation_key, title FROM reply_queue WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        conversation_key = str(row["conversation_key"] if row else "")
+        conversation = str(row["title"] if row else "")
         conn.execute(
             """
             UPDATE reply_queue
-            SET status = 'ready', reply_text = ?, handoff_type = ?,
-                handoff_reason = ?, error = NULL, locked_at = NULL,
-                updated_at = ?
+            SET status = 'ready', reply_text = ?, reply_source = 'ai',
+                handoff_type = ?, handoff_reason = ?, error = NULL,
+                locked_at = NULL, updated_at = ?
             WHERE id = ?
             """,
             (final_reply, kind, reason, now, job_id),
         )
+        _record_metric_event(
+            conn,
+            event_type="ai_draft_ready",
+            conversation_key=conversation_key,
+            conversation=conversation,
+            job_id=job_id,
+            reply_source="ai",
+            handoff_type=kind,
+            duration_ms=duration_ms,
+            details={"action": "handoff", "reason": reason, "reply_preview": final_reply[:240]},
+            created_at=now,
+        )
+        existing_handoff = conn.execute(
+            """
+            SELECT 1
+            FROM metric_events
+            WHERE event_type = 'handoff'
+              AND job_id = ?
+              AND handoff_type = ?
+            LIMIT 1
+            """,
+            (job_id, kind),
+        ).fetchone()
+        if existing_handoff is None:
+            _record_metric_event(
+                conn,
+                event_type="handoff",
+                conversation_key=conversation_key,
+                conversation=conversation,
+                job_id=job_id,
+                reply_source="ai",
+                handoff_type=kind,
+                duration_ms=duration_ms,
+                details={"reason": reason},
+                created_at=now,
+            )
 
 
 def mark_approved(job_id: int, *, reply_text: str | None = None) -> bool:
@@ -960,7 +1429,7 @@ def mark_approved(job_id: int, *, reply_text: str | None = None) -> bool:
     with connect() as conn:
         row = conn.execute(
             """
-            SELECT status, reply_text
+            SELECT status, reply_text, reply_source, conversation_key, title
             FROM reply_queue
             WHERE id = ?
             """,
@@ -971,15 +1440,29 @@ def mark_approved(job_id: int, *, reply_text: str | None = None) -> bool:
         final_reply = clean_customer_reply_text(reply_text if reply_text is not None else row["reply_text"] or "")
         if not final_reply:
             return False
+        previous_reply = str(row["reply_text"] or "").strip()
+        reply_was_edited = bool(reply_text is not None and final_reply != previous_reply)
+        reply_source = "human" if reply_was_edited else (str(row["reply_source"] or "").strip() or "ai")
         cur = conn.execute(
             """
             UPDATE reply_queue
-            SET status = 'approved', reply_text = ?, error = NULL,
+            SET status = 'approved', reply_text = ?, reply_source = ?, error = NULL,
                 locked_at = NULL, updated_at = ?
             WHERE id = ?
             """,
-            (final_reply, now, job_id),
+            (final_reply, reply_source, now, job_id),
         )
+        if cur.rowcount == 1 and reply_was_edited:
+            _record_metric_event(
+                conn,
+                event_type="human_edited_reply",
+                conversation_key=str(row["conversation_key"] or ""),
+                conversation=str(row["title"] or ""),
+                job_id=job_id,
+                reply_source="human",
+                details={"action": "approve"},
+                created_at=now,
+            )
         return cur.rowcount == 1
 
 
@@ -993,13 +1476,28 @@ def save_reply(job_id: int, *, reply_text: str) -> bool:
         cur = conn.execute(
             """
             UPDATE reply_queue
-            SET status = 'ready', reply_text = ?, error = NULL,
+            SET status = 'ready', reply_text = ?, reply_source = 'human', error = NULL,
                 locked_at = NULL, updated_at = ?
             WHERE id = ?
               AND status IN ('ready', 'failed', 'skipped')
             """,
             (final_reply, now, job_id),
         )
+        if cur.rowcount == 1:
+            row = conn.execute(
+                "SELECT conversation_key, title FROM reply_queue WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            _record_metric_event(
+                conn,
+                event_type="human_edited_reply",
+                conversation_key=str(row["conversation_key"] if row else ""),
+                conversation=str(row["title"] if row else ""),
+                job_id=job_id,
+                reply_source="human",
+                details={"action": "save"},
+                created_at=now,
+            )
         return cur.rowcount == 1
 
 
@@ -1022,8 +1520,10 @@ def regenerate_reply(job_id: int, reason: str = "review_regenerate") -> bool:
             """
             UPDATE reply_queue
             SET status = 'pending', reply_text = NULL, context_json = NULL,
-                last_message_hash = NULL, handoff_type = '', handoff_reason = '',
-                error = ?, locked_at = NULL, updated_at = ?
+                last_message_hash = NULL, reply_source = '',
+                handoff_type = '', handoff_reason = '',
+                error = ?, locked_at = NULL,
+                updated_at = ?
             WHERE id = ?
               AND status IN ('ready', 'failed', 'skipped')
             """,
@@ -1043,14 +1543,19 @@ def mark_approved_retry(job_id: int, *, reply_text: str, reason: str = "") -> No
     final_reply = clean_customer_reply_text(reply_text)
     now = time.time()
     with connect() as conn:
+        row = conn.execute(
+            "SELECT reply_source FROM reply_queue WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        reply_source = str(row["reply_source"] if row else "").strip() or "ai"
         conn.execute(
             """
             UPDATE reply_queue
-            SET status = 'approved', reply_text = ?, error = ?,
+            SET status = 'approved', reply_text = ?, reply_source = ?, error = ?,
                 locked_at = NULL, updated_at = ?
             WHERE id = ?
             """,
-            (final_reply, reason or None, now, job_id),
+            (final_reply, reply_source, reason or None, now, job_id),
         )
 
 
@@ -1084,19 +1589,39 @@ def mark_pending(job_id: int, reason: str = "") -> None:
         )
 
 
-def mark_done(job_id: int, *, message_hash: str | None = None, reply_text: str | None = None) -> None:
+def mark_done(
+    job_id: int,
+    *,
+    message_hash: str | None = None,
+    reply_text: str | None = None,
+    reply_source: str | None = None,
+    duration_ms: float | int | None = None,
+) -> None:
     final_reply = clean_customer_reply_text(reply_text) if reply_text is not None else None
     now = time.time()
     with connect() as conn:
+        row = conn.execute(
+            "SELECT conversation_key, title, reply_source FROM reply_queue WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        final_reply_source = str(reply_source or (row["reply_source"] if row else "") or "ai").strip()
         conn.execute(
             """
             UPDATE reply_queue
-            SET status = 'done', last_message_hash = ?, reply_text = ?,
+            SET status = 'done', last_message_hash = ?, reply_text = ?, reply_source = ?,
                 error = NULL, locked_at = NULL, updated_at = ?
             WHERE id = ?
             """,
-            (message_hash, final_reply, now, job_id),
+            (message_hash, final_reply, final_reply_source, now, job_id),
         )
+        if row is not None:
+            _set_last_reply_source(
+                conn,
+                conversation_key=str(row["conversation_key"] or ""),
+                conversation=str(row["title"] or ""),
+                reply_source=final_reply_source,
+                now=now,
+            )
 
 
 def mark_skipped(job_id: int, reason: str) -> None:
