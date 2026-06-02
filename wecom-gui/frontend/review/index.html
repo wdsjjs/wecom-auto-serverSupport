@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>客服回复审核</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+
+  </head>
+  <body>
+    <header>
+      <h1>客服回复审核</h1>
+      <div class="toolbar">
+        <span class="wecom-status" id="wecomStatus">企微检测中...</span>
+        <span class="status" id="status">加载中...</span>
+        <button id="refresh">刷新</button>
+      </div>
+    </header>
+    <main>
+      <div class="notice" id="notice"></div>
+      <div class="counts" id="counts"></div>
+      <div class="list" id="list"></div>
+    </main>
+    <template id="issue-action-template"><button type="button" data-action="complete-issue">提交记录</button></template>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import time
 from pathlib import Path
 
 from .db import connect, ensure_schema
@@ -85,6 +86,12 @@ def retrieve(
     db_path: str | Path,
     context: dict | None = None,
 ) -> dict:
+    started = time.perf_counter()
+    timing: dict[str, int | None] = {
+        "script_ms": None,
+        "vector_ms": None,
+        "hydrate_ms": None,
+    }
     context = context or {}
     disable_vector = bool(context.get("disable_vector"))
     vector_hits: list[dict] = []
@@ -92,27 +99,38 @@ def retrieve(
 
     if disable_vector:
         script_context = context
+        script_started = time.perf_counter()
         script_result = script_search(query, db_path, script_context)
+        timing["script_ms"] = round((time.perf_counter() - script_started) * 1000)
     else:
+        vector_started = time.perf_counter()
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 vector_future = executor.submit(search_memories, db_path, customer_id=customer_id, query=query)
                 vector_hits = vector_future.result(timeout=10)
+                timing["vector_ms"] = round((time.perf_counter() - vector_started) * 1000)
+            hydrate_started = time.perf_counter()
             vector_hits = _hydrate_vector_knowledge(db_path, vector_hits)
+            timing["hydrate_ms"] = round((time.perf_counter() - hydrate_started) * 1000)
         except Exception as exc:
+            if timing["vector_ms"] is None:
+                timing["vector_ms"] = round((time.perf_counter() - vector_started) * 1000)
             vector_error = str(exc)
             vector_hits = []
         product = _product_from_profile(vector_hits)
         script_context = dict(context)
         if product and not script_context.get("known_product"):
             script_context["known_product"] = product
+        script_started = time.perf_counter()
         script_result = script_search(query, db_path, script_context)
+        timing["script_ms"] = round((time.perf_counter() - script_started) * 1000)
 
     script_hits = script_result["hits"]
     conflicts = list(script_result.get("conflicts", []))
     needs_clarification = bool(script_result.get("needs_clarification"))
     if not script_hits and vector_hits:
         needs_clarification = True
+    timing["total_ms"] = round((time.perf_counter() - started) * 1000)
 
     return {
         "query": query,
@@ -125,5 +143,11 @@ def retrieve(
             "conflicts": conflicts,
             "needs_clarification": needs_clarification,
             "vector_error": vector_error,
+        },
+        "metrics": {
+            "timing": timing,
+            "script_count": len(script_hits),
+            "vector_count": len(vector_hits),
+            "vector_disabled": disable_vector,
         },
     }

@@ -286,10 +286,22 @@ def run_debug_case(payload: dict) -> dict:
         db_path=db_path,
         context=context,
     )
+    retrieval_metrics = retrieval_result.get("metrics") if isinstance(retrieval_result.get("metrics"), dict) else {}
+    retrieval_timing = (
+        retrieval_metrics.get("timing")
+        if isinstance(retrieval_metrics.get("timing"), dict)
+        else {}
+    )
+    measured_duration_ms = round((time.perf_counter() - started) * 1000)
     retrieval_trace = {
-        "duration_ms": round((time.perf_counter() - started) * 1000),
+        "duration_ms": retrieval_timing.get("total_ms", measured_duration_ms),
+        "measured_duration_ms": measured_duration_ms,
+        "script_ms": retrieval_timing.get("script_ms"),
+        "vector_ms": retrieval_timing.get("vector_ms"),
+        "hydrate_ms": retrieval_timing.get("hydrate_ms"),
         "script_count": len(retrieval_result.get("script_hits", [])),
         "vector_count": len(retrieval_result.get("vector_hits", [])),
+        "vector_disabled": retrieval_metrics.get("vector_disabled"),
         "answer_basis": retrieval_result.get("merged_context", {}).get("answer_basis"),
         "needs_clarification": retrieval_result.get("merged_context", {}).get("needs_clarification"),
         "vector_error": retrieval_result.get("merged_context", {}).get("vector_error"),

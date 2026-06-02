@@ -543,13 +543,41 @@ def test_review_http_allows_actions_without_token(monkeypatch, tmp_path):
 
 
 def test_review_page_primary_actions_are_send_only():
-    assert "data-action=\"regenerate\"" not in review_server.REVIEW_HTML
-    assert "data-action=\"reject\"" not in review_server.REVIEW_HTML
-    assert "data-action=\"save\"" not in review_server.REVIEW_HTML
-    assert "重新生成" not in review_server.REVIEW_HTML
-    assert "拒绝</button>" not in review_server.REVIEW_HTML
-    assert "保存修改" not in review_server.REVIEW_HTML
+    frontend = review_server.REVIEW_HTML + review_server.REVIEW_FRONTEND_JS
+    assert "data-action=\"regenerate\"" not in frontend
+    assert "data-action=\"reject\"" not in frontend
+    assert "data-action=\"save\"" not in frontend
+    assert "重新生成" not in frontend
+    assert "拒绝</button>" not in frontend
+    assert "保存修改" not in frontend
     assert "data-action=\"complete-issue\"" in review_server.REVIEW_HTML
+
+
+def test_review_http_serves_split_frontend_assets(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), review_server.ReviewHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        with request.urlopen(f"{base}/", timeout=5) as resp:
+            html = resp.read().decode("utf-8")
+        assert "/static/styles.css" in html
+        assert "/static/app.js" in html
+
+        with request.urlopen(f"{base}/static/styles.css", timeout=5) as resp:
+            css = resp.read().decode("utf-8")
+            assert resp.headers["Content-Type"].startswith("text/css")
+        assert ".wecom-status" in css
+
+        with request.urlopen(f"{base}/static/app.js", timeout=5) as resp:
+            js = resp.read().decode("utf-8")
+            assert resp.headers["Content-Type"].startswith("text/javascript")
+        assert "/api/review/items" in js
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
 
 
 def test_review_http_supports_save_approve_with_reply_and_regenerate(monkeypatch, tmp_path):
@@ -913,7 +941,6 @@ def test_handoff_duplicate_visible_reply_is_not_sent_again(monkeypatch, tmp_path
 
 def test_handoff_new_message_returns_to_attention_without_ai(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
-    agent._HANDOFF_NOTIFY_KEYS.clear()
     row = {"title": "客户A", "preview": "转人工", "time": "刚刚", "tags": ["@微信"], "raw": [], "unread": True}
     _, item = state.enqueue_conversation(row, "sig1")
     job = state.claim_pending_for_read()
@@ -955,11 +982,6 @@ def test_handoff_new_message_returns_to_attention_without_ai(monkeypatch, tmp_pa
             "messages": [{"role": "用户", "content": "我还想问一下", "text": "我还想问一下"}],
         },
     )
-    notified = []
-    monkeypatch.setattr(
-        "csbot.ops_gateway.handoff_notify",
-        lambda **kwargs: notified.append(kwargs) or {"ok": True, "notified": True, "dry_run": False},
-    )
     monkeypatch.setattr(
         "cli_anything.wecom_gui.core.llm.draft_reply",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("handoff should not call AI")),
@@ -972,17 +994,12 @@ def test_handoff_new_message_returns_to_attention_without_ai(monkeypatch, tmp_pa
     item = review_server.list_review_items(status="handoff")[0]
     assert item["handoff_attention"] is True
     assert item["reply_text"] == ""
-    assert notified
-    assert notified[0]["customer_id"] == "客户A"
-    assert notified[0]["query"] == "我还想问一下"
-    assert notified[0]["dry_run"] is False
     assert review_server.save_item(job["id"], reply_text="新的人工回复")["ok"] is True
     assert review_server.approve_item(job["id"], reply_text="新的人工回复")["ok"] is True
 
 
-def test_direct_handoff_sends_feishu_notification(monkeypatch, tmp_path):
+def test_direct_handoff_enters_review_without_external_notification(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
-    agent._HANDOFF_NOTIFY_KEYS.clear()
     row = {"title": "客户A", "preview": "转人工", "time": "刚刚", "tags": ["@微信"], "raw": []}
     state.enqueue_conversation(row, "sig")
 
@@ -995,21 +1012,15 @@ def test_direct_handoff_sends_feishu_notification(monkeypatch, tmp_path):
             "messages": [{"role": "用户", "content": "我要转人工", "text": "我要转人工"}],
         },
     )
-    notified = []
-    monkeypatch.setattr(
-        "csbot.ops_gateway.handoff_notify",
-        lambda **kwargs: notified.append(kwargs) or {"ok": True, "notified": True, "dry_run": False},
-    )
-
     with ThreadPoolExecutor(max_workers=1) as executor:
         result = agent._read_one_pending(last=12, executor=executor, futures={}, max_drafts=1)
 
     assert result["handoff"] == 1
     assert review_server.review_counts()["handoff"] == 1
-    assert notified
-    assert notified[0]["customer_id"] == "客户A"
-    assert notified[0]["query"] == "我要转人工"
-    assert notified[0]["dry_run"] is False
+    item = review_server.list_review_items(status="handoff")[0]
+    assert item["title"] == "客户A"
+    assert item["handoff_pending"] is True
+    assert item["handoff_type"] == "direct"
 
 
 def test_handoff_waiting_same_hash_does_not_trigger_attention(monkeypatch, tmp_path):

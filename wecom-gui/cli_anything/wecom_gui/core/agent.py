@@ -23,7 +23,6 @@ from cli_anything.wecom_gui.utils import macos_backend
 _DRAFT_STARTED_AT: dict[int, float] = {}
 _DRAFT_POOL: dict[int, str] = {}
 _DRAFT_MESSAGE_HASH: dict[int, str] = {}
-_HANDOFF_NOTIFY_KEYS: set[str] = set()
 
 
 def _message_image_paths(messages: list[dict]) -> list[str]:
@@ -153,90 +152,6 @@ def _message_text(message: dict | None) -> str:
     if not message:
         return ""
     return str(message.get("content") or message.get("text") or "")
-
-
-def _handoff_customer_id(title: str) -> str:
-    binding = state.lookup_wecom_customer(customer_name=title) or {}
-    uid = str(binding.get("uid") or "").strip()
-    return uid or title or os.environ.get("WECOM_GUI_CSBOT_CUSTOMER_ID", "wecom-customer")
-
-
-def _handoff_notify_result_message(payload: dict | None) -> str:
-    data = payload if isinstance(payload, dict) else {}
-    if data.get("notified"):
-        return "sent"
-    if data.get("reason"):
-        return str(data.get("reason"))
-    if data.get("error"):
-        return str(data.get("error"))
-    if data.get("dry_run"):
-        return "dry_run"
-    if data.get("enabled") is False:
-        return "feishu_disabled"
-    if not data:
-        return "empty_result"
-    return "unknown"
-
-
-def _notify_handoff(
-    *,
-    job: dict,
-    title: str,
-    query: str,
-    reason: str,
-    kind: str,
-    message_hash: str = "",
-    extra_context: dict | None = None,
-) -> dict:
-    """Send one Feishu handoff notification for GUI-owned handoff events."""
-    notify_key = "|".join(
-        [
-            str(job.get("id") or ""),
-            str(kind or ""),
-            str(message_hash or job.get("last_message_hash") or ""),
-            _match_text(query)[:120],
-        ]
-    )
-    if notify_key in _HANDOFF_NOTIFY_KEYS:
-        return {"ok": True, "notified": False, "duplicate": True, "reason": "duplicate_handoff_notify"}
-    _HANDOFF_NOTIFY_KEYS.add(notify_key)
-    context = {
-        "source": "wecom-gui",
-        "conversation_title": title,
-        "conversation_key": str(job.get("conversation_key") or ""),
-        "job_id": job.get("id"),
-        "handoff_type": kind,
-        "message_hash": message_hash or job.get("last_message_hash") or "",
-        **(extra_context or {}),
-    }
-    try:
-        from csbot.ops_gateway import handoff_notify
-
-        result = handoff_notify(
-            customer_id=_handoff_customer_id(title),
-            query=query,
-            reason=reason or "需要人工处理",
-            context=context,
-            dry_run=False,
-        )
-    except Exception as exc:
-        result = {"ok": False, "notified": False, "error": str(exc)}
-    state.append_event(
-        {
-            "type": "agent_handoff_feishu_notify",
-            "job_id": job.get("id"),
-            "conversation": title,
-            "kind": kind,
-            "query": query,
-            "reason": reason,
-            "result": result,
-        }
-    )
-    if result.get("notified"):
-        _log(f"[AI客服] 飞书转人工通知已发送：{title}｜{kind}")
-    else:
-        _log(f"[AI客服] 飞书转人工通知未发送：{title}｜{_handoff_notify_result_message(result)}")
-    return result
 
 
 def _match_text(value: str | None) -> str:
@@ -922,14 +837,6 @@ def _read_one_pending(
                 latest=latest,
             )
             state.mark_handoff_attention(job["id"])
-            _notify_handoff(
-                job=job,
-                title=title,
-                query=latest_turn_text,
-                reason=reason,
-                kind="handoff_attention",
-                message_hash=current["hash"],
-            )
             state.append_event(
                 {
                     "type": "agent_handoff_attention",
@@ -953,14 +860,6 @@ def _read_one_pending(
                 handoff_type="direct",
                 handoff_reason=reason,
                 reply_text=handoff.HANDOFF_REPLY_TEXT,
-            )
-            _notify_handoff(
-                job=job,
-                title=title,
-                query=latest_turn_text,
-                reason=reason,
-                kind="direct",
-                message_hash=current["hash"],
             )
             state.append_event(
                 {
@@ -1096,17 +995,6 @@ def _finish_drafts(futures: dict[int, Future]) -> dict:
                 }
             )
             _log(f"[AI客服] AI回复已生成：{title}｜{elapsed_text}｜池={pool}｜{_short(draft['text'], 140)}")
-            if draft.get("action") == "handoff":
-                raw = draft.get("raw") if isinstance(draft.get("raw"), dict) else {}
-                codex = raw.get("codex") if isinstance(raw.get("codex"), dict) else {}
-                handoff_payload = codex.get("handoff") if isinstance(codex.get("handoff"), dict) else {}
-                if handoff_payload.get("notified"):
-                    _log(f"[AI客服] 飞书转人工通知已发送：{title}")
-                else:
-                    _log(
-                        f"[AI客服] 飞书转人工通知未发送：{title}｜"
-                        f"{_handoff_notify_result_message(handoff_payload)}"
-                    )
             ready += 1
         except Exception as exc:
             current_job = state.get_job(job_id)

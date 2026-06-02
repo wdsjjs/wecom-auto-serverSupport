@@ -54,8 +54,8 @@ class OpsGatewayTest(unittest.TestCase):
         self.assertEqual(result["source"], "clickhouse")
         self.assertEqual(result["result"]["draft"]["ticket_category"], "售后投诉")
 
-    def test_handoff_defaults_to_dry_run_without_feishu_send(self) -> None:
-        with mock.patch.dict("os.environ", {"CSBOT_FEISHU_ENABLED": "1", "CSBOT_FEISHU_WEBHOOK": "http://feishu"}, clear=False):
+    def test_handoff_never_sends_feishu_notification(self) -> None:
+        with mock.patch.dict("os.environ", {"CSBOT_FEISHU_ENABLED": "1", "CSBOT_FEISHU_WEBHOOK": "http://removed"}, clear=False):
             with mock.patch("csbot.ops_gateway.request.urlopen") as urlopen:
                 result = handoff_notify(
                     customer_id="cust",
@@ -67,28 +67,18 @@ class OpsGatewayTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertFalse(result["notified"])
         self.assertTrue(result["dry_run"])
+        self.assertFalse(result["enabled"])
+        self.assertEqual(result["reason"], "feishu_notification_removed")
         self.assertEqual(result["message_preview"]["customer_name"], "张三")
         urlopen.assert_not_called()
 
-    def test_handoff_feishu_text_includes_customer_name(self) -> None:
-        class FakeResponse:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self) -> bytes:
-                return b'{"StatusCode":0}'
-
+    def test_handoff_preview_includes_customer_name_without_send(self) -> None:
         with mock.patch.dict(
             "os.environ",
-            {"CSBOT_FEISHU_ENABLED": "1", "CSBOT_FEISHU_WEBHOOK": "http://feishu"},
+            {"CSBOT_FEISHU_ENABLED": "1", "CSBOT_FEISHU_WEBHOOK": "http://removed"},
             clear=False,
         ):
-            with mock.patch("csbot.ops_gateway.request.urlopen", return_value=FakeResponse()) as urlopen:
+            with mock.patch("csbot.ops_gateway.request.urlopen") as urlopen:
                 result = handoff_notify(
                     customer_id="cust",
                     query="我要投诉",
@@ -98,10 +88,10 @@ class OpsGatewayTest(unittest.TestCase):
                 )
 
         self.assertTrue(result["ok"])
-        self.assertTrue(result["notified"])
-        request_obj = urlopen.call_args.args[0]
-        body = json.loads(request_obj.data.decode("utf-8"))
-        self.assertIn("客户名称：李四", body["content"]["text"])
+        self.assertFalse(result["notified"])
+        self.assertEqual(result["reason"], "feishu_notification_removed")
+        self.assertEqual(result["message_preview"]["customer_name"], "李四")
+        urlopen.assert_not_called()
 
 
 class OpsCliTest(unittest.TestCase):

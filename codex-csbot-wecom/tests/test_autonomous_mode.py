@@ -299,7 +299,7 @@ class AutonomousWorkerContractTest(unittest.TestCase):
         self.assertFalse(any(str(arg).startswith("@") for arg in captured["command"]))
         self.assertFalse(result["codex_cli"]["supports_images"])
 
-    def test_autonomous_worker_sends_feishu_for_handoff_action(self) -> None:
+    def test_autonomous_worker_records_local_handoff_action(self) -> None:
         reply = {
             "action": "handoff",
             "reply_text": "您好，这个问题我帮您转人工客服确认处理，请您稍等。",
@@ -317,57 +317,52 @@ class AutonomousWorkerContractTest(unittest.TestCase):
             out_path.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-        handoff_result = {"ok": True, "notified": True, "dry_run": False}
         with mock.patch("csbot.codex_cli.ensure_model_catalog") as catalog_mock:
             catalog_mock.return_value.enabled = True
             catalog_mock.return_value.path = str(Path(self.tmp.name) / "catalog.json")
             catalog_mock.return_value.generated = False
             catalog_mock.return_value.error = ""
             with mock.patch("csbot.autonomous_worker.subprocess.run", side_effect=fake_run):
-                with mock.patch("csbot.autonomous_worker.handoff_notify", return_value=handoff_result) as notify:
-                    result = run_autonomous_worker(
-                        customer_id="cust-1",
-                        query="我要投诉，给我转人工",
-                        context={"conversation_title": "刘裕鑫"},
-                        db_path=self.db,
-                        timeout=30,
-                    )
+                result = run_autonomous_worker(
+                    customer_id="cust-1",
+                    query="我要投诉，给我转人工",
+                    context={"conversation_title": "刘裕鑫"},
+                    db_path=self.db,
+                    timeout=30,
+                )
 
         self.assertEqual(result["reply"], reply)
-        self.assertEqual(result["handoff"], handoff_result)
-        notify.assert_called_once()
-        self.assertEqual(notify.call_args.kwargs["customer_id"], "cust-1")
-        self.assertEqual(notify.call_args.kwargs["query"], "我要投诉，给我转人工")
-        self.assertFalse(notify.call_args.kwargs["dry_run"])
+        self.assertEqual(result["handoff"]["reason"], "handled_by_wecom_review")
+        self.assertFalse(result["handoff"]["notified"])
+        self.assertEqual(result["handoff"]["customer_id"], "cust-1")
+        self.assertEqual(result["handoff"]["query"], "我要投诉，给我转人工")
 
     def test_autonomous_worker_timeout_returns_handoff_reply(self) -> None:
         def fake_run(command, **kwargs):
             raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 1), output="", stderr="timeout")
 
-        handoff_result = {"ok": True, "notified": True, "dry_run": False}
         with mock.patch("csbot.codex_cli.ensure_model_catalog") as catalog_mock:
             catalog_mock.return_value.enabled = True
             catalog_mock.return_value.path = str(Path(self.tmp.name) / "catalog.json")
             catalog_mock.return_value.generated = False
             catalog_mock.return_value.error = ""
             with mock.patch("csbot.autonomous_worker.subprocess.run", side_effect=fake_run):
-                with mock.patch("csbot.autonomous_worker.handoff_notify", return_value=handoff_result) as notify:
-                    result = run_autonomous_worker(
-                        customer_id="cust-timeout",
-                        query="我需要增肌，请问你推荐什么产品？",
-                        context={"conversation_title": "墨雨"},
-                        db_path=self.db,
-                        timeout=1,
-                    )
+                result = run_autonomous_worker(
+                    customer_id="cust-timeout",
+                    query="我需要增肌，请问你推荐什么产品？",
+                    context={"conversation_title": "墨雨"},
+                    db_path=self.db,
+                    timeout=1,
+                )
 
         self.assertEqual(result["parse_error"], "codex_timeout")
         self.assertTrue(result["validation"]["ok"])
         self.assertEqual(result["reply"]["action"], "handoff")
         self.assertIn("转人工", result["reply"]["reply_text"])
-        self.assertEqual(result["handoff"], handoff_result)
-        notify.assert_called_once()
+        self.assertEqual(result["handoff"]["reason"], "handled_by_wecom_review")
+        self.assertFalse(result["handoff"]["notified"])
 
-    def test_autonomous_worker_sends_feishu_for_ai_problem_handoff(self) -> None:
+    def test_autonomous_worker_records_local_ai_problem_handoff(self) -> None:
         reply = {
             "action": "handoff",
             "reply_text": "您好，这个问题我帮您转人工客服确认处理，请您稍等。",
@@ -385,25 +380,23 @@ class AutonomousWorkerContractTest(unittest.TestCase):
             out_path.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-        handoff_result = {"ok": True, "notified": True, "dry_run": False}
         with mock.patch("csbot.codex_cli.ensure_model_catalog") as catalog_mock:
             catalog_mock.return_value.enabled = True
             catalog_mock.return_value.path = str(Path(self.tmp.name) / "catalog.json")
             catalog_mock.return_value.generated = False
             catalog_mock.return_value.error = ""
             with mock.patch("csbot.autonomous_worker.subprocess.run", side_effect=fake_run):
-                with mock.patch("csbot.autonomous_worker.handoff_notify", return_value=handoff_result) as notify:
-                    result = run_autonomous_worker(
-                        customer_id="cust-1",
-                        query="鱼油怎么吃",
-                        context={"conversation_title": "刘裕鑫"},
-                        db_path=self.db,
-                        timeout=30,
-                    )
+                result = run_autonomous_worker(
+                    customer_id="cust-1",
+                    query="鱼油怎么吃",
+                    context={"conversation_title": "刘裕鑫"},
+                    db_path=self.db,
+                    timeout=30,
+                )
 
         self.assertEqual(result["reply"], reply)
-        self.assertEqual(result["handoff"], handoff_result)
-        notify.assert_called_once()
+        self.assertEqual(result["handoff"]["reason"], "handled_by_wecom_review")
+        self.assertFalse(result["handoff"]["notified"])
 
     def test_debug_autonomous_does_not_force_fixed_retrieve(self) -> None:
         codex_result = {

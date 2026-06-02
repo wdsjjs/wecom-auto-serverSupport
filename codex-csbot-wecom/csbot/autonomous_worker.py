@@ -18,7 +18,6 @@ from .codex_cli import (
 )
 from .codex_contract import validate_autonomous_reply
 from .config import DEFAULT_PROJECT_DIR, resolve_codex_workdir, resolve_db_path, resolve_mem0_url, using_pg
-from .ops_gateway import handoff_notify
 from .textutil import json_loads
 
 
@@ -333,13 +332,15 @@ def _worker_env(mem0_url: str, worker_info: dict) -> dict:
 def _notify_handoff_if_needed(*, customer_id: str, query: str, context: dict, reply: dict | None) -> dict | None:
     if not isinstance(reply, dict) or reply.get("action") != "handoff":
         return None
-    return handoff_notify(
-        customer_id=customer_id,
-        query=query,
-        reason=str(reply.get("decision_basis") or reply.get("reply_text") or "转人工").strip(),
-        context=context,
-        dry_run=False,
-    )
+    return {
+        "ok": True,
+        "notified": False,
+        "reason": "handled_by_wecom_review",
+        "customer_id": customer_id,
+        "query": query,
+        "handoff_reason": str(reply.get("decision_basis") or reply.get("reply_text") or "转人工").strip(),
+        "context": context,
+    }
 
 
 def _timeout_reply(timeout: int) -> dict:

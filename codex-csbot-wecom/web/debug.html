@@ -463,6 +463,13 @@
       return value !== undefined && value !== null;
     }
 
+    function fmtMs(value) {
+      if (!hasValue(value)) return "-";
+      const number = Number(value);
+      if (!Number.isFinite(number)) return String(value);
+      return number >= 1000 ? `${(number / 1000).toFixed(2)}s` : `${number}ms`;
+    }
+
     function hasLegacyRetrieval(data) {
       const retrieval = data?.retrieval || {};
       const trace = data?.retrieval_trace || {};
@@ -512,6 +519,10 @@
       const request = data.request || {};
       const mode = responseMode(data);
       const metrics = [pill(`mode ${mode}`, mode === "autonomous" ? "ok" : "")];
+      if (hasValue(trace.duration_ms)) metrics.push(pill(`retrieval ${fmtMs(trace.duration_ms)}`, trace.duration_ms <= 2000 ? "ok" : "warn"));
+      if (hasValue(trace.script_ms)) metrics.push(pill(`script ${fmtMs(trace.script_ms)}`, trace.script_ms <= 1000 ? "ok" : "warn"));
+      if (hasValue(trace.vector_ms)) metrics.push(pill(`vector ${fmtMs(trace.vector_ms)}`, trace.vector_ms <= 5000 ? "ok" : "warn"));
+      if (hasValue(trace.hydrate_ms)) metrics.push(pill(`hydrate ${fmtMs(trace.hydrate_ms)}`, trace.hydrate_ms <= 1000 ? "ok" : "warn"));
       if (hasValue(trace.script_count)) metrics.push(pill(`script ${trace.script_count}`, trace.script_count ? "ok" : "warn"));
       if (hasValue(trace.vector_count)) metrics.push(pill(`vector ${trace.vector_count}`, trace.vector_count ? "ok" : "warn"));
       if (trace.answer_basis) metrics.push(pill(trace.answer_basis, trace.answer_basis === "script_first" ? "ok" : "warn"));

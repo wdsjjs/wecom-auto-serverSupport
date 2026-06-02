@@ -450,32 +450,14 @@ def handoff_notify(
         "reason": reason,
         "context": context,
     }
-    enabled = os.environ.get("CSBOT_FEISHU_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
-    webhook = os.environ.get("CSBOT_FEISHU_WEBHOOK", "").strip()
-    if dry_run or not enabled or not webhook:
-        return {
-            "ok": True,
-            "notified": False,
-            "dry_run": dry_run,
-            "enabled": enabled,
-            "reason": "dry_run_or_feishu_disabled",
-            "message_preview": preview,
-        }
-    body = json.dumps({"msg_type": "text", "content": {"text": _handoff_text(preview)}}, ensure_ascii=False).encode()
-    req = request.Request(webhook, data=body, headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with request.urlopen(req, timeout=10) as resp:
-            response_text = resp.read().decode("utf-8", errors="replace")
-        return {
-            "ok": True,
-            "notified": True,
-            "dry_run": False,
-            "status": getattr(resp, "status", 200),
-            "message_preview": preview,
-            "response": response_text[-2000:],
-        }
-    except Exception as exc:
-        return {"ok": False, "notified": False, "dry_run": False, "error": str(exc), "message_preview": preview}
+    return {
+        "ok": True,
+        "notified": False,
+        "dry_run": dry_run,
+        "enabled": False,
+        "reason": "feishu_notification_removed",
+        "message_preview": preview,
+    }
 
 
 def _order_reply(orders: list[dict[str, Any]]) -> str:
@@ -498,16 +480,6 @@ def _logistics_reply(result: dict[str, Any], identifier: str) -> str:
     if summary:
         return f"查到订单 {summary.get('order_id') or identifier}，暂时没有最新物流轨迹。"
     return "暂时没有查到物流信息，请确认订单号、运单号或下单手机号是否正确。"
-
-
-def _handoff_text(preview: dict[str, Any]) -> str:
-    return (
-        "客服机器人转人工\n"
-        f"客户ID：{preview.get('customer_id') or ''}\n"
-        f"客户名称：{preview.get('customer_name') or ''}\n"
-        f"原因：{preview.get('reason') or ''}\n"
-        f"客户消息：{preview.get('query') or ''}"
-    )
 
 
 def _customer_name(context: dict[str, Any]) -> str:

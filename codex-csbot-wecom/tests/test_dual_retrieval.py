@@ -311,6 +311,21 @@ class DualRetrievalTest(unittest.TestCase):
         self.assertEqual(result["merged_context"]["answer_basis"], "script_first")
         self.assertEqual(result["vector_hits"], [])
 
+    def test_retrieve_reports_timing_metrics(self) -> None:
+        result = retrieve(customer_id="cust-timing", query="女维怎么吃", db_path=self.db, context={})
+
+        timing = result["metrics"]["timing"]
+        self.assertIsInstance(timing["total_ms"], int)
+        self.assertGreaterEqual(timing["total_ms"], 0)
+        self.assertIsInstance(timing["script_ms"], int)
+        self.assertGreaterEqual(timing["script_ms"], 0)
+        self.assertIsInstance(timing["vector_ms"], int)
+        self.assertGreaterEqual(timing["vector_ms"], 0)
+        self.assertIsInstance(timing["hydrate_ms"], int)
+        self.assertGreaterEqual(timing["hydrate_ms"], 0)
+        self.assertEqual(result["metrics"]["script_count"], len(result["script_hits"]))
+        self.assertEqual(result["metrics"]["vector_count"], len(result["vector_hits"]))
+
     def test_knowledge_age_does_not_become_child_profile(self) -> None:
         import_kb_docs_as_memories(self.db)
 
