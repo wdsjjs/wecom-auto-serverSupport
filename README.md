@@ -100,10 +100,12 @@ The review server prints a URL like:
 http://192.168.x.x:8122/
 ```
 
-Open that URL from the reviewer machine on the same LAN. The page supports only:
+Open that URL from the reviewer machine on the same LAN. The page supports:
 
 - view latest customer message and AI reply;
-- approve;
+- save edited or manually written reply text;
+- approve with the final reply text;
+- ask the agent to regenerate rejected, failed, or ready drafts;
 - reject.
 
 Approving does not send from the browser directly. It marks the queue item

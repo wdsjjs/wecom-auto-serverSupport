@@ -207,12 +207,16 @@ REVIEW_HTML = """<!doctype html>
         )).join("");
       }
       function roleClass(message) {
+        const type = String(message.message_type || "");
         const role = String(message.role || "");
-        if (role.includes("客服")) return "service";
-        if (role.includes("用户") || role.includes("客户")) return "user";
+        if (type === "reply" || role.includes("客服")) return "service";
+        if (type === "customer" || role.includes("用户") || role.includes("客户")) return "user";
         return "unknown";
       }
       function roleLabel(message) {
+        const type = String(message.message_type || "");
+        if (type === "reply") return "客服";
+        if (type === "customer") return "客户";
         const role = String(message.role || "").trim();
         if (role.includes("客服")) return "客服";
         if (role.includes("用户") || role.includes("客户")) return "客户";
@@ -349,6 +353,7 @@ def _fallback_messages(item: dict, latest_text: str) -> list[dict]:
             "message_hash": item.get("last_message_hash") or "",
             "seq": 0,
             "role": "用户",
+            "message_type": "customer",
             "text": text,
             "time_text": item.get("time_text") or "",
             "source": "context_json" if latest_text else "preview",
@@ -359,12 +364,30 @@ def _fallback_messages(item: dict, latest_text: str) -> list[dict]:
     ]
 
 
+def _message_type(message: dict) -> str:
+    role = str(message.get("role") or "").strip().lower()
+    if role in {"customer", "user", "human"} or "用户" in role or "客户" in role:
+        return "customer"
+    if (
+        role in {"reply", "service", "assistant", "agent", "staff"}
+        or "客服" in role
+        or "坐席" in role
+    ):
+        return "reply"
+    return "unknown"
+
+
+def _classified_messages(messages: list[dict]) -> list[dict]:
+    return [{**message, "message_type": _message_type(message)} for message in messages]
+
+
 def _review_item(item: dict) -> dict:
     latest_text = _context_latest_text(item)
     conversation_key = str(item.get("conversation_key") or "").strip()
     messages = state.list_conversation_messages(conversation_key=conversation_key) if conversation_key else []
     if not messages:
         messages = _fallback_messages(item, latest_text)
+    messages = _classified_messages(messages)
     return {
         "id": item.get("id"),
         "conversation_key": conversation_key,
@@ -395,11 +418,29 @@ def review_counts() -> dict[str, int]:
     return counts
 
 
-def approve_item(job_id: int) -> dict:
-    if not state.mark_approved(job_id):
+def approve_item(job_id: int, *, reply_text: str | None = None) -> dict:
+    if not state.mark_approved(job_id, reply_text=reply_text):
         return {"ok": False, "error": "not_ready", "id": job_id}
     item = state.get_job(job_id)
     state.append_event({"type": "review_approved", "job_id": job_id, "conversation": (item or {}).get("title")})
+    return {"ok": True, "item": _review_item(item or {})}
+
+
+def save_item(job_id: int, *, reply_text: str) -> dict:
+    if not state.save_reply(job_id, reply_text=reply_text):
+        return {"ok": False, "error": "not_ready", "id": job_id}
+    item = state.get_job(job_id)
+    state.append_event({"type": "review_saved", "job_id": job_id, "conversation": (item or {}).get("title")})
+    return {"ok": True, "item": _review_item(item or {})}
+
+
+def regenerate_item(job_id: int, *, reason: str = "review_regenerate") -> dict:
+    if not state.regenerate_reply(job_id, reason=reason):
+        return {"ok": False, "error": "not_regeneratable", "id": job_id}
+    item = state.get_job(job_id)
+    state.append_event(
+        {"type": "review_regenerate", "job_id": job_id, "conversation": (item or {}).get("title"), "reason": reason}
+    )
     return {"ok": True, "item": _review_item(item or {})}
 
 
@@ -458,7 +499,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) != 5 or parts[:3] != ["api", "review", "items"] or parts[4] not in {"approve", "reject"}:
+        actions = {"approve", "reject", "save", "regenerate"}
+        if len(parts) != 5 or parts[:3] != ["api", "review", "items"] or parts[4] not in actions:
             _json_response(self, 404, {"ok": False, "error": "not_found"})
             return
         try:
@@ -472,10 +514,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
             _json_response(self, 400, {"ok": False, "error": str(exc)})
             return
         if parts[4] == "approve":
-            result = approve_item(job_id)
-        else:
+            reply_text = payload.get("reply_text")
+            result = approve_item(job_id, reply_text=str(reply_text) if reply_text is not None else None)
+        elif parts[4] == "reject":
             reason = str(payload.get("reason") or "review_rejected").strip() or "review_rejected"
             result = reject_item(job_id, reason=reason)
+        elif parts[4] == "save":
+            reply_text = str(payload.get("reply_text") or "").strip()
+            result = save_item(job_id, reply_text=reply_text)
+        else:
+            reason = str(payload.get("reason") or "review_regenerate").strip() or "review_regenerate"
+            result = regenerate_item(job_id, reason=reason)
         _json_response(self, 200 if result.get("ok") else 409, result)
 
 

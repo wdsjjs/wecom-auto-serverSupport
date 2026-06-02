@@ -108,6 +108,8 @@ Review API:
 ```text
 GET  /api/review/items?status=ready
 GET  /api/review/counts
+POST /api/review/items/{id}/save
+POST /api/review/items/{id}/regenerate
 POST /api/review/items/{id}/approve
 POST /api/review/items/{id}/reject
 ```

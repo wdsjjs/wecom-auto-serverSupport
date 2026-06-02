@@ -2962,6 +2962,68 @@ def test_review_approve_and_reject_ready_items(monkeypatch, tmp_path):
     assert rejected["error"] == "review_rejected"
 
 
+def test_review_regenerate_moves_inactive_jobs_back_to_pending(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    rows = [
+        {"title": "客户A", "preview": "被拒绝", "time": "刚刚", "tags": ["@微信"], "raw": []},
+        {"title": "客户B", "preview": "失败了", "time": "刚刚", "tags": ["@微信"], "raw": []},
+        {"title": "客户C", "preview": "待审核", "time": "刚刚", "tags": ["@微信"], "raw": []},
+    ]
+    jobs = []
+    for index, row in enumerate(rows):
+        state.enqueue_conversation(row, f"sig-{index}")
+        job = state.claim_pending_for_read()
+        state.mark_drafting(
+            job["id"],
+            message_hash=f"hash-{index}",
+            messages=[{"role": "用户", "content": row["preview"]}],
+            latest={"role": "用户", "content": row["preview"]},
+        )
+        state.mark_ready(job["id"], reply_text=f"旧回复{index}")
+        jobs.append(job)
+
+    assert review_server.reject_item(jobs[0]["id"])["ok"] is True
+    state.mark_failed(jobs[1]["id"], "draft_error")
+
+    for job in jobs:
+        result = review_server.regenerate_item(job["id"])
+        assert result["ok"] is True
+        regenerated = state.get_job(job["id"])
+        assert regenerated["status"] == "pending"
+        assert regenerated["reply_text"] is None
+        assert regenerated["last_message_hash"] is None
+        assert regenerated["context_json"] is None
+        assert state.list_conversation_messages(conversation_key=job["conversation_key"]) == []
+
+    pending = state.claim_pending_for_read()
+    assert pending["id"] in {job["id"] for job in jobs}
+
+
+def test_review_save_and_approve_uses_final_reply_text(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "鱼油怎么吃", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "鱼油怎么吃", "text": "鱼油怎么吃"}],
+        latest={"role": "用户", "content": "鱼油怎么吃"},
+    )
+    state.mark_ready(job["id"], reply_text="AI草稿")
+
+    saved = review_server.save_item(job["id"], reply_text="客服改过的回复")
+    assert saved["ok"] is True
+    assert saved["item"]["status"] == "ready"
+    assert saved["item"]["reply_text"] == "客服改过的回复"
+
+    approved = review_server.approve_item(job["id"], reply_text="最终确认回复")
+    assert approved["ok"] is True
+    approved_job = state.get_job(job["id"])
+    assert approved_job["status"] == "approved"
+    assert approved_job["reply_text"] == "最终确认回复"
+
+
 def test_review_items_include_latest_context(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "旧预览", "time": "刚刚", "tags": ["@微信"], "raw": []}
@@ -2983,7 +3045,30 @@ def test_review_items_include_latest_context(monkeypatch, tmp_path):
     assert items[0]["reply_text"] == "审核回复"
     assert items[0]["conversation_key"]
     assert items[0]["messages"][0]["role"] == "用户"
+    assert items[0]["messages"][0]["message_type"] == "customer"
     assert items[0]["messages"][0]["text"] == "最新问题"
+
+
+def test_review_items_classify_customer_reply_and_unknown_messages(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "我想咨询", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[
+            {"role": "用户", "content": "我想咨询"},
+            {"role": "客服", "content": "您好"},
+            {"role": "system", "content": "时间分割线"},
+        ],
+        latest={"role": "用户", "content": "我想咨询"},
+    )
+    state.mark_ready(job["id"], reply_text="请问您想了解哪款？")
+
+    item = review_server.list_review_items(status="ready")[0]
+
+    assert [message["message_type"] for message in item["messages"]] == ["customer", "reply", "unknown"]
 
 
 def test_mark_drafting_replaces_persisted_conversation_messages(monkeypatch, tmp_path):
@@ -3054,6 +3139,66 @@ def test_review_http_allows_actions_without_token(monkeypatch, tmp_path):
         assert counts["counts"]["approved"] == 1
         for status in ["ready", "approved", "done", "skipped", "failed"]:
             assert status in counts["counts"]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+
+def test_review_http_supports_save_approve_with_reply_and_regenerate(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "查订单", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "查订单"}],
+        latest={"role": "用户", "content": "查订单"},
+    )
+    state.mark_ready(job["id"], reply_text="AI草稿")
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), review_server.ReviewHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        save_req = request.Request(
+            f"{base}/api/review/items/{job['id']}/save",
+            data=json.dumps({"reply_text": "客服保存稿"}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with request.urlopen(save_req, timeout=5) as resp:
+            saved = json.loads(resp.read().decode("utf-8"))
+        assert saved["ok"] is True
+        assert state.get_job(job["id"])["reply_text"] == "客服保存稿"
+
+        approve_req = request.Request(
+            f"{base}/api/review/items/{job['id']}/approve",
+            data=json.dumps({"reply_text": "最终发送稿"}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with request.urlopen(approve_req, timeout=5) as resp:
+            approved = json.loads(resp.read().decode("utf-8"))
+        assert approved["ok"] is True
+        assert state.get_job(job["id"])["status"] == "approved"
+        assert state.get_job(job["id"])["reply_text"] == "最终发送稿"
+
+        state.mark_skipped(job["id"], "manual_reject")
+        regenerate_req = request.Request(
+            f"{base}/api/review/items/{job['id']}/regenerate",
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with request.urlopen(regenerate_req, timeout=5) as resp:
+            regenerated = json.loads(resp.read().decode("utf-8"))
+        assert regenerated["ok"] is True
+        pending = state.get_job(job["id"])
+        assert pending["status"] == "pending"
+        assert pending["reply_text"] is None
     finally:
         httpd.shutdown()
         httpd.server_close()

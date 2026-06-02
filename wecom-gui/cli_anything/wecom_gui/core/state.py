@@ -835,21 +835,87 @@ def mark_ready(job_id: int, *, reply_text: str) -> None:
         )
 
 
-def mark_approved(job_id: int) -> bool:
+def mark_approved(job_id: int, *, reply_text: str | None = None) -> bool:
     """Approve a ready reply for agent-managed sending."""
+    now = time.time()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT status, reply_text
+            FROM reply_queue
+            WHERE id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None or row["status"] != "ready":
+            return False
+        final_reply = str(reply_text if reply_text is not None else row["reply_text"] or "").strip()
+        if not final_reply:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE reply_queue
+            SET status = 'approved', reply_text = ?, error = NULL,
+                locked_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (final_reply, now, job_id),
+        )
+        return cur.rowcount == 1
+
+
+def save_reply(job_id: int, *, reply_text: str) -> bool:
+    """Save a reviewer-authored reply and keep it waiting for approval."""
+    final_reply = str(reply_text or "").strip()
+    if not final_reply:
+        return False
     now = time.time()
     with connect() as conn:
         cur = conn.execute(
             """
             UPDATE reply_queue
-            SET status = 'approved', error = NULL,
+            SET status = 'ready', reply_text = ?, error = NULL,
                 locked_at = NULL, updated_at = ?
             WHERE id = ?
-              AND status = 'ready'
-              AND COALESCE(reply_text, '') != ''
+              AND status IN ('ready', 'failed', 'skipped')
             """,
-            (now, job_id),
+            (final_reply, now, job_id),
         )
+        return cur.rowcount == 1
+
+
+def regenerate_reply(job_id: int, reason: str = "review_regenerate") -> bool:
+    """Return a completed draft/rejected/error job to pending for a fresh read."""
+    now = time.time()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT conversation_key
+            FROM reply_queue
+            WHERE id = ?
+              AND status IN ('ready', 'failed', 'skipped')
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE reply_queue
+            SET status = 'pending', reply_text = NULL, context_json = NULL,
+                last_message_hash = NULL, error = ?, locked_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+              AND status IN ('ready', 'failed', 'skipped')
+            """,
+            (reason or "review_regenerate", now, job_id),
+        )
+        conversation_key = str(row["conversation_key"] or "").strip()
+        if cur.rowcount == 1 and conversation_key:
+            conn.execute(
+                "DELETE FROM conversation_messages WHERE conversation_key = ?",
+                (conversation_key,),
+            )
         return cur.rowcount == 1
 
 
