@@ -81,6 +81,18 @@ class AutonomousWorkerContractTest(unittest.TestCase):
                      '女维每日 1 粒，随餐服用。', '{}', '5 产品常规信息', 2, '服用方法')
                 """
             )
+            conn.execute(
+                """
+                INSERT INTO kb_docs
+                    (kb_doc_id, kb_version, business_type, product, topic, text, facts_json,
+                     source_sheet, source_row, source_field)
+                VALUES
+                    ('doc-paper-1', 'test-v1', 'research_evidence', '婴幼少儿 DHA 藻油', 'DHA 与儿童成长研究',
+                     '产品: 婴幼少儿 DHA 藻油\n论文方向: 儿童成长研究\n标题: DHA 与儿童成长研究\n链接: https://example.com/dha-paper',
+                     '{"产品":"婴幼少儿 DHA 藻油","论文方向":"儿童成长研究","标题":"DHA 与儿童成长研究","链接":"https://example.com/dha-paper"}',
+                     '6 论文表', 8, 'row')
+                """
+            )
             conn.commit()
         finally:
             conn.close()
@@ -200,6 +212,49 @@ class AutonomousWorkerContractTest(unittest.TestCase):
             run_patch.stop()
 
         self.assertEqual(result["reply"], reply)
+        self.assertTrue(result["validation"]["ok"])
+
+    def test_supplement_send_appends_paper_links_from_database(self) -> None:
+        reply = {
+            "action": "send",
+            "reply_text": "结合您的需求，为您推荐这几款产品组合。接下来，我详细为您介绍下：\n婴幼少儿 DHA 藻油：适合儿童成长相关需求。",
+            "used_script_sources": [
+                {"sheet": "10 补剂推荐", "row": 2, "field": "row", "kb_doc_id": "doc-rec-1"}
+            ],
+            "used_vector_memories": [],
+            "confidence": 0.9,
+            "commands_run": [],
+            "conflicts": [],
+            "retrieval_summary": "已查询补剂推荐规则。",
+            "decision_basis": "命中儿童成长推荐规则。",
+        }
+
+        def fake_run(command, **kwargs):
+            out_path = Path(command[command.index("--output-last-message") + 1])
+            out_path.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch("csbot.codex_cli.ensure_model_catalog") as catalog_mock:
+            catalog_mock.return_value.enabled = True
+            catalog_mock.return_value.path = str(Path(self.tmp.name) / "catalog.json")
+            catalog_mock.return_value.generated = False
+            catalog_mock.return_value.error = ""
+            with mock.patch("csbot.autonomous_worker.subprocess.run", side_effect=fake_run):
+                result = run_autonomous_worker(
+                    customer_id="cust-supplement",
+                    query="儿童成长 推荐",
+                    context={"agent_mode": "supplement", "agent_context": {"reply_source": "supplement"}},
+                    db_path=self.db,
+                    timeout=30,
+                )
+
+        reply_text = result["reply"]["reply_text"]
+        self.assertIn("相关论文参考：", reply_text)
+        self.assertIn("DHA 与儿童成长研究：https://example.com/dha-paper", reply_text)
+        self.assertIn(
+            {"sheet": "6 论文表", "row": 8, "field": "row", "kb_doc_id": "doc-paper-1"},
+            result["reply"]["used_script_sources"],
+        )
         self.assertTrue(result["validation"]["ok"])
 
     def test_pi_worker_passes_images_as_cli_attachments(self) -> None:

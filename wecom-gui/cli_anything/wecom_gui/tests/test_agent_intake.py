@@ -90,6 +90,263 @@ def test_agent_binds_visible_sidebar_uid_before_drafting(monkeypatch, tmp_path):
     assert state.lookup_wecom_customer(customer_name="客户A")["uid"] == "wm-visible"
 
 
+def test_agent_upgrades_visible_queue_key_to_sidebar_uid(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {
+        "title": "客户A",
+        "preview": "查订单",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "raw": [],
+        "source": "ocr",
+        "click_y": 240.0,
+    }
+    changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    assert changed is True
+    assert item["conversation_key"].startswith("visible:")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "hash": "hash1",
+            "messages": [{"role": "用户", "content": "查订单", "text": "查订单"}],
+        },
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "wm-visible")
+
+    def fake_draft(messages, customer_name="", customer_uid="", **kwargs):
+        return {"ok": True, "text": f"uid={customer_uid}", "message": f"uid={customer_uid}"}
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fake_draft)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=12, executor=executor, futures=futures, max_drafts=1)
+        assert result["drafting"] == 1
+        job_id = next(iter(futures))
+        assert futures[job_id].result()["text"] == "uid=wm-visible"
+
+    upgraded = state.get_job(job_id)
+    assert upgraded["conversation_key"] == "uid:wm-visible"
+    assert state.get_job(item["id"])["conversation_key"] == "uid:wm-visible"
+
+
+def test_agent_creates_welcome_ready_draft_from_system_text(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {
+        "title": "三水儿",
+        "preview": "你已添加了 三水儿，现在可以开始聊天了。",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "raw": [],
+        "source": "ocr",
+        "click_y": 240.0,
+    }
+    state.enqueue_conversation(row, watcher._conversation_signature(row))
+
+    messages = [
+        {"role": "系统", "content": "你已添加了 三水儿，现在可以开始聊天了。", "text": "你已添加了 三水儿，现在可以开始聊天了。"},
+        {"role": "系统", "content": "以上是打招呼内容", "text": "以上是打招呼内容"},
+    ]
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {"hash": "welcome-hash", "messages": messages},
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.llm.draft_reply",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("welcome should not call AI")),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=12, executor=executor, futures=futures, max_drafts=1)
+
+    assert result["supplement"] == 1
+    assert futures == {}
+    ready = state.list_queue(status="ready")[0]
+    assert ready["reply_text"].startswith("您好~可以简单介绍下您的基本信息")
+    assert "20.儿童成长" in ready["reply_text"]
+    assert ready["reply_source"] == "supplement"
+    assert json.loads(ready["context_json"])["latest"]["role"] == "系统"
+    supplement = state.get_supplement_state(ready["conversation_key"])
+    assert supplement["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
+    assert supplement["pending_next_stage"] == state.SUPPLEMENT_DIGGING_NEED
+    stored = state.list_conversation_messages(conversation_key=ready["conversation_key"])
+    assert [message["message_type"] for message in stored] == ["system", "system"]
+
+
+def test_agent_creates_supplement_first_prompt_from_recommendation_intent(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "补剂推荐", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, watcher._conversation_signature(row))
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "hash": "supp-hash",
+            "messages": [{"role": "用户", "content": "补剂推荐", "text": "补剂推荐"}],
+        },
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.llm.draft_reply",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("first prompt should not call AI")),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=12, executor=executor, futures=futures, max_drafts=1)
+
+    assert result["supplement"] == 1
+    assert futures == {}
+    ready = state.list_queue(status="ready")[0]
+    assert ready["reply_source"] == "supplement"
+    assert ready["reply_text"] == agent.SUPPLEMENT_FIRST_REPLY_WITH_PROFILE
+    assert state.get_supplement_state(ready["conversation_key"])["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
+    logs = state.list_supplement_logs()
+    assert logs[-1]["event_type"] == "supplement_route_evaluated"
+
+
+def test_agent_supplement_active_flow_passes_agent_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "最近经常熬夜", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    state.mark_supplement_state(
+        item["conversation_key"],
+        state.SUPPLEMENT_DIGGING_NEED,
+        conversation_key=item["conversation_key"],
+        conversation="客户A",
+        job_id=item["id"],
+        trace_id="trace-1",
+        digging_count=1,
+        selected_needs=["睡眠质量差"],
+        reason="need_selection_ack",
+    )
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "hash": "dig-hash",
+            "messages": [{"role": "用户", "content": "最近经常熬夜", "text": "最近经常熬夜"}],
+        },
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
+    captured = {}
+
+    def fake_draft(messages, customer_name="", customer_uid="", agent_mode="", agent_context=None, **kwargs):
+        captured["agent_mode"] = agent_mode
+        captured["agent_context"] = agent_context
+        return {"ok": True, "text": "请问您入睡困难还是容易醒？", "message": "请问您入睡困难还是容易醒？", "action": "clarify"}
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fake_draft)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=12, executor=executor, futures=futures, max_drafts=1)
+        assert result["drafting"] == 1
+        job_id = next(iter(futures))
+        assert futures[job_id].result()["text"] == "请问您入睡困难还是容易醒？"
+
+    assert captured["agent_mode"] == "supplement"
+    assert captured["agent_context"]["trace_id"] == "trace-1"
+    assert captured["agent_context"]["selected_needs"] == ["睡眠质量差"]
+
+
+def test_agent_supplement_profile_opt_out_reaches_agent_context(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "不想提供个人信息", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    state.mark_supplement_state(
+        item["conversation_key"],
+        state.SUPPLEMENT_DIGGING_NEED,
+        conversation_key=item["conversation_key"],
+        conversation="客户A",
+        job_id=item["id"],
+        trace_id="trace-opt-out",
+        digging_count=1,
+        selected_needs=["睡眠质量差"],
+        known_profile={"has_basic_profile": False},
+        reason="need_selection_ack",
+    )
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "hash": "opt-out-hash",
+            "messages": [{"role": "用户", "content": "不想提供个人信息，睡眠不好", "text": "不想提供个人信息，睡眠不好"}],
+        },
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
+    captured = {}
+
+    def fake_draft(messages, customer_name="", customer_uid="", agent_mode="", agent_context=None, **kwargs):
+        captured["agent_context"] = agent_context
+        return {"ok": True, "text": "请问您是入睡困难还是容易醒？", "message": "请问您是入睡困难还是容易醒？", "action": "clarify"}
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fake_draft)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=12, executor=executor, futures=futures, max_drafts=1)
+        assert result["drafting"] == 1
+        next(iter(futures.values())).result()
+
+    assert captured["agent_context"]["profile_opt_out"] is True
+    assert captured["agent_context"]["known_profile"]["profile_opt_out"] is True
+    assert captured["agent_context"]["digging_question_policy"]["max_questions_per_reply"] == 1
+    saved = state.get_supplement_state(item["conversation_key"])
+    assert saved["known_profile"]["profile_opt_out"] is True
+
+
+def test_agent_skips_duplicate_supplement_prompt_when_already_active(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {
+        "title": "三水儿",
+        "preview": "你已添加了 三水儿，现在可以开始聊天了。",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "raw": [],
+        "source": "ocr",
+        "click_y": 240.0,
+    }
+    _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    state.mark_supplement_state(
+        item["conversation_key"],
+        state.SUPPLEMENT_COLLECTING_PROFILE,
+        conversation_key=item["conversation_key"],
+        conversation="三水儿",
+        job_id=item["id"],
+        trace_id="trace-existing",
+        reason="first_prompt_ready",
+    )
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "hash": "welcome-hash",
+            "messages": [
+                {"role": "系统", "content": "你已添加了 三水儿，现在可以开始聊天了。", "text": "你已添加了 三水儿，现在可以开始聊天了。"}
+            ],
+        },
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = agent._read_one_pending(last=12, executor=executor, futures={}, max_drafts=1)
+
+    assert result["supplement"] == 1
+    ready = state.list_queue(status="ready")[0]
+    assert ready["reply_source"] == "supplement"
+    assert ready["reply_text"] == agent.SUPPLEMENT_FIRST_REPLY_WITH_PROFILE
+
+
 def test_agent_read_only_logs_context_without_drafting(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "[图片]", "time": "刚刚", "tags": ["@微信"], "raw": []}
@@ -113,6 +370,7 @@ def test_agent_read_only_logs_context_without_drafting(monkeypatch, tmp_path):
             ],
         },
     )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
 
     def fail_draft(*args, **kwargs):
         raise AssertionError("read-only mode should not call AI")
@@ -136,7 +394,7 @@ def test_agent_read_only_logs_context_without_drafting(monkeypatch, tmp_path):
     assert any(json.loads(line)["type"] == "agent_read_only_completed" for line in events)
 
 
-def test_agent_builds_welcome_draft_for_new_customer_system_message(monkeypatch, tmp_path):
+def test_agent_builds_supplement_prompt_for_new_customer_system_message(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     monkeypatch.setenv("WECOM_GUI_WELCOME_MESSAGE", "欢迎加入")
     row = {
@@ -163,9 +421,10 @@ def test_agent_builds_welcome_draft_for_new_customer_system_message(monkeypatch,
             ],
         },
     )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
 
     def fail_draft(*args, **kwargs):
-        raise AssertionError("welcome should not call the ordinary AI drafter")
+        raise AssertionError("new-customer supplement prompt should not call the ordinary AI drafter")
 
     monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fail_draft)
 
@@ -173,11 +432,12 @@ def test_agent_builds_welcome_draft_for_new_customer_system_message(monkeypatch,
         futures = {}
         result = agent._read_one_pending(last=12, executor=executor, futures=futures, max_drafts=1)
 
-    assert result["welcome"] == 1
+    assert result["supplement"] == 1
     assert futures == {}
     ready = state.list_queue(status="ready")[0]
-    assert ready["reply_text"] == "欢迎加入"
-    assert ready["reply_source"] == "welcome"
+    assert ready["reply_text"] == agent.SUPPLEMENT_FIRST_REPLY_WITH_PROFILE
+    assert ready["reply_source"] == "supplement"
+    assert state.get_supplement_state(ready["conversation_key"])["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
 
 
 def test_agent_defers_when_live_chat_messages_missing(monkeypatch, tmp_path):

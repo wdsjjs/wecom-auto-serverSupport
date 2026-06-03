@@ -105,8 +105,36 @@ def build_sample_workbook(path: Path) -> None:
     shipping.append(["EPA鱼油", "97%高纯度EPA鱼油", "现货", "", "预计2个月左右发货哈~"])
 
     recs = wb.create_sheet("10 补剂推荐")
-    recs.append(["需求点", "挖需结果", "推荐产品", "推荐产品介绍", "备注（不发出）"])
-    recs.append(["儿童成长", "3个月以上婴儿，神经发育", "婴幼少儿DHA藻油", "促进婴幼儿神经发育", ""])
+    recs.append(
+        [
+            "需求点",
+            "挖需铺垫",
+            "挖需问题",
+            "挖需结果",
+            "推荐产品",
+            "相同挖需结果下的优先级",
+            "是否为兜底推荐产品",
+            "推荐产品介绍",
+            "推荐后免责话术",
+            "备注（不发出）",
+            "第一段话术",
+        ]
+    )
+    recs.append(
+        [
+            "儿童成长",
+            "儿童成长需要结合年龄和喂养情况看。",
+            "请问孩子多大了，平时饮食怎么样？",
+            "3个月以上婴儿，神经发育",
+            "婴幼少儿DHA藻油",
+            "高",
+            "是",
+            "促进婴幼儿神经发育",
+            "婴幼儿使用前建议结合年龄确认。",
+            "只做内部备注",
+            "您好~请先介绍基础信息。",
+        ]
+    )
 
     reports = wb.create_sheet("13 产品检测报告")
     reports.append(["产品常用名", "产品全称", "出厂检测", "第三方检测"])
@@ -120,6 +148,7 @@ def build_sample_workbook(path: Path) -> None:
     papers = wb.create_sheet("6 论文表")
     papers.append(["产品", "论文方向", "标题", "链接"])
     papers.append(["复合维生素（男/女）", "免疫研究", "维生素相关研究", "https://example.com/paper"])
+    papers.append(["婴幼少儿 DHA 藻油", "儿童成长研究", "DHA 与儿童成长研究", "https://example.com/dha-paper"])
 
     safety = wb.create_sheet("7 L0级注意事项")
     safety.append(["问题", "回答"])
@@ -152,6 +181,7 @@ class DualRetrievalTest(unittest.TestCase):
                 "CSBOT_MEM0_URL": "",
                 "CSBOT_MEM0_API_KEY": "",
                 "CSBOT_MEM0_ENV": "/tmp/csbot-test-mem0.env",
+                "CSBOT_PG_DSN": "",
             },
         )
         self.env_patch.start()
@@ -193,6 +223,52 @@ class DualRetrievalTest(unittest.TestCase):
         self.assertEqual(result["script_hits"][0]["product"], "婴幼少儿 DHA 藻油")
         self.assertEqual(result["merged_context"]["known_user_facts"]["child_age"], "1.5岁")
         self.assertFalse(result["merged_context"]["needs_clarification"])
+
+    def test_supplement_scope_keeps_recommendation_fields(self) -> None:
+        result = script_search("儿童成长 补剂推荐", self.db, {"scope": "supplement"})
+
+        self.assertEqual(result["intent"], "supplement_recommendation")
+        self.assertEqual(result["scope"], "supplement")
+        first = result["hits"][0]
+        self.assertEqual(first["business_type"], "recommendation_rule")
+        self.assertEqual(first["source"]["sheet"], "10 补剂推荐")
+        self.assertEqual(first["facts"]["挖需铺垫"], "儿童成长需要结合年龄和喂养情况看。")
+        self.assertEqual(first["facts"]["挖需问题"], "请问孩子多大了，平时饮食怎么样？")
+        self.assertEqual(first["facts"]["相同挖需结果下的优先级"], "高")
+        self.assertEqual(first["facts"]["是否为兜底推荐产品"], "是")
+        self.assertEqual(first["facts"]["推荐后免责话术"], "婴幼儿使用前建议结合年龄确认。")
+        self.assertEqual(first["facts"]["第一段话术"], "您好~请先介绍基础信息。")
+
+    def test_supplement_retrieve_filters_to_supplement_kb(self) -> None:
+        result = retrieve(
+            customer_id="cust-supplement",
+            query="儿童成长 补剂推荐",
+            db_path=self.db,
+            context={"scope": "supplement"},
+        )
+
+        self.assertEqual(result["metrics"]["scope"], "supplement")
+        self.assertGreaterEqual(len(result["script_hits"]), 1)
+        allowed = {
+            ("recommendation_rule", "10 补剂推荐"),
+            ("product_profile", "5 产品常规信息"),
+            ("safety_policy", "7 L0级注意事项"),
+            ("research_evidence", "6 论文表"),
+        }
+        self.assertTrue(
+            {
+                (hit["business_type"], hit["source"]["sheet"])
+                for hit in result["script_hits"]
+            }.issubset(allowed)
+        )
+
+    def test_supplement_scope_includes_related_paper_links(self) -> None:
+        result = script_search("儿童成长 婴幼少儿 DHA 藻油 推荐 论文", self.db, {"scope": "supplement"})
+
+        paper_hits = [hit for hit in result["hits"] if hit["business_type"] == "research_evidence"]
+        self.assertTrue(paper_hits)
+        self.assertEqual(paper_hits[0]["source"]["sheet"], "6 论文表")
+        self.assertEqual(paper_hits[0]["facts"]["链接"], "https://example.com/dha-paper")
 
     def test_fish_shipping_is_ambiguous(self) -> None:
         result = retrieve(customer_id="cust-2", query="鱼油发货时间", db_path=self.db, context={})
@@ -239,7 +315,7 @@ class DualRetrievalTest(unittest.TestCase):
 
         for business_type, source_sheet in expectations.items():
             rows = self._rows_for_business_type(business_type)
-            self.assertEqual(len(rows), 1, business_type)
+            self.assertGreaterEqual(len(rows), 1, business_type)
             self.assertEqual(rows[0]["source_sheet"], source_sheet)
 
     def test_alias_can_retrieve_generic_sheet_rows(self) -> None:

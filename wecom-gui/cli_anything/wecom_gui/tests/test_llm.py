@@ -309,6 +309,43 @@ def test_pi_provider_invokes_csbot_autonomous(monkeypatch, tmp_path):
     assert data["message"] == "鱼油起拍数量是 4 盒。"
     assert captured["cmd"][:3] == [llm._csbot_python(), "-m", "csbot"]
 
+
+def test_pi_provider_uses_agent_context_customer_key(monkeypatch, tmp_path):
+    captured = {}
+
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps(
+            {
+                "ok": True,
+                "mode": "autonomous",
+                "codex": {"reply": {"action": "clarify", "reply_text": "最近入睡大概需要多久？"}},
+            },
+            ensure_ascii=False,
+        )
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return Result()
+
+    monkeypatch.delenv("WECOM_GUI_CODEX_BACKEND", raising=False)
+    monkeypatch.setenv("WECOM_GUI_CSBOT_DIR", str(tmp_path))
+    monkeypatch.setenv("WECOM_GUI_CSBOT_CUSTOMER_ID", "fallback-customer")
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.subprocess.run", fake_run)
+
+    llm.draft_reply(
+        [{"role": "用户", "content": "想改善睡眠"}],
+        provider="pi",
+        agent_mode="supplement",
+        agent_context={"customer_key": "supplement-full-test:abc123", "trace_id": "trace-1"},
+    )
+
+    assert captured["cmd"][captured["cmd"].index("--customer-id") + 1] == "supplement-full-test:abc123"
+    context = json.loads(captured["cmd"][captured["cmd"].index("--context-json") + 1])
+    assert context["customer_id"] == "supplement-full-test:abc123"
+    assert context["agent_context"]["customer_key"] == "supplement-full-test:abc123"
+
 def test_pi_provider_recovers_reply_text_from_malformed_stdout(monkeypatch, tmp_path):
     class Result:
         returncode = 0

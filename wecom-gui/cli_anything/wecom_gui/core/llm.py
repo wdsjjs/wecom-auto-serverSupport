@@ -185,7 +185,13 @@ def latest_user_turn_image_paths(messages: list[dict]) -> list[str]:
     return message_image_paths(latest_user_turn_messages(messages))
 
 
-def build_csbot_context(messages: list[dict], *, customer_name: str = "") -> dict:
+def build_csbot_context(
+    messages: list[dict],
+    *,
+    customer_name: str = "",
+    agent_mode: str = "",
+    agent_context: dict | None = None,
+) -> dict:
     """Build compact context for the csbot autonomous worker."""
     history = []
     for message in messages:
@@ -208,6 +214,11 @@ def build_csbot_context(messages: list[dict], *, customer_name: str = "") -> dic
             item["media"] = media_payload
         history.append(item)
     context = {"source": "wecom-gui", "messages": history, "known_facts": {}}
+    mode = str(agent_mode or "").strip()
+    if mode:
+        context["agent_mode"] = mode
+    if agent_context:
+        context["agent_context"] = agent_context
     image_paths = latest_user_turn_image_paths(messages)
     if image_paths:
         context["image_paths"] = image_paths
@@ -275,12 +286,15 @@ def _csbot_python() -> str:
     return os.environ.get("WECOM_GUI_CSBOT_PYTHON") or os.environ.get("WECOM_GUI_PYTHON") or "/opt/homebrew/bin/python3"
 
 
-def _codex_customer_id(customer_uid: str = "") -> str:
-    return (
-        customer_uid.strip()
-        or os.environ.get("WECOM_GUI_CSBOT_CUSTOMER_ID", "wecom-customer").strip()
-        or "wecom-customer"
-    )
+def _codex_customer_id(customer_uid: str = "", *, agent_context: dict | None = None) -> str:
+    explicit_id = str(customer_uid or "").strip()
+    if not explicit_id and isinstance(agent_context, dict):
+        for key in ("customer_key", "customer_id", "external_user_id", "wecom_uid"):
+            value = str(agent_context.get(key) or "").strip()
+            if value:
+                explicit_id = value
+                break
+    return explicit_id or os.environ.get("WECOM_GUI_CSBOT_CUSTOMER_ID", "wecom-customer").strip() or "wecom-customer"
 
 
 def _csbot_db_path() -> str:
@@ -401,7 +415,14 @@ def draft_reply_codex_direct(messages: list[dict]) -> dict:
     }
 
 
-def draft_reply_codex_csbot(messages: list[dict], *, customer_name: str = "", customer_uid: str = "") -> dict:
+def draft_reply_codex_csbot(
+    messages: list[dict],
+    *,
+    customer_name: str = "",
+    customer_uid: str = "",
+    agent_mode: str = "",
+    agent_context: dict | None = None,
+) -> dict:
     """Draft via the sibling csbot autonomous worker with KB/MEM0 retrieval."""
     query = latest_user_turn_text(messages) or latest_user_text(messages)
     if not query:
@@ -409,10 +430,16 @@ def draft_reply_codex_csbot(messages: list[dict], *, customer_name: str = "", cu
 
     timeout = float(os.environ.get("WECOM_GUI_CODEX_TIMEOUT", "120"))
     project_dir = _csbot_project_dir()
+    customer_id = _codex_customer_id(customer_uid, agent_context=agent_context)
     context_json = json.dumps(
         {
-            **build_csbot_context(messages, customer_name=customer_name),
-            **({"external_user_id": customer_uid, "wecom_uid": customer_uid} if customer_uid else {}),
+            **build_csbot_context(
+                messages,
+                customer_name=customer_name,
+                agent_mode=agent_mode,
+                agent_context=agent_context,
+            ),
+            **({"external_user_id": customer_uid, "wecom_uid": customer_uid} if customer_uid else {"customer_id": customer_id}),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -423,7 +450,7 @@ def draft_reply_codex_csbot(messages: list[dict], *, customer_name: str = "", cu
         "csbot",
         "autonomous-reply",
         "--customer-id",
-        _codex_customer_id(customer_uid),
+        customer_id,
         "--query",
         query,
         "--context-json",
@@ -490,12 +517,25 @@ def draft_reply_codex_csbot(messages: list[dict], *, customer_name: str = "", cu
     }
 
 
-def draft_reply_codex(messages: list[dict], *, customer_name: str = "", customer_uid: str = "") -> dict:
+def draft_reply_codex(
+    messages: list[dict],
+    *,
+    customer_name: str = "",
+    customer_uid: str = "",
+    agent_mode: str = "",
+    agent_context: dict | None = None,
+) -> dict:
     """Draft a reply through the configured Codex backend."""
     backend = os.environ.get("WECOM_GUI_CODEX_BACKEND", "csbot").strip().lower()
     if backend in {"direct", "cli", "codex-cli"}:
         return draft_reply_codex_direct(messages)
-    return draft_reply_codex_csbot(messages, customer_name=customer_name, customer_uid=customer_uid)
+    return draft_reply_codex_csbot(
+        messages,
+        customer_name=customer_name,
+        customer_uid=customer_uid,
+        agent_mode=agent_mode,
+        agent_context=agent_context,
+    )
 
 
 def draft_reply(
@@ -505,6 +545,8 @@ def draft_reply(
     provider: str | None = None,
     customer_name: str = "",
     customer_uid: str = "",
+    agent_mode: str = "",
+    agent_context: dict | None = None,
 ) -> dict:
     """Draft a reply using UDA/OpenAI-compatible API, or return fallback text."""
     selected = (provider or os.environ.get("WECOM_GUI_AI_PROVIDER", "uda")).strip().lower()
@@ -518,10 +560,22 @@ def draft_reply(
         raise RuntimeError("WECOM_GUI_UDA_API_KEY is not set.")
 
     if selected == "codex":
-        return draft_reply_codex(messages, customer_name=customer_name, customer_uid=customer_uid)
+        return draft_reply_codex(
+            messages,
+            customer_name=customer_name,
+            customer_uid=customer_uid,
+            agent_mode=agent_mode,
+            agent_context=agent_context,
+        )
 
     if selected == "pi":
-        return draft_reply_codex(messages, customer_name=customer_name, customer_uid=customer_uid)
+        return draft_reply_codex(
+            messages,
+            customer_name=customer_name,
+            customer_uid=customer_uid,
+            agent_mode=agent_mode,
+            agent_context=agent_context,
+        )
 
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:

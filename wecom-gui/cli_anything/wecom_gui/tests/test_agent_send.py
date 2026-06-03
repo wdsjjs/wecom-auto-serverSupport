@@ -58,6 +58,203 @@ def test_agent_send_recheck_allows_same_latest_text_with_misread_role(monkeypatc
     assert sent == [{"text": "鱼油建议随餐服用。", "dry_run": False, "submit": True}]
     assert state.list_queue(status="done")[0]["title"] == "刘裕鑫"
 
+
+def test_agent_marks_welcome_sent_only_after_successful_send(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "三水儿", "preview": "你已添加了 三水儿，现在可以开始聊天了。", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    assert changed is True
+    trigger = {"role": "系统", "text": row["preview"], "content": row["preview"], "message_type": "system"}
+    state.mark_drafting(item["id"], message_hash="welcome-hash", messages=[trigger], latest=trigger)
+    state.mark_welcome_status(
+        item["conversation_key"],
+        state.WELCOME_PENDING,
+        conversation_key=item["conversation_key"],
+        conversation="三水儿",
+        job_id=item["id"],
+        reason="welcome_draft_ready",
+    )
+    state.mark_ready(item["id"], reply_text="{WELCOME_MESSAGE}", reply_source="welcome")
+
+    reads = iter(
+        [
+            {"hash": "precheck", "messages": [trigger]},
+            {
+                "hash": "after-send",
+                "messages": [
+                    trigger,
+                    {"role": "客服", "content": "{WELCOME_MESSAGE}", "text": "{WELCOME_MESSAGE}"},
+                ],
+            },
+        ]
+    )
+    sent = []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append({"text": text, "submit": submit}) or {"ok": True},
+    )
+
+    result = agent._send_one_ready(last=12, mode="auto")
+
+    assert result["sent"] == 1
+    assert sent == [{"text": "{WELCOME_MESSAGE}", "submit": True}]
+    assert state.get_welcome_state(item["conversation_key"])["status"] == state.WELCOME_SENT
+    done = state.list_queue(status="done")[0]
+    assert done["reply_source"] == "welcome"
+
+
+def test_agent_marks_supplement_recommended_after_successful_send(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "三水儿", "preview": "最近睡眠差", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    latest = {"role": "用户", "text": "最近睡眠差", "content": "最近睡眠差"}
+    state.mark_drafting(
+        item["id"],
+        message_hash="supp-hash",
+        messages=[latest],
+        latest=latest,
+        extra_context={
+            "agent_mode": "supplement",
+            "supplement_trace_id": "trace-1",
+            "supplement_customer_key": item["conversation_key"],
+        },
+    )
+    state.mark_supplement_state(
+        item["conversation_key"],
+        state.SUPPLEMENT_READY_TO_RECOMMEND,
+        conversation_key=item["conversation_key"],
+        conversation="三水儿",
+        job_id=item["id"],
+        trace_id="trace-1",
+        pending_next_stage=state.SUPPLEMENT_RECOMMENDED,
+        reason="supplement_draft_ready",
+    )
+    state.mark_ready(item["id"], reply_text="结合您的需求，为您推荐这几款产品组合。", reply_source="supplement")
+
+    reads = iter(
+        [
+            {"hash": "precheck", "messages": [latest]},
+            {
+                "hash": "after-send",
+                "messages": [
+                    latest,
+                    {
+                        "role": "客服",
+                        "content": "结合您的需求，为您推荐这几款产品组合。",
+                        "text": "结合您的需求，为您推荐这几款产品组合。",
+                    },
+                ],
+            },
+        ]
+    )
+    sent = []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(text) or {"ok": True},
+    )
+
+    result = agent._send_one_ready(last=12, mode="auto")
+
+    assert result["sent"] == 1
+    assert sent == ["结合您的需求，为您推荐这几款产品组合。"]
+    assert state.list_queue(status="done")[0]["reply_source"] == "supplement"
+    assert state.get_supplement_state(item["conversation_key"])["stage"] == state.SUPPLEMENT_RECOMMENDED
+    assert state.list_supplement_logs(event_type="supplement_sent")[-1]["trace_id"] == "trace-1"
+
+
+def test_agent_marks_review_edited_welcome_sent(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "三水儿", "preview": "你已添加了 三水儿，现在可以开始聊天了。", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    trigger = {"role": "系统", "text": row["preview"], "content": row["preview"], "message_type": "system"}
+    state.mark_drafting(item["id"], message_hash="welcome-hash", messages=[trigger], latest=trigger)
+    state.mark_welcome_status(
+        item["conversation_key"],
+        state.WELCOME_PENDING,
+        conversation_key=item["conversation_key"],
+        conversation="三水儿",
+        job_id=item["id"],
+        reason="welcome_draft_ready",
+    )
+    state.mark_ready(item["id"], reply_text="{WELCOME_MESSAGE}", reply_source="welcome")
+    assert state.mark_approved(item["id"], reply_text="欢迎加入营养工厂") is True
+
+    reads = iter(
+        [
+            {"hash": "precheck", "messages": [trigger]},
+            {
+                "hash": "after-send",
+                "messages": [
+                    trigger,
+                    {"role": "客服", "content": "欢迎加入营养工厂", "text": "欢迎加入营养工厂"},
+                ],
+            },
+        ]
+    )
+    sent = []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(text) or {"ok": True},
+    )
+
+    result = agent._send_one_ready(last=12, mode="review")
+
+    assert result["sent"] == 1
+    assert sent == ["欢迎加入营养工厂"]
+    assert state.get_welcome_state(item["conversation_key"])["status"] == state.WELCOME_SENT
+    assert state.list_queue(status="done")[0]["reply_source"] == "human"
+
+
+def test_agent_skips_welcome_when_customer_message_arrives_before_send(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "三水儿", "preview": "你已添加了 三水儿，现在可以开始聊天了。", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    trigger = {"role": "系统", "text": row["preview"], "content": row["preview"], "message_type": "system"}
+    state.mark_drafting(item["id"], message_hash="welcome-hash", messages=[trigger], latest=trigger)
+    state.mark_welcome_status(
+        item["conversation_key"],
+        state.WELCOME_PENDING,
+        conversation_key=item["conversation_key"],
+        conversation="三水儿",
+        job_id=item["id"],
+        reason="welcome_draft_ready",
+    )
+    state.mark_ready(item["id"], reply_text="{WELCOME_MESSAGE}", reply_source="welcome")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=False: {
+            "hash": "precheck-new-customer",
+            "messages": [
+                trigger,
+                {"role": "用户", "content": "你好，我想咨询产品", "text": "你好，我想咨询产品"},
+            ],
+        },
+    )
+    sent = []
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda *args, **kwargs: sent.append(args) or {"ok": True},
+    )
+
+    result = agent._send_one_ready(last=12, mode="auto")
+
+    assert result["skipped"] == 1
+    assert sent == []
+    assert state.get_welcome_state(item["conversation_key"])["status"] == state.WELCOME_SKIPPED
+    assert state.get_job(item["id"])["status"] == "skipped"
+
+
 def test_agent_send_recheck_retries_empty_live_read(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "刘裕鑫", "preview": "鱼油怎么吃？", "time": "刚刚", "tags": ["@重庆邮电大学"], "raw": []}

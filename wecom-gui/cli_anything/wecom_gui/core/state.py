@@ -28,6 +28,28 @@ LATENCY_BUCKETS = (
     (30_000, "15-30s"),
     (60_000, "30-60s"),
 )
+WELCOME_PENDING = "welcome_pending"
+WELCOME_SENT = "welcome_sent"
+WELCOME_SKIPPED = "welcome_skipped"
+WELCOME_STATUSES = {WELCOME_PENDING, WELCOME_SENT, WELCOME_SKIPPED}
+SUPPLEMENT_COLLECTING_PROFILE = "collecting_profile"
+SUPPLEMENT_DIGGING_NEED = "digging_need"
+SUPPLEMENT_READY_TO_RECOMMEND = "ready_to_recommend"
+SUPPLEMENT_RECOMMENDED = "recommended"
+SUPPLEMENT_CLOSED = "closed"
+SUPPLEMENT_SKIPPED = "skipped"
+SUPPLEMENT_ACTIVE_STAGES = {
+    SUPPLEMENT_COLLECTING_PROFILE,
+    SUPPLEMENT_DIGGING_NEED,
+    SUPPLEMENT_READY_TO_RECOMMEND,
+}
+SUPPLEMENT_STAGES = {
+    *SUPPLEMENT_ACTIVE_STAGES,
+    SUPPLEMENT_RECOMMENDED,
+    SUPPLEMENT_CLOSED,
+    SUPPLEMENT_SKIPPED,
+}
+SUPPLEMENT_REPLY_SOURCE = "supplement"
 
 
 def state_dir() -> Path:
@@ -262,6 +284,92 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS welcome_states (
+            customer_key TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            conversation_key TEXT NOT NULL DEFAULT '',
+            conversation TEXT NOT NULL DEFAULT '',
+            job_id INTEGER,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS supplement_states (
+            customer_key TEXT PRIMARY KEY,
+            stage TEXT NOT NULL,
+            conversation_key TEXT NOT NULL DEFAULT '',
+            conversation TEXT NOT NULL DEFAULT '',
+            job_id INTEGER,
+            trace_id TEXT NOT NULL DEFAULT '',
+            digging_count INTEGER NOT NULL DEFAULT 0,
+            selected_needs_json TEXT NOT NULL DEFAULT '[]',
+            known_profile_json TEXT NOT NULL DEFAULT '{}',
+            last_message_hash TEXT NOT NULL DEFAULT '',
+            pending_next_stage TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS supplement_agent_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            trace_id TEXT NOT NULL DEFAULT '',
+            job_id INTEGER,
+            conversation_key TEXT NOT NULL DEFAULT '',
+            external_user_id TEXT NOT NULL DEFAULT '',
+            customer_id TEXT NOT NULL DEFAULT '',
+            conversation TEXT NOT NULL DEFAULT '',
+            reply_source TEXT NOT NULL DEFAULT 'supplement',
+            stage TEXT NOT NULL DEFAULT '',
+            message_hash TEXT NOT NULL DEFAULT '',
+            latest_text_preview TEXT NOT NULL DEFAULT '',
+            details_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_supplement_agent_logs_trace_created
+        ON supplement_agent_logs(trace_id, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS supplement_full_test_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            trace_id TEXT NOT NULL DEFAULT '',
+            job_id INTEGER,
+            conversation_key TEXT NOT NULL DEFAULT '',
+            external_user_id TEXT NOT NULL DEFAULT '',
+            customer_id TEXT NOT NULL DEFAULT '',
+            conversation TEXT NOT NULL DEFAULT '',
+            reply_source TEXT NOT NULL DEFAULT 'supplement',
+            stage TEXT NOT NULL DEFAULT '',
+            message_hash TEXT NOT NULL DEFAULT '',
+            latest_text_preview TEXT NOT NULL DEFAULT '',
+            details_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_supplement_full_test_logs_trace_created
+        ON supplement_full_test_logs(trace_id, created_at)
+        """
+    )
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_reply_issue_tasks_status_updated
         ON reply_issue_tasks(status, updated_at)
         """
@@ -462,6 +570,12 @@ def conversation_key_for_row(row: dict) -> str:
     return _legacy_conversation_key(title)
 
 
+def conversation_key_for_uid(uid: object) -> str:
+    """Return the stable queue key for one real WeCom external user id."""
+    value = _clean_key_part(uid)
+    return f"uid:{value}" if value else ""
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict:
     item = dict(row)
     item["tags"] = json.loads(item.pop("tags_json") or "[]")
@@ -472,6 +586,17 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
 
 def _issue_row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
+
+
+def _welcome_row_to_dict(row: sqlite3.Row) -> dict:
+    return dict(row)
+
+
+def _supplement_row_to_dict(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    item["selected_needs"] = json.loads(item.pop("selected_needs_json") or "[]")
+    item["known_profile"] = json.loads(item.pop("known_profile_json") or "{}")
+    return item
 
 
 def _record_metric_event(
@@ -1201,6 +1326,537 @@ def get_job_by_conversation_key(conversation_key: str) -> dict | None:
     return _row_to_dict(row) if row else None
 
 
+def get_welcome_state(customer_key: str) -> dict | None:
+    """Return the welcome flow state for one stable customer key."""
+    key = str(customer_key or "").strip()
+    if not key:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM welcome_states WHERE customer_key = ?",
+            (key,),
+        ).fetchone()
+    return _welcome_row_to_dict(row) if row else None
+
+
+def _move_welcome_state_key(
+    conn: sqlite3.Connection,
+    *,
+    source_key: str,
+    target_key: str,
+    job_id: int | None = None,
+) -> None:
+    source_value = str(source_key or "").strip()
+    target_value = str(target_key or "").strip()
+    if not source_value or not target_value or source_value == target_value:
+        return
+    source = conn.execute(
+        "SELECT * FROM welcome_states WHERE customer_key = ?",
+        (source_value,),
+    ).fetchone()
+    if source is None:
+        return
+    target = conn.execute(
+        "SELECT * FROM welcome_states WHERE customer_key = ?",
+        (target_value,),
+    ).fetchone()
+    now = time.time()
+    source_rank = {WELCOME_SKIPPED: 0, WELCOME_PENDING: 1, WELCOME_SENT: 2}.get(str(source["status"] or ""), 0)
+    target_rank = (
+        {WELCOME_SKIPPED: 0, WELCOME_PENDING: 1, WELCOME_SENT: 2}.get(str(target["status"] or ""), -1)
+        if target is not None
+        else -1
+    )
+    if target is None or source_rank > target_rank:
+        conn.execute(
+            """
+            INSERT INTO welcome_states
+                (customer_key, status, conversation_key, conversation, job_id,
+                 reason, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(customer_key) DO UPDATE SET
+                status = excluded.status,
+                conversation_key = excluded.conversation_key,
+                conversation = excluded.conversation,
+                job_id = excluded.job_id,
+                reason = excluded.reason,
+                updated_at = excluded.updated_at
+            """,
+            (
+                target_value,
+                source["status"],
+                target_value,
+                source["conversation"],
+                job_id if job_id is not None else source["job_id"],
+                source["reason"],
+                source["created_at"],
+                now,
+            ),
+        )
+    conn.execute("DELETE FROM welcome_states WHERE customer_key = ?", (source_value,))
+
+
+def _move_supplement_state_key(
+    conn: sqlite3.Connection,
+    *,
+    source_key: str,
+    target_key: str,
+    job_id: int | None = None,
+) -> None:
+    source_value = str(source_key or "").strip()
+    target_value = str(target_key or "").strip()
+    if not source_value or not target_value or source_value == target_value:
+        return
+    source = conn.execute(
+        "SELECT * FROM supplement_states WHERE customer_key = ?",
+        (source_value,),
+    ).fetchone()
+    if source is None:
+        return
+    target = conn.execute(
+        "SELECT * FROM supplement_states WHERE customer_key = ?",
+        (target_value,),
+    ).fetchone()
+    now = time.time()
+    if target is None or float(source["updated_at"] or 0) >= float(target["updated_at"] or 0):
+        conn.execute(
+            """
+            INSERT INTO supplement_states
+                (customer_key, stage, conversation_key, conversation, job_id,
+                 trace_id, digging_count, selected_needs_json, known_profile_json,
+                 last_message_hash, pending_next_stage, reason, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(customer_key) DO UPDATE SET
+                stage = excluded.stage,
+                conversation_key = excluded.conversation_key,
+                conversation = excluded.conversation,
+                job_id = excluded.job_id,
+                trace_id = excluded.trace_id,
+                digging_count = excluded.digging_count,
+                selected_needs_json = excluded.selected_needs_json,
+                known_profile_json = excluded.known_profile_json,
+                last_message_hash = excluded.last_message_hash,
+                pending_next_stage = excluded.pending_next_stage,
+                reason = excluded.reason,
+                updated_at = excluded.updated_at
+            """,
+            (
+                target_value,
+                source["stage"],
+                target_value,
+                source["conversation"],
+                job_id if job_id is not None else source["job_id"],
+                source["trace_id"],
+                source["digging_count"],
+                source["selected_needs_json"],
+                source["known_profile_json"],
+                source["last_message_hash"],
+                source["pending_next_stage"],
+                source["reason"],
+                source["created_at"],
+                now,
+            ),
+        )
+    conn.execute("DELETE FROM supplement_states WHERE customer_key = ?", (source_value,))
+
+
+def mark_welcome_status(
+    customer_key: str,
+    status: str,
+    *,
+    conversation_key: str = "",
+    conversation: str = "",
+    job_id: int | None = None,
+    reason: str = "",
+) -> dict | None:
+    """Persist a welcome flow status without marking sent before delivery."""
+    key = str(customer_key or "").strip()
+    status_value = str(status or "").strip()
+    if not key or status_value not in WELCOME_STATUSES:
+        return None
+    now = time.time()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM welcome_states WHERE customer_key = ?",
+            (key,),
+        ).fetchone()
+        created_at = float(row["created_at"]) if row else now
+        conn.execute(
+            """
+            INSERT INTO welcome_states
+                (customer_key, status, conversation_key, conversation, job_id,
+                 reason, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(customer_key) DO UPDATE SET
+                status = excluded.status,
+                conversation_key = excluded.conversation_key,
+                conversation = excluded.conversation,
+                job_id = excluded.job_id,
+                reason = excluded.reason,
+                updated_at = excluded.updated_at
+            """,
+            (
+                key,
+                status_value,
+                str(conversation_key or ""),
+                str(conversation or ""),
+                job_id,
+                str(reason or ""),
+                created_at,
+                now,
+            ),
+        )
+        updated = conn.execute(
+            "SELECT * FROM welcome_states WHERE customer_key = ?",
+            (key,),
+        ).fetchone()
+    return _welcome_row_to_dict(updated) if updated is not None else None
+
+
+def get_supplement_state(customer_key: str) -> dict | None:
+    """Return supplement recommendation flow state for one customer key."""
+    key = str(customer_key or "").strip()
+    if not key:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM supplement_states WHERE customer_key = ?",
+            (key,),
+        ).fetchone()
+    return _supplement_row_to_dict(row) if row else None
+
+
+def mark_supplement_state(
+    customer_key: str,
+    stage: str,
+    *,
+    conversation_key: str = "",
+    conversation: str = "",
+    job_id: int | None = None,
+    trace_id: str = "",
+    digging_count: int | None = None,
+    selected_needs: list | None = None,
+    known_profile: dict | None = None,
+    message_hash: str = "",
+    pending_next_stage: str = "",
+    reason: str = "",
+) -> dict | None:
+    """Persist supplement state. Completion stages are called after send success."""
+    key = str(customer_key or "").strip()
+    stage_value = str(stage or "").strip()
+    if not key or stage_value not in SUPPLEMENT_STAGES:
+        return None
+    now = time.time()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM supplement_states WHERE customer_key = ?",
+            (key,),
+        ).fetchone()
+        created_at = float(row["created_at"]) if row else now
+        existing_trace = str(row["trace_id"] if row else "")
+        existing_digging = int(row["digging_count"] if row else 0)
+        existing_needs = row["selected_needs_json"] if row else "[]"
+        existing_profile = row["known_profile_json"] if row else "{}"
+        conn.execute(
+            """
+            INSERT INTO supplement_states
+                (customer_key, stage, conversation_key, conversation, job_id,
+                 trace_id, digging_count, selected_needs_json, known_profile_json,
+                 last_message_hash, pending_next_stage, reason, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(customer_key) DO UPDATE SET
+                stage = excluded.stage,
+                conversation_key = excluded.conversation_key,
+                conversation = excluded.conversation,
+                job_id = excluded.job_id,
+                trace_id = excluded.trace_id,
+                digging_count = excluded.digging_count,
+                selected_needs_json = excluded.selected_needs_json,
+                known_profile_json = excluded.known_profile_json,
+                last_message_hash = excluded.last_message_hash,
+                pending_next_stage = excluded.pending_next_stage,
+                reason = excluded.reason,
+                updated_at = excluded.updated_at
+            """,
+            (
+                key,
+                stage_value,
+                str(conversation_key or ""),
+                str(conversation or ""),
+                job_id,
+                str(trace_id or existing_trace or f"supp-{int(now * 1000)}"),
+                existing_digging if digging_count is None else int(digging_count),
+                json.dumps(selected_needs, ensure_ascii=False) if selected_needs is not None else existing_needs,
+                json.dumps(known_profile, ensure_ascii=False) if known_profile is not None else existing_profile,
+                str(message_hash or (row["last_message_hash"] if row else "")),
+                str(pending_next_stage or ""),
+                str(reason or ""),
+                created_at,
+                now,
+            ),
+        )
+        updated = conn.execute(
+            "SELECT * FROM supplement_states WHERE customer_key = ?",
+            (key,),
+        ).fetchone()
+    return _supplement_row_to_dict(updated) if updated is not None else None
+
+
+def _sanitize_supplement_details(details: dict | None) -> dict:
+    sanitized: dict = {}
+    for key, value in (details or {}).items():
+        name = str(key)
+        lowered = name.lower()
+        if any(secret in lowered for secret in ("api_key", "apikey", "token", "secret", "authorization", "request_body")):
+            continue
+        if isinstance(value, str):
+            sanitized[name] = value[:240]
+        elif isinstance(value, (int, float, bool)) or value is None:
+            sanitized[name] = value
+        elif isinstance(value, list):
+            sanitized[name] = value[:20]
+        elif isinstance(value, dict):
+            sanitized[name] = {str(k): v for k, v in list(value.items())[:20]}
+        else:
+            sanitized[name] = str(value)[:240]
+    return sanitized
+
+
+def log_supplement_event(
+    event_type: str,
+    *,
+    trace_id: str = "",
+    job_id: int | None = None,
+    conversation_key: str = "",
+    external_user_id: str = "",
+    customer_id: str = "",
+    conversation: str = "",
+    stage: str = "",
+    message_hash: str = "",
+    latest_text_preview: str = "",
+    details: dict | None = None,
+) -> None:
+    """Record one supplement-agent audit log and metrics event."""
+    event = str(event_type or "").strip()
+    if not event:
+        return
+    detail_payload = _sanitize_supplement_details(details)
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO supplement_agent_logs
+                (event_type, trace_id, job_id, conversation_key, external_user_id,
+                 customer_id, conversation, reply_source, stage, message_hash,
+                 latest_text_preview, details_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event,
+                str(trace_id or ""),
+                job_id,
+                str(conversation_key or ""),
+                str(external_user_id or ""),
+                str(customer_id or ""),
+                str(conversation or ""),
+                SUPPLEMENT_REPLY_SOURCE,
+                str(stage or ""),
+                str(message_hash or ""),
+                str(latest_text_preview or "")[:160],
+                json.dumps(detail_payload, ensure_ascii=False),
+                now,
+            ),
+        )
+        _record_metric_event(
+            conn,
+            event_type=event,
+            conversation_key=str(conversation_key or ""),
+            conversation=str(conversation or ""),
+            job_id=job_id,
+            reply_source=SUPPLEMENT_REPLY_SOURCE,
+            details=detail_payload,
+            created_at=now,
+        )
+
+
+def log_supplement_full_test_event(
+    event_type: str,
+    *,
+    trace_id: str = "",
+    job_id: int | None = None,
+    conversation_key: str = "",
+    external_user_id: str = "",
+    customer_id: str = "",
+    conversation: str = "",
+    stage: str = "",
+    message_hash: str = "",
+    latest_text_preview: str = "",
+    details: dict | None = None,
+) -> None:
+    """Record one isolated full-flow supplement test log."""
+    event = str(event_type or "").strip()
+    if not event:
+        return
+    detail_payload = _sanitize_supplement_details(details)
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO supplement_full_test_logs
+                (event_type, trace_id, job_id, conversation_key, external_user_id,
+                 customer_id, conversation, reply_source, stage, message_hash,
+                 latest_text_preview, details_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event,
+                str(trace_id or ""),
+                job_id,
+                str(conversation_key or ""),
+                str(external_user_id or ""),
+                str(customer_id or ""),
+                str(conversation or ""),
+                SUPPLEMENT_REPLY_SOURCE,
+                str(stage or ""),
+                str(message_hash or ""),
+                str(latest_text_preview or "")[:160],
+                json.dumps(detail_payload, ensure_ascii=False),
+                now,
+            ),
+        )
+
+
+def list_supplement_logs(*, trace_id: str = "", event_type: str = "", limit: int = 100) -> list[dict]:
+    """List recent supplement-agent logs for tests/debugging."""
+    limit_value = max(1, int(limit or 100))
+    with connect() as conn:
+        clauses = []
+        params: list[object] = []
+        if trace_id:
+            clauses.append("trace_id = ?")
+            params.append(trace_id)
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM supplement_agent_logs
+            {where}
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            """,
+            (*params, limit_value),
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["details"] = json.loads(item.pop("details_json") or "{}")
+        items.append(item)
+    return items
+
+
+def upgrade_job_conversation_key_to_uid(job_id: int, uid: str) -> dict | None:
+    """Upgrade a visible-position queue key to a stable WeCom uid key."""
+    target_key = conversation_key_for_uid(uid)
+    if not target_key:
+        return get_job(job_id)
+    now = time.time()
+    with connect() as conn:
+        source = conn.execute("SELECT * FROM reply_queue WHERE id = ?", (job_id,)).fetchone()
+        if source is None:
+            return None
+        source_key = str(source["conversation_key"] or "")
+        if source_key == target_key:
+            return _row_to_dict(source)
+        target = conn.execute("SELECT * FROM reply_queue WHERE conversation_key = ?", (target_key,)).fetchone()
+        if target is not None and int(target["id"]) != int(job_id):
+            source_is_newer = float(source["updated_at"] or 0) >= float(target["updated_at"] or 0)
+            if source_is_newer:
+                target_is_handoff = bool(str(target["handoff_type"] or "").strip())
+                merged_handoff_type = str(source["handoff_type"] or target["handoff_type"] or "")
+                merged_handoff_reason = str(source["handoff_reason"] or target["handoff_reason"] or "")
+                merged_reply_text = source["reply_text"]
+                merged_reply_attachments = source["reply_attachments_json"]
+                if target_is_handoff and not str(source["reply_text"] or "").strip():
+                    merged_reply_text = target["reply_text"]
+                    if str(source["reply_attachments_json"] or "[]") == "[]":
+                        merged_reply_attachments = target["reply_attachments_json"]
+                conn.execute(
+                    """
+                    UPDATE reply_queue
+                    SET title = ?, preview = ?, time_text = ?, tags_json = ?, raw_json = ?,
+                        signature = ?, status = ?, attempts = ?, last_message_hash = ?,
+                        context_json = ?, click_x = ?, click_y = ?, source = ?,
+                        reply_text = ?, handoff_type = ?, handoff_reason = ?,
+                        reply_source = ?, reply_attachments_json = ?, error = ?,
+                        locked_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        source["title"],
+                        source["preview"],
+                        source["time_text"],
+                        source["tags_json"],
+                        source["raw_json"],
+                        source["signature"],
+                        source["status"],
+                        source["attempts"],
+                        source["last_message_hash"],
+                        source["context_json"],
+                        source["click_x"],
+                        source["click_y"],
+                        source["source"],
+                        merged_reply_text,
+                        merged_handoff_type,
+                        merged_handoff_reason,
+                        source["reply_source"],
+                        merged_reply_attachments,
+                        source["error"],
+                        source["locked_at"],
+                        now,
+                        target["id"],
+                    ),
+                )
+            conn.execute(
+                "UPDATE conversation_messages SET conversation_key = ?, job_id = ? WHERE conversation_key = ?",
+                (target_key, target["id"], source_key),
+            )
+            conn.execute(
+                """
+                UPDATE metric_events
+                SET conversation_key = ?,
+                    job_id = CASE WHEN job_id IS NULL OR job_id = ? THEN ? ELSE job_id END
+                WHERE conversation_key = ?
+                """,
+                (target_key, job_id, target["id"], source_key),
+            )
+            conn.execute(
+                "UPDATE reply_issue_tasks SET conversation_key = ?, job_id = ? WHERE conversation_key = ?",
+                (target_key, target["id"], source_key),
+            )
+            conn.execute("DELETE FROM conversation_metric_state WHERE conversation_key = ?", (source_key,))
+            _move_welcome_state_key(conn, source_key=source_key, target_key=target_key, job_id=target["id"])
+            _move_supplement_state_key(conn, source_key=source_key, target_key=target_key, job_id=target["id"])
+            conn.execute("DELETE FROM reply_queue WHERE id = ?", (job_id,))
+            row = conn.execute("SELECT * FROM reply_queue WHERE id = ?", (target["id"],)).fetchone()
+            return _row_to_dict(row) if row else None
+
+        conn.execute(
+            "UPDATE reply_queue SET conversation_key = ?, updated_at = ? WHERE id = ?",
+            (target_key, now, job_id),
+        )
+        conn.execute("UPDATE conversation_messages SET conversation_key = ? WHERE conversation_key = ?", (target_key, source_key))
+        conn.execute("UPDATE metric_events SET conversation_key = ? WHERE conversation_key = ?", (target_key, source_key))
+        conn.execute("UPDATE reply_issue_tasks SET conversation_key = ? WHERE conversation_key = ?", (target_key, source_key))
+        conn.execute("UPDATE conversation_metric_state SET conversation_key = ? WHERE conversation_key = ?", (target_key, source_key))
+        _move_welcome_state_key(conn, source_key=source_key, target_key=target_key, job_id=job_id)
+        _move_supplement_state_key(conn, source_key=source_key, target_key=target_key, job_id=job_id)
+        row = conn.execute("SELECT * FROM reply_queue WHERE id = ?", (job_id,)).fetchone()
+        return _row_to_dict(row) if row else None
+
+
 def queue_counts() -> dict[str, int]:
     """Return queue counts grouped by status."""
     with connect() as conn:
@@ -1367,15 +2023,17 @@ def lookup_wecom_customer(*, uid: str = "", customer_name: str = "") -> dict | N
         if uid:
             row = conn.execute("SELECT * FROM wecom_customer_bindings WHERE uid = ?", (uid,)).fetchone()
         if row is None and customer_name:
-            row = conn.execute(
+            rows = conn.execute(
                 """
                 SELECT * FROM wecom_customer_bindings
                 WHERE customer_name = ? OR display_name = ?
                 ORDER BY updated_at DESC
-                LIMIT 1
                 """,
                 (customer_name, customer_name),
-            ).fetchone()
+            ).fetchall()
+            unique_uids = {str(item["uid"] or "") for item in rows}
+            if len(unique_uids) == 1:
+                row = rows[0]
     return _binding_to_dict(row) if row else None
 
 
@@ -1491,9 +2149,12 @@ def claim_approved_to_send() -> dict | None:
 
 def _message_type_for_record(message: dict) -> str:
     explicit = str(message.get("message_type") or "").strip().lower()
-    if explicit in {"customer", "reply", "unknown"}:
+    if explicit in {"customer", "reply", "system", "unknown"}:
         return explicit
     role = str(message.get("role") or "").strip().lower()
+    text = str(message.get("content") or message.get("text") or "").strip()
+    if "以上是打招呼内容" in text or ("你已添加了" in text and "现在可以开始聊天了" in text):
+        return "system"
     if role in {"customer", "user", "human"} or "用户" in role or "客户" in role:
         return "customer"
     if (
@@ -1718,7 +2379,14 @@ def get_conversation_media(*, message_id: int, media_index: int) -> dict | None:
     return {**media, "message_id": message_id, "media_index": media_index, "capture_path": path}
 
 
-def mark_drafting(job_id: int, *, message_hash: str, messages: list[dict], latest: dict) -> None:
+def mark_drafting(
+    job_id: int,
+    *,
+    message_hash: str,
+    messages: list[dict],
+    latest: dict,
+    extra_context: dict | None = None,
+) -> None:
     now = time.time()
     latest_text = str(latest.get("content") or latest.get("text") or "").strip()
     context = {
@@ -1731,6 +2399,8 @@ def mark_drafting(job_id: int, *, message_hash: str, messages: list[dict], lates
         },
         "message_count": len(messages),
     }
+    if extra_context:
+        context.update(extra_context)
     with connect() as conn:
         row = conn.execute("SELECT conversation_key FROM reply_queue WHERE id = ?", (job_id,)).fetchone()
         conversation_key = str(row["conversation_key"] if row else "")
@@ -2000,7 +2670,13 @@ def mark_approved(job_id: int, *, reply_text: str | None = None, attachments: li
             return False
         is_handoff = bool(str(row["handoff_type"] or "").strip())
         reply_was_edited = bool(reply_text is not None and final_reply != previous_reply)
-        reply_source = "human" if is_handoff or reply_was_edited else (str(row["reply_source"] or "").strip() or "ai")
+        original_reply_source = str(row["reply_source"] or "").strip()
+        if original_reply_source == SUPPLEMENT_REPLY_SOURCE:
+            reply_source = SUPPLEMENT_REPLY_SOURCE
+        elif is_handoff or reply_was_edited:
+            reply_source = "human"
+        else:
+            reply_source = original_reply_source or "ai"
         cur = conn.execute(
             """
             UPDATE reply_queue
@@ -2018,7 +2694,7 @@ def mark_approved(job_id: int, *, reply_text: str | None = None, attachments: li
                 conversation_key=str(row["conversation_key"] or ""),
                 conversation=str(row["title"] or ""),
                 job_id=job_id,
-                reply_source="human",
+                reply_source=reply_source,
                 details={"action": "approve"},
                 created_at=now,
             )
@@ -2200,17 +2876,28 @@ def finish_handoff(job_id: int, reason: str = "handoff_finished") -> bool:
         return cur.rowcount == 1
 
 
-def mark_pending(job_id: int, reason: str = "") -> None:
+def mark_pending(job_id: int, reason: str = "", *, preserve_context: bool = False) -> None:
     now = time.time()
     with connect() as conn:
-        conn.execute(
-            """
-            UPDATE reply_queue
-            SET status = 'pending', error = ?, locked_at = NULL, updated_at = ?
-            WHERE id = ?
-            """,
-            (reason or None, now, job_id),
-        )
+        if preserve_context:
+            conn.execute(
+                """
+                UPDATE reply_queue
+                SET status = 'pending', error = ?, locked_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (reason or None, now, job_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE reply_queue
+                SET status = 'pending', error = ?, context_json = NULL,
+                    last_message_hash = NULL, locked_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (reason or None, now, job_id),
+            )
 
 
 def mark_done(

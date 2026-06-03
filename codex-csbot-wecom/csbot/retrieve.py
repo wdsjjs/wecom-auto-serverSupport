@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .db import connect, ensure_schema
 from .script_search import extract_child_age, script_search
+from .script_search import _is_supplement_scope
 from .textutil import json_loads, normalize_text, score_text
 from .vector_store import search_memories
 
@@ -59,6 +60,26 @@ def _hydrate_vector_knowledge(db_path: str | Path, vector_hits: list[dict]) -> l
     return hydrated
 
 
+def _filter_supplement_vector_hits(vector_hits: list[dict]) -> list[dict]:
+    filtered: list[dict] = []
+    for hit in vector_hits:
+        metadata = hit.get("metadata") or {}
+        hit_type = metadata.get("type") or hit.get("type")
+        if hit_type == "customer_profile":
+            filtered.append(hit)
+            continue
+        if hit_type != "knowledge":
+            continue
+        if metadata.get("business_type") in {
+            "recommendation_rule",
+            "product_profile",
+            "safety_policy",
+            "research_evidence",
+        } and metadata.get("source_sheet") in {"10 补剂推荐", "5 产品常规信息", "7 L0级注意事项", "6 论文表"}:
+            filtered.append(hit)
+    return filtered
+
+
 def _product_from_profile(vector_hits: list[dict]) -> str:
     profile_candidates = [hit for hit in vector_hits if (hit.get("metadata") or {}).get("type") == "customer_profile"]
     for hit in profile_candidates:
@@ -94,6 +115,7 @@ def retrieve(
     }
     context = context or {}
     disable_vector = bool(context.get("disable_vector"))
+    supplement_scope = _is_supplement_scope(context)
     vector_hits: list[dict] = []
     vector_error = None
 
@@ -111,6 +133,8 @@ def retrieve(
                 timing["vector_ms"] = round((time.perf_counter() - vector_started) * 1000)
             hydrate_started = time.perf_counter()
             vector_hits = _hydrate_vector_knowledge(db_path, vector_hits)
+            if supplement_scope:
+                vector_hits = _filter_supplement_vector_hits(vector_hits)
             timing["hydrate_ms"] = round((time.perf_counter() - hydrate_started) * 1000)
         except Exception as exc:
             if timing["vector_ms"] is None:
@@ -149,5 +173,6 @@ def retrieve(
             "script_count": len(script_hits),
             "vector_count": len(vector_hits),
             "vector_disabled": disable_vector,
+            "scope": "supplement" if supplement_scope else "",
         },
     }

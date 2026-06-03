@@ -18,7 +18,8 @@ from .codex_cli import (
 )
 from .codex_contract import validate_autonomous_reply
 from .config import DEFAULT_PROJECT_DIR, resolve_codex_workdir, resolve_db_path, resolve_mem0_url, using_pg
-from .textutil import json_loads
+from .db import connect, ensure_schema
+from .textutil import json_loads, normalize_text, score_text
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -69,14 +70,25 @@ def to_text(value: object) -> str:
     return str(value)
 
 
-def _tool_examples(db_path: Path, customer_id: str, query: str) -> list[str]:
+def _is_supplement_context(context: dict | None) -> bool:
+    if not isinstance(context, dict):
+        return False
+    if str(context.get("agent_mode") or "").strip() == "supplement":
+        return True
+    agent_context = context.get("agent_context")
+    return isinstance(agent_context, dict) and str(agent_context.get("reply_source") or "").strip() == "supplement"
+
+
+def _tool_examples(db_path: Path, customer_id: str, query: str, context: dict | None = None) -> list[str]:
     encoded_query = json.dumps(query, ensure_ascii=False)
     encoded_customer = json.dumps(customer_id, ensure_ascii=False)
     db_args = "" if using_pg() else f"--db {json.dumps(str(db_path), ensure_ascii=False)} "
+    scope_context = {"scope": "supplement", "agent_mode": "supplement"} if _is_supplement_context(context) else {}
+    scope_arg = f" --context-json {json.dumps(json.dumps(scope_context, ensure_ascii=False), ensure_ascii=False)}" if scope_context else ""
     return [
         (
             f"/opt/homebrew/bin/python3 -m csbot {db_args}"
-            f"retrieve --customer-id {encoded_customer} --query {encoded_query}"
+            f"retrieve --customer-id {encoded_customer} --query {encoded_query}{scope_arg}"
         ),
         (
             f"/opt/homebrew/bin/python3 -m csbot {db_args}"
@@ -88,7 +100,7 @@ def _tool_examples(db_path: Path, customer_id: str, query: str) -> list[str]:
         ),
         (
             f"/opt/homebrew/bin/python3 -m csbot {db_args}"
-            f"kb search --query {encoded_query}"
+            f"kb search --query {encoded_query}{scope_arg}"
         ),
         "/opt/homebrew/bin/python3 -m csbot ops order --identifier \"手机号或订单号\" --id-type phone",
         "/opt/homebrew/bin/python3 -m csbot ops logistics --order-id \"订单号\"",
@@ -126,7 +138,7 @@ def build_autonomous_prompt(
 ) -> str:
     resolved_db_path = resolve_db_path(db_path)
     codex_workdir = resolve_codex_workdir()
-    command_examples = _tool_examples(resolved_db_path, customer_id, query)
+    command_examples = _tool_examples(resolved_db_path, customer_id, query, context)
     context_json = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
     commands_json = json.dumps(command_examples, ensure_ascii=False, indent=2)
     knowledge_backend = "PostgreSQL PG 知识库" if using_pg() else "SQLite 兼容知识库"
@@ -150,7 +162,51 @@ def build_autonomous_prompt(
         "latest_message": query,
         "context": context,
     }
+    supplement_instructions = ""
+    if isinstance(context, dict) and context.get("agent_mode") == "supplement":
+        supplement_instructions = """
+
+<supplement_recommendation_agent_instructions>
+你现在处于补剂推荐 Agent 模式，reply_source=supplement。
+必须围绕客户补剂推荐诉求工作：识别基础信息、需求点、挖需结果，并按知识库证据推荐产品或追问。
+
+必须连接和使用所有相关知识库工具：
+1. 使用 `retrieve --customer-id ... --query ... --context-json '{"scope":"supplement","agent_mode":"supplement"}'` 做 PG/script 与 MEM0 双召回。
+2. 使用 `kb search --query ... --context-json '{"scope":"supplement","agent_mode":"supplement"}'` 检索 SQL/PG 中的 `10 补剂推荐`、`5 产品常规信息`、`7 L0级注意事项`、`6 论文表` 或 kb_docs 中的 recommendation_rule、product_profile、safety_policy、research_evidence。
+3. 使用 `mem search --customer-id ... --query ...` 查询客户画像、历史购买、偏好和既往需求；Mem0 只能辅助画像，不能覆盖 PG/script 产品事实。
+
+事实优先级：
+- 产品事实、推荐规则、禁忌、吃法、价格、链接、免责话术必须以 SQL/PG/script/kb_docs 为准。
+- 推荐产品后必须追加数据库已有的相关论文链接：优先查询 `6 论文表` / research_evidence，使用标题/论文方向 + 链接；没有查到真实链接时不要编造，也不要添加论文段落。
+- SQL/PG 与 Mem0 冲突时，以 SQL/PG 为准，并在 conflicts 中记录冲突摘要。
+- 证据不足时 action 用 clarify 或 handoff，不要编造推荐规则、产品事实或医疗功效。
+
+流程要求：
+- 第一步：GUI 已在欢迎语后发送第一段固定话术，收集基础信息并让用户选择 3-5 个需求点；不要重复输出第一段固定话术。
+- 第二步：根据用户回复的数字或文字需求点进行追问，一共追问两次；如果 context.agent_context.digging_count 小于 2，优先根据 `需求点`、`挖需铺垫`、`挖需问题` 生成下一轮追问，action 用 clarify。
+- 挖需回复一次只能提出 1 个问题，必须直接提问；不要写「从xx方面看」「从xx角度看」「结合您的情况」「考虑到」等铺垫或分析话术。
+- 如果 context.agent_context.profile_opt_out=true，或用户明确表示不愿意/不方便提供个人信息、基础信息、年龄、身高、体重等隐私信息，不要再追问这些信息；只基于用户已给出的需求点继续问 1 个非隐私挖需问题，或在证据足够时直接推荐。
+- 第三步：追问完成或信息已经足够后推荐产品。推荐时按 `需求点 + 挖需结果` 匹配推荐规则；无法匹配具体挖需结果时使用兜底推荐规则。
+- 同一结果下按 `相同挖需结果下的优先级` 排序：高 > 中 > 空。
+- 关联 `5 产品常规信息` 补充适用年龄、服用方法、禁忌、规格和链接。
+- 必须按 `7 L0级注意事项` 做合规校验，禁止治疗承诺和极限词；特殊场景必须附带知识库中的推荐后免责话术。
+- 推荐产品不超过 3 个时，回复必须使用这个开头：
+  结合您的需求，为您推荐这几款产品组合。接下来，我详细为您介绍下：
+  然后填写推荐产品介绍。
+- 推荐产品超过 3 个时，回复必须使用这个结构：
+  结合您的需求，优先为您推荐这几款产品组合。接下来，我详细为您介绍下：
+  先介绍高优先级产品。
+  如果您服用后感觉效果良好，后续可以搭配以下产品：
+  再介绍后续可搭配产品。
+- 推荐正文最后如果有论文链接，追加：
+  相关论文参考：
+  - 论文标题或方向：数据库链接
+
+输出仍必须是 schema 要求的 JSON。commands_run 记录实际执行过的工具命令，不得记录 API key、token、完整隐私画像或完整请求体。
+</supplement_recommendation_agent_instructions>
+"""
     return f"""{agent_rules}
+{supplement_instructions}
 
 <runtime_context_json>
 {json.dumps(runtime_context, ensure_ascii=False, indent=2)}
@@ -357,6 +413,167 @@ def _timeout_reply(timeout: int) -> dict:
     }
 
 
+def _paper_link_from_facts(facts: dict) -> str:
+    for key in ("链接", "论文链接", "URL", "url", "DOI"):
+        value = normalize_text(facts.get(key))
+        if value:
+            if key == "DOI" and not value.lower().startswith(("http://", "https://")):
+                return f"https://doi.org/{value}"
+            return value
+    return ""
+
+
+def _paper_title_from_row(row, facts: dict) -> str:
+    return (
+        normalize_text(facts.get("论文名称"))
+        or normalize_text(facts.get("标题"))
+        or normalize_text(facts.get("论文方向"))
+        or normalize_text(row["topic"])
+        or normalize_text(row["product"])
+        or "相关研究"
+    )
+
+
+def _supplement_search_text(query: str, reply_text: str, context: dict) -> str:
+    parts = [query, reply_text]
+    agent_context = context.get("agent_context") if isinstance(context, dict) else None
+    if isinstance(agent_context, dict):
+        parts.extend(normalize_text(value) for value in agent_context.get("selected_needs") or [])
+        known_profile = agent_context.get("known_profile")
+        if isinstance(known_profile, dict):
+            parts.extend(normalize_text(value) for value in known_profile.values())
+    return "\n".join(part for part in parts if normalize_text(part))
+
+
+def _find_supplement_paper_links(
+    *,
+    query: str,
+    reply_text: str,
+    context: dict,
+    db_path: str | Path,
+    limit: int = 3,
+) -> list[dict]:
+    search_text = _supplement_search_text(query, reply_text, context)
+    if not search_text:
+        return []
+    conn = connect(db_path)
+    try:
+        ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT * FROM kb_docs
+            WHERE business_type = ?
+            """,
+            ("research_evidence",),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    hits = []
+    for row in rows:
+        facts = json_loads(row["facts_json"], {})
+        if not isinstance(facts, dict):
+            facts = {}
+        link = _paper_link_from_facts(facts)
+        if not link:
+            continue
+        text = normalize_text(row["text"])
+        product = normalize_text(row["product"])
+        title = _paper_title_from_row(row, facts)
+        direction = normalize_text(facts.get("论文方向"))
+        score = score_text(search_text, text)
+        if product and product in search_text:
+            score += 0.7
+        for value in (title, direction, normalize_text(facts.get("产品")), normalize_text(facts.get("产品全称"))):
+            if value and value in search_text:
+                score += 0.3
+        if score <= 0:
+            continue
+        hits.append(
+            {
+                "title": title,
+                "link": link,
+                "score": score,
+                "source": {
+                    "sheet": row["source_sheet"],
+                    "row": row["source_row"],
+                    "field": row["source_field"] or "",
+                    "kb_doc_id": row["kb_doc_id"],
+                },
+            }
+        )
+    hits.sort(key=lambda item: item["score"], reverse=True)
+    deduped = []
+    seen_links: set[str] = set()
+    for hit in hits:
+        if hit["link"] in seen_links:
+            continue
+        seen_links.add(hit["link"])
+        deduped.append(hit)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _append_supplement_paper_links(
+    reply: dict | None,
+    *,
+    query: str,
+    context: dict,
+    db_path: str | Path,
+) -> dict | None:
+    if not isinstance(reply, dict) or reply.get("action") != "send" or not _is_supplement_context(context):
+        return reply
+    reply_text = normalize_text(reply.get("reply_text"))
+    if not reply_text or "相关论文参考" in reply_text:
+        return reply
+    papers = _find_supplement_paper_links(query=query, reply_text=reply_text, context=context, db_path=db_path)
+    if not papers:
+        return reply
+    lines = ["相关论文参考："]
+    for paper in papers:
+        if paper["link"] in reply_text:
+            continue
+        lines.append(f"- {paper['title']}：{paper['link']}")
+    if len(lines) == 1:
+        return reply
+    reply = dict(reply)
+    reply["reply_text"] = f"{reply_text}\n\n" + "\n".join(lines)
+    used_sources = reply.get("used_script_sources")
+    if not isinstance(used_sources, list):
+        used_sources = []
+    existing_sources = {
+        (
+            source.get("sheet"),
+            source.get("row"),
+            source.get("field", ""),
+            source.get("kb_doc_id", ""),
+        )
+        for source in used_sources
+        if isinstance(source, dict)
+    }
+    for paper in papers:
+        source = paper["source"]
+        key = (source.get("sheet"), source.get("row"), source.get("field", ""), source.get("kb_doc_id", ""))
+        if key not in existing_sources:
+            used_sources.append(source)
+            existing_sources.add(key)
+    reply["used_script_sources"] = used_sources
+    commands_run = reply.get("commands_run")
+    if isinstance(commands_run, list):
+        commands_run.append(
+            {
+                "command": "kb_docs research_evidence lookup",
+                "purpose": "补剂推荐后追加数据库论文链接",
+                "success": True,
+            }
+        )
+    summary = normalize_text(reply.get("retrieval_summary"))
+    paper_summary = "已从 research_evidence/6 论文表追加相关论文链接。"
+    reply["retrieval_summary"] = f"{summary} {paper_summary}".strip() if summary else paper_summary
+    return reply
+
+
 def run_autonomous_worker(
     *,
     customer_id: str,
@@ -401,6 +618,7 @@ def run_autonomous_worker(
         )
         last_message = out_path.read_text(encoding="utf-8") if out_path.exists() else ""
         reply, parse_error = safe_json_parse(last_message or proc.stdout)
+        reply = _append_supplement_paper_links(reply, query=query, context=context, db_path=resolved_db_path)
         validation = validate_autonomous_reply(reply or {})
         handoff = _notify_handoff_if_needed(
             customer_id=customer_id,

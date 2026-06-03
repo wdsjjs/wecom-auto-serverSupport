@@ -6,15 +6,17 @@ import json
 import mimetypes
 import os
 import socket
+import threading
 import time
 import uuid
 import base64
+import hashlib
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from cli_anything.wecom_gui import __version__
-from cli_anything.wecom_gui.core import state
+from cli_anything.wecom_gui.core import agent, llm, state
 from cli_anything.wecom_gui.core.text import clean_customer_reply_text, clean_history_message_text
 from cli_anything.wecom_gui.utils import macos_backend
 
@@ -25,17 +27,34 @@ MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 
 
 FRONTEND_DIR = Path(__file__).resolve().parents[3] / "frontend" / "review"
+SUPPLEMENT_TEST_FRONTEND_DIR = Path(__file__).resolve().parents[3] / "frontend" / "supplement-test"
+SUPPLEMENT_FULL_TEST_FRONTEND_DIR = Path(__file__).resolve().parents[3] / "frontend" / "supplement-full-test"
+_SUPPLEMENT_TEST_VERSION_LOCK = threading.Lock()
+_SUPPLEMENT_TEST_VERSIONS: dict[str, int] = {}
 
 
-def _load_frontend_text(name: str) -> str:
+def _load_frontend_text(name: str, *, root: Path = FRONTEND_DIR) -> str:
     try:
-        return (FRONTEND_DIR / name).read_text(encoding="utf-8")
+        return (root / name).read_text(encoding="utf-8")
     except OSError:
         return ""
 
 
 REVIEW_HTML = _load_frontend_text("index.html")
 REVIEW_FRONTEND_JS = _load_frontend_text("app.js")
+SUPPLEMENT_TEST_HTML = _load_frontend_text("index.html", root=SUPPLEMENT_TEST_FRONTEND_DIR)
+SUPPLEMENT_FULL_TEST_HTML = _load_frontend_text("index.html", root=SUPPLEMENT_FULL_TEST_FRONTEND_DIR)
+SUPPLEMENT_WELCOME_TEMPLATE = """您好，{用户名}
+我是您专属的——Luna 营养工厂健康顾问
+✓已为超 40 万人提供营养咨询服务
+
+领产品说明书 https://docs.qq.com/s/tHMpjD9S811JnjY369QC2G
+
+留下您的性别、年龄和需求，我为您【搭配补剂】。比如失眠、肥胖、脱发、三高…等等～
+
+👇【今日限时福利】进群领 50 元券包🎁
+docs.qq.com
+docs.qq.com"""
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status_code: int, payload: dict) -> None:
@@ -83,10 +102,10 @@ def _send_file_response(handler: BaseHTTPRequestHandler, path: Path) -> None:
     handler.wfile.write(body)
 
 
-def _send_static_response(handler: BaseHTTPRequestHandler, relative_path: str) -> None:
+def _send_static_response(handler: BaseHTTPRequestHandler, relative_path: str, *, root_dir: Path = FRONTEND_DIR) -> None:
     try:
-        target = (FRONTEND_DIR / relative_path.lstrip("/")).resolve()
-        root = FRONTEND_DIR.resolve()
+        target = (root_dir / relative_path.lstrip("/")).resolve()
+        root = root_dir.resolve()
     except OSError:
         _json_response(handler, 404, {"ok": False, "error": "static_not_found"})
         return
@@ -225,9 +244,12 @@ def _sanitize_media(message: dict) -> list[dict]:
 
 def _message_type(message: dict) -> str:
     explicit = str(message.get("message_type") or "").strip().lower()
-    if explicit in {"customer", "reply", "unknown"}:
+    if explicit in {"customer", "reply", "system", "unknown"}:
         return explicit
     role = str(message.get("role") or "").strip().lower()
+    text = str(message.get("text") or "").strip()
+    if "以上是打招呼内容" in text or ("你已添加了" in text and "现在可以开始聊天了" in text):
+        return "system"
     if role in {"customer", "user", "human"} or "用户" in role or "客户" in role:
         return "customer"
     if (
@@ -260,7 +282,15 @@ def _classified_messages(messages: list[dict]) -> list[dict]:
         position_type = _position_message_type(message)
         if position_type and str(message.get("role_confidence") or "") in {"medium", "high"}:
             message_type = position_type
-        role = "客服" if message_type == "reply" else "用户" if message_type == "customer" else message.get("role", "")
+        role = (
+            "客服"
+            if message_type == "reply"
+            else "用户"
+            if message_type == "customer"
+            else "系统"
+            if message_type == "system"
+            else message.get("role", "")
+        )
         items.append(
             {
                 **message,
@@ -317,6 +347,7 @@ def _review_item(item: dict) -> dict:
         "latest_text": latest_text,
         "messages": messages,
         "reply_text": clean_customer_reply_text(item.get("reply_text") or ""),
+        "reply_source": item.get("reply_source") or "",
         "reply_attachments": _public_reply_attachments(item),
         "handoff_type": item.get("handoff_type") or "",
         "handoff_reason": item.get("handoff_reason") or "",
@@ -371,6 +402,650 @@ def review_counts() -> dict[str, int]:
     counts["issues"] = state.reply_issue_pending_count()
     counts["ready"] = len(state.list_ready_for_review(handoff=False, limit=1000000))
     return counts
+
+
+def _supplement_test_customer_key(customer: str, *, prefix: str = "supplement-test") -> str:
+    value = str(customer or "测试客户").strip() or "测试客户"
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}:{digest}"
+
+
+def _supplement_test_version(customer_key: str) -> int:
+    with _SUPPLEMENT_TEST_VERSION_LOCK:
+        return int(_SUPPLEMENT_TEST_VERSIONS.get(customer_key, 0))
+
+
+def _supplement_test_bump_version(customer_key: str) -> int:
+    with _SUPPLEMENT_TEST_VERSION_LOCK:
+        value = int(_SUPPLEMENT_TEST_VERSIONS.get(customer_key, 0)) + 1
+        _SUPPLEMENT_TEST_VERSIONS[customer_key] = value
+        return value
+
+
+def _supplement_test_is_current(customer_key: str, version: int) -> bool:
+    return _supplement_test_version(customer_key) == version
+
+
+def _supplement_trace_id(job_id: int, customer_key: str) -> str:
+    return f"supp-test-{job_id}-{hashlib.sha1(customer_key.encode('utf-8')).hexdigest()[:8]}-{int(time.time() * 1000)}"
+
+
+def _supplement_test_message_hash(messages: list[dict]) -> str:
+    raw = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _supplement_log(
+    event_type: str,
+    *,
+    trace_id: str,
+    job: dict,
+    customer_key: str,
+    stage: str,
+    message_hash: str = "",
+    latest_text: str = "",
+    details: dict | None = None,
+    isolated: bool = False,
+) -> None:
+    logger = (
+        state.log_supplement_full_test_event
+        if isolated or str(customer_key or "").startswith("supplement-full-test:")
+        else state.log_supplement_event
+    )
+    logger(
+        event_type,
+        trace_id=trace_id,
+        job_id=job.get("id"),
+        conversation_key=customer_key,
+        external_user_id="",
+        customer_id=customer_key,
+        conversation=str(job.get("title") or ""),
+        stage=stage,
+        message_hash=message_hash,
+        latest_text_preview=str(latest_text or "")[:120],
+        details=details or {},
+    )
+
+
+def _supplement_test_logs(customer_key: str, trace_id: str = "", *, limit: int = 200, isolated: bool = False) -> list[dict]:
+    clauses = []
+    params: list[object] = []
+    if trace_id:
+        clauses.append("trace_id = ?")
+        params.append(trace_id)
+    else:
+        clauses.append("(customer_id = ? OR conversation_key = ?)")
+        params.extend([customer_key, customer_key])
+    table = "supplement_full_test_logs" if isolated else "supplement_agent_logs"
+    with state.connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM {table}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            """,
+            (*params, max(1, int(limit or 200))),
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["details"] = json.loads(item.pop("details_json") or "{}")
+        items.append(item)
+    return items
+
+
+def _supplement_test_upsert_job(customer_key: str, customer_name: str, latest_text: str) -> dict:
+    now = time.time()
+    title = str(customer_name or "补剂测试客户").strip() or "补剂测试客户"
+    signature = hashlib.sha1(f"{customer_key}|{latest_text}|{now}".encode("utf-8")).hexdigest()
+    time_text = "网页微信"
+    with state.connect() as conn:
+        row = conn.execute("SELECT * FROM reply_queue WHERE conversation_key = ?", (customer_key,)).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO reply_queue
+                    (conversation_key, title, preview, time_text, tags_json, raw_json,
+                     source, signature, status, error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'drafting', NULL, ?, ?)
+                """,
+                (
+                    customer_key,
+                    title,
+                    latest_text,
+                    time_text,
+                    json.dumps(["supplement-test"], ensure_ascii=False),
+                    json.dumps([], ensure_ascii=False),
+                    "supplement-test",
+                    signature,
+                    now,
+                    now,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE reply_queue
+                SET title = ?, preview = ?, time_text = ?, tags_json = ?,
+                    raw_json = ?, source = 'supplement-test', signature = ?,
+                    status = 'drafting', error = NULL, locked_at = NULL, updated_at = ?
+                WHERE conversation_key = ?
+                """,
+                (
+                    title,
+                    latest_text,
+                    time_text,
+                    json.dumps(["supplement-test"], ensure_ascii=False),
+                    json.dumps([], ensure_ascii=False),
+                    signature,
+                    now,
+                    customer_key,
+                ),
+            )
+    return state.get_job_by_conversation_key(customer_key) or {}
+
+
+def _supplement_selected_needs(text: str) -> list[str]:
+    return agent._supplement_selected_needs(text)
+
+
+def _supplement_fixed_reply_for_stage(text: str, supplement_state: dict | None) -> tuple[str, str, str, dict] | None:
+    current_stage = str((supplement_state or {}).get("stage") or "")
+    selected_needs = _supplement_selected_needs(text)
+    if not current_stage:
+        has_profile = agent._has_supplement_profile(text)
+        reply = agent.SUPPLEMENT_FIRST_REPLY_CHOICES_ONLY if has_profile else agent.SUPPLEMENT_FIRST_REPLY_WITH_PROFILE
+        return reply, state.SUPPLEMENT_COLLECTING_PROFILE, state.SUPPLEMENT_DIGGING_NEED, {
+            "action": "first_prompt",
+            "has_profile": has_profile,
+            "selected_needs": selected_needs,
+        }
+    if current_stage == state.SUPPLEMENT_COLLECTING_PROFILE and agent._is_supplement_need_selection(text):
+        return agent.SUPPLEMENT_SELECTION_ACK, state.SUPPLEMENT_DIGGING_NEED, state.SUPPLEMENT_DIGGING_NEED, {
+            "action": "need_selection_ack",
+            "selected_needs": selected_needs,
+            "need_numbers": agent._selected_supplement_need_numbers(text),
+        }
+    return None
+
+
+def _supplement_welcome_text(customer_name: str) -> str:
+    title = str(customer_name or "客户").strip() or "客户"
+    return SUPPLEMENT_WELCOME_TEMPLATE.replace("{用户名}", title)
+
+
+def _supplement_web_welcome_message(customer_name: str) -> dict:
+    title = str(customer_name or "客户").strip() or "客户"
+    text = _supplement_welcome_text(title)
+    return {
+        "role": "客服",
+        "content": text,
+        "text": text,
+        "source": "web-wechat",
+        "message_type": "reply",
+        "role_confidence": "welcome_template",
+    }
+
+
+def _supplement_draft_details(draft: dict) -> dict:
+    raw = draft.get("raw") if isinstance(draft.get("raw"), dict) else {}
+    codex = raw.get("codex") if isinstance(raw.get("codex"), dict) else {}
+    reply = codex.get("reply") if isinstance(codex.get("reply"), dict) else {}
+    details = {
+        "action": str(draft.get("action") or "") or "send",
+        "provider": draft.get("provider"),
+        "model": draft.get("model"),
+        "duration_ms": draft.get("duration_ms"),
+    }
+    for key in (
+        "commands_run",
+        "retrieval_summary",
+        "used_script_sources",
+        "used_vector_memories",
+        "confidence",
+        "decision_basis",
+        "conflicts",
+    ):
+        if key in reply:
+            details[key] = reply.get(key)
+    return details
+
+
+def _supplement_agent_log_details(details: dict) -> dict:
+    return {
+        "action": details.get("action") or "",
+        "provider": details.get("provider") or "",
+        "model": details.get("model") or "",
+        "duration_ms": details.get("duration_ms"),
+        "commands_run": details.get("commands_run") or [],
+        "retrieval_summary": details.get("retrieval_summary") or "",
+        "used_script_sources": details.get("used_script_sources") or [],
+        "used_vector_memories": details.get("used_vector_memories") or [],
+        "confidence": details.get("confidence"),
+        "decision_basis": details.get("decision_basis") or "",
+        "conflicts": details.get("conflicts") or [],
+    }
+
+
+def _supplement_reply_for_stage(text: str, supplement_state: dict | None, *, messages: list[dict], customer_name: str, trace_id: str, customer_key: str) -> tuple[str, str, str, dict]:
+    fixed = _supplement_fixed_reply_for_stage(text, supplement_state)
+    if fixed is not None:
+        return fixed
+    current_stage = str((supplement_state or {}).get("stage") or "")
+    context = agent._supplement_agent_context(
+        state_row=supplement_state or {},
+        route={"triggered": True, "active_state_exists": bool(supplement_state), "detected_intent": "supplement_test"},
+        customer_key=customer_key,
+        trace_id=trace_id,
+        stage=current_stage or state.SUPPLEMENT_DIGGING_NEED,
+    )
+    draft = llm.draft_reply(
+        messages,
+        provider="pi",
+        customer_name=customer_name,
+        customer_uid="",
+        agent_mode=agent.SUPPLEMENT_REPLY_SOURCE,
+        agent_context=context,
+    )
+    action = str(draft.get("action") or "")
+    next_stage = state.SUPPLEMENT_DIGGING_NEED if action == "clarify" else state.SUPPLEMENT_READY_TO_RECOMMEND
+    pending_next = state.SUPPLEMENT_DIGGING_NEED if action == "clarify" else state.SUPPLEMENT_RECOMMENDED
+    return str(draft.get("text") or draft.get("message") or ""), next_stage, pending_next, _supplement_draft_details(draft)
+
+
+def _supplement_commit_test_reply(
+    *,
+    job: dict,
+    customer_key: str,
+    customer_name: str,
+    trace_id: str,
+    messages: list[dict],
+    message_hash: str,
+    latest_text: str,
+    reply_text: str,
+    next_stage: str,
+    pending_next_stage: str,
+    details: dict,
+    selected_needs: list[str],
+    supplement_state: dict | None,
+    reason: str,
+) -> list[dict]:
+    final_reply = clean_customer_reply_text(reply_text)
+    state.mark_drafting(
+        int(job["id"]),
+        message_hash=message_hash,
+        messages=messages,
+        latest=messages[-1],
+        extra_context={
+            "agent_mode": agent.SUPPLEMENT_REPLY_SOURCE,
+            "supplement_trace_id": trace_id,
+            "supplement_customer_key": customer_key,
+            "supplement_stage": next_stage,
+        },
+    )
+    state.mark_ready(
+        int(job["id"]),
+        reply_text=final_reply,
+        reply_source=agent.SUPPLEMENT_REPLY_SOURCE,
+        action=str(details.get("action") or "send"),
+    )
+    state.mark_done(
+        int(job["id"]),
+        message_hash=message_hash,
+        reply_text=final_reply,
+        reply_source=agent.SUPPLEMENT_REPLY_SOURCE,
+    )
+    digging_count = int((supplement_state or {}).get("digging_count") or 0)
+    if str(details.get("action") or "") in {"digging_question", "clarify"}:
+        digging_count = min(2, digging_count + 1)
+    known_profile = dict((supplement_state or {}).get("known_profile") or {})
+    known_profile["has_basic_profile"] = bool(
+        known_profile.get("has_basic_profile") or agent._has_supplement_profile(latest_text)
+    )
+    if agent._declines_supplement_profile(latest_text):
+        known_profile["profile_opt_out"] = True
+        known_profile["has_basic_profile"] = False
+    state.mark_supplement_state(
+        customer_key,
+        state.SUPPLEMENT_RECOMMENDED if pending_next_stage == state.SUPPLEMENT_RECOMMENDED else next_stage,
+        conversation_key=customer_key,
+        conversation=customer_name,
+        job_id=int(job["id"]),
+        trace_id=trace_id,
+        digging_count=digging_count,
+        selected_needs=selected_needs or (supplement_state or {}).get("selected_needs") or [],
+        known_profile=known_profile,
+        message_hash=message_hash,
+        pending_next_stage=pending_next_stage,
+        reason=reason,
+    )
+    committed_stage = state.SUPPLEMENT_RECOMMENDED if pending_next_stage == state.SUPPLEMENT_RECOMMENDED else next_stage
+    _supplement_log(
+        "supplement_draft_ready",
+        trace_id=trace_id,
+        job=job,
+        customer_key=customer_key,
+        stage=next_stage,
+        message_hash=message_hash,
+        latest_text=latest_text,
+        details={"reply_preview": final_reply[:160], **details},
+    )
+    _supplement_log(
+        "supplement_sent",
+        trace_id=trace_id,
+        job=job,
+        customer_key=customer_key,
+        stage=committed_stage,
+        message_hash=message_hash,
+        latest_text=latest_text,
+        details={"reply_preview": final_reply[:160], "channel": "web_wechat_simulator"},
+    )
+    _supplement_log(
+        "supplement_state_committed",
+        trace_id=trace_id,
+        job=job,
+        customer_key=customer_key,
+        stage=committed_stage,
+        message_hash=message_hash,
+        latest_text=latest_text,
+        details={"next_stage": pending_next_stage, "commit_reason": reason},
+    )
+    return [
+        *messages,
+        {
+            "role": "客服",
+            "content": final_reply,
+            "text": final_reply,
+            "source": "supplement-test",
+            "message_type": "reply",
+        },
+    ]
+
+
+def supplement_test_status(customer: str = "测试客户", *, full_flow: bool = False) -> dict:
+    customer_key = _supplement_test_customer_key(
+        customer,
+        prefix="supplement-full-test" if full_flow else "supplement-test",
+    )
+    item = state.get_job_by_conversation_key(customer_key) or {}
+    supplement_state = state.get_supplement_state(customer_key)
+    trace_id = str((supplement_state or {}).get("trace_id") or "")
+    return {
+        "customer": customer,
+        "customer_key": customer_key,
+        "job": _review_item(item) if item else {},
+        "state": supplement_state or {},
+        "messages": _classified_messages(state.list_conversation_messages(conversation_key=customer_key, limit=50)),
+        "logs": _supplement_test_logs(customer_key, trace_id=trace_id, limit=200, isolated=full_flow),
+    }
+
+
+def supplement_test_reset(customer: str = "测试客户", *, full_flow: bool = False) -> dict:
+    customer_key = _supplement_test_customer_key(
+        customer,
+        prefix="supplement-full-test" if full_flow else "supplement-test",
+    )
+    _supplement_test_bump_version(customer_key)
+    with state.connect() as conn:
+        conn.execute("DELETE FROM reply_queue WHERE conversation_key = ?", (customer_key,))
+        conn.execute("DELETE FROM conversation_messages WHERE conversation_key = ?", (customer_key,))
+        conn.execute("DELETE FROM supplement_states WHERE customer_key = ?", (customer_key,))
+        if full_flow:
+            conn.execute("DELETE FROM supplement_full_test_logs WHERE customer_id = ? OR conversation_key = ?", (customer_key, customer_key))
+        else:
+            conn.execute("DELETE FROM supplement_agent_logs WHERE customer_id = ? OR conversation_key = ?", (customer_key, customer_key))
+        conn.execute("DELETE FROM metric_events WHERE conversation_key = ?", (customer_key,))
+    return {"ok": True, **supplement_test_status(customer, full_flow=full_flow)}
+
+
+def supplement_test_send(customer: str, text: str, *, full_flow: bool = False, new_user: bool = False) -> dict:
+    body = clean_history_message_text(text)
+    if not body and not new_user:
+        return {"ok": False, "error": "empty_message"}
+    customer_name = str(customer or "测试客户").strip() or "测试客户"
+    customer_key = _supplement_test_customer_key(
+        customer_name,
+        prefix="supplement-full-test" if full_flow else "supplement-test",
+    )
+    request_version = _supplement_test_version(customer_key)
+    job = _supplement_test_upsert_job(customer_key, customer_name, body or "新用户进线")
+    previous_messages = state.list_conversation_messages(conversation_key=customer_key, limit=50)
+    messages = [
+        {"role": item.get("role") or "用户", "content": item.get("text") or "", "text": item.get("text") or ""}
+        for item in previous_messages
+        if item.get("text")
+    ]
+    supplement_state = state.get_supplement_state(customer_key)
+    is_new_user_start = bool(new_user)
+    if is_new_user_start:
+        messages.append(_supplement_web_welcome_message(customer_name))
+    if body:
+        messages.append({"role": "用户", "content": body, "text": body, "source": "web-wechat", "message_type": "customer"})
+    message_hash = _supplement_test_message_hash(messages)
+    state.record_conversation_messages(
+        conversation_key=customer_key,
+        job_id=job.get("id"),
+        message_hash=message_hash,
+        messages=messages,
+    )
+    trace_id = str((supplement_state or {}).get("trace_id") or "") or _supplement_trace_id(int(job.get("id") or 0), customer_key)
+    stage = str((supplement_state or {}).get("stage") or state.SUPPLEMENT_COLLECTING_PROFILE)
+    selected_needs = _supplement_selected_needs(body)
+    route = agent._supplement_route(body, active_state=supplement_state)
+    if is_new_user_start:
+        route = {
+            "triggered": True,
+            "matched_terms": [],
+            "active_state_exists": False,
+            "detected_intent": "new_user_welcome_followup",
+            "reason": "",
+        }
+    _supplement_log(
+        "supplement_route_evaluated",
+        trace_id=trace_id,
+        job=job,
+        customer_key=customer_key,
+        stage=stage,
+        message_hash=message_hash,
+        latest_text=body,
+        details={
+            "triggered": bool(route.get("triggered")),
+            "matched_terms": route.get("matched_terms") or [],
+            "active_state_exists": bool(route.get("active_state_exists")),
+            "detected_intent": route.get("detected_intent") or "supplement_test",
+            "reason": route.get("reason") or "",
+            "trigger_source": "new_user_welcome" if is_new_user_start else "customer_message",
+            "channel": "web_wechat_simulator",
+        },
+    )
+    if not route.get("triggered"):
+        state.mark_read_logged(
+            int(job["id"]),
+            message_hash=message_hash,
+            messages=messages,
+            reason=str(route.get("reason") or "old_user_waiting_for_question"),
+        )
+        _supplement_log(
+            "supplement_route_skipped",
+            trace_id=trace_id,
+            job=job,
+            customer_key=customer_key,
+            stage=stage,
+            message_hash=message_hash,
+            latest_text=body,
+            details={
+                "reason": route.get("reason") or "old_user_waiting_for_question",
+                "channel": "web_wechat_simulator",
+            },
+        )
+        return {"ok": True, "reply_text": "", "skipped": True, **supplement_test_status(customer_name, full_flow=full_flow)}
+    _supplement_log(
+        "supplement_state_loaded",
+        trace_id=trace_id,
+        job=job,
+        customer_key=customer_key,
+        stage=stage,
+        message_hash=message_hash,
+        latest_text=body,
+        details={
+            "current_stage": (supplement_state or {}).get("stage") or "",
+            "digging_count": int((supplement_state or {}).get("digging_count") or 0),
+            "selected_needs": (supplement_state or {}).get("selected_needs") or [],
+        },
+    )
+    try:
+        fixed_reply = (
+            (
+                agent.SUPPLEMENT_FIRST_REPLY_WITH_PROFILE,
+                state.SUPPLEMENT_COLLECTING_PROFILE,
+                state.SUPPLEMENT_DIGGING_NEED,
+                {
+                    "action": "new_user_welcome_followup",
+                    "has_profile": False,
+                    "selected_needs": selected_needs,
+                    "welcome_template": "luna_nutrition_factory",
+                    "reset_existing_state": bool(supplement_state),
+                },
+            )
+            if is_new_user_start
+            else _supplement_fixed_reply_for_stage(body, supplement_state)
+        )
+        if fixed_reply is None:
+            _supplement_log(
+                "supplement_backend_agent_started",
+                trace_id=trace_id,
+                job=job,
+                customer_key=customer_key,
+                stage=stage,
+                message_hash=message_hash,
+                latest_text=body,
+                details={"model": os.environ.get("WECOM_GUI_PI_MODEL", ""), "channel": "web_wechat_simulator"},
+            )
+        started = time.perf_counter()
+        if fixed_reply is not None:
+            reply_text, next_stage, pending_next_stage, details = fixed_reply
+            _supplement_log(
+                "supplement_fixed_flow_reply",
+                trace_id=trace_id,
+                job=job,
+                customer_key=customer_key,
+                stage=next_stage,
+                message_hash=message_hash,
+                latest_text=body,
+                details={
+                    **details,
+                    "trigger_source": "new_user_welcome" if is_new_user_start else "customer_message",
+                    "channel": "web_wechat_simulator",
+                },
+            )
+        else:
+            reply_text, next_stage, pending_next_stage, details = _supplement_reply_for_stage(
+                body,
+                supplement_state,
+                messages=messages,
+                customer_name=customer_name,
+                trace_id=trace_id,
+                customer_key=customer_key,
+            )
+        duration_ms = round((time.perf_counter() - started) * 1000)
+        if fixed_reply is None:
+            _supplement_log(
+                "supplement_backend_agent_done",
+                trace_id=trace_id,
+                job=job,
+                customer_key=customer_key,
+                stage=next_stage,
+                message_hash=message_hash,
+                latest_text=body,
+                details={**_supplement_agent_log_details(details), "duration_ms": duration_ms, "channel": "web_wechat_simulator"},
+            )
+    except Exception as exc:
+        _supplement_log("supplement_backend_agent_failed", trace_id=trace_id, job=job, customer_key=customer_key, stage=stage, message_hash=message_hash, latest_text=body, details={"error_type": type(exc).__name__, "error": str(exc), "channel": "web_wechat_simulator"})
+        return {"ok": False, "error": str(exc), **supplement_test_status(customer_name, full_flow=full_flow)}
+    if not _supplement_test_is_current(customer_key, request_version):
+        return {"ok": True, "stale": True, "reset_detected": True, **supplement_test_status(customer_name, full_flow=full_flow)}
+    committed_messages = _supplement_commit_test_reply(
+        job=job,
+        customer_key=customer_key,
+        customer_name=customer_name,
+        trace_id=trace_id,
+        messages=messages,
+        message_hash=message_hash,
+        selected_needs=selected_needs or (supplement_state or {}).get("selected_needs") or [],
+        latest_text=body,
+        reply_text=reply_text,
+        next_stage=next_stage,
+        pending_next_stage=pending_next_stage,
+        details=details,
+        supplement_state=None if is_new_user_start else supplement_state,
+        reason="test_sent",
+    )
+    final_reply = clean_customer_reply_text(reply_text)
+    if (
+        str(details.get("action") or "") == "need_selection_ack"
+        and _supplement_test_is_current(customer_key, request_version)
+    ):
+        _supplement_log(
+            "supplement_ack_sent_continue_pi",
+            trace_id=trace_id,
+            job=job,
+            customer_key=customer_key,
+            stage=state.SUPPLEMENT_DIGGING_NEED,
+            message_hash=message_hash,
+            latest_text=body,
+            details={"reply_preview": final_reply[:160]},
+        )
+        pi_state = state.get_supplement_state(customer_key) or {}
+        pi_messages = [
+            {"role": item.get("role") or "用户", "content": item.get("content") or item.get("text") or "", "text": item.get("text") or item.get("content") or ""}
+            for item in committed_messages
+            if item.get("content") or item.get("text")
+        ]
+        pi_message_hash = _supplement_test_message_hash(pi_messages)
+        state.record_conversation_messages(
+            conversation_key=customer_key,
+            job_id=job.get("id"),
+            message_hash=pi_message_hash,
+            messages=pi_messages,
+        )
+        try:
+            _supplement_log("supplement_backend_agent_started", trace_id=trace_id, job=job, customer_key=customer_key, stage=state.SUPPLEMENT_DIGGING_NEED, message_hash=pi_message_hash, latest_text=body, details={"model": os.environ.get("WECOM_GUI_PI_MODEL", ""), "after_ack": True, "channel": "web_wechat_simulator"})
+            pi_started = time.perf_counter()
+            pi_reply, pi_next_stage, pi_pending_next_stage, pi_details = _supplement_reply_for_stage(
+                body,
+                pi_state,
+                messages=pi_messages,
+                customer_name=customer_name,
+                trace_id=trace_id,
+                customer_key=customer_key,
+            )
+            pi_duration_ms = round((time.perf_counter() - pi_started) * 1000)
+            _supplement_log("supplement_backend_agent_done", trace_id=trace_id, job=job, customer_key=customer_key, stage=pi_next_stage, message_hash=pi_message_hash, latest_text=body, details={**_supplement_agent_log_details(pi_details), "duration_ms": pi_duration_ms, "after_ack": True, "channel": "web_wechat_simulator"})
+        except Exception as exc:
+            _supplement_log("supplement_backend_agent_failed", trace_id=trace_id, job=job, customer_key=customer_key, stage=state.SUPPLEMENT_DIGGING_NEED, message_hash=pi_message_hash, latest_text=body, details={"error_type": type(exc).__name__, "error": str(exc), "after_ack": True, "channel": "web_wechat_simulator"})
+            return {"ok": False, "error": str(exc), **supplement_test_status(customer_name, full_flow=full_flow)}
+        if not _supplement_test_is_current(customer_key, request_version):
+            return {"ok": True, "stale": True, "reset_detected": True, **supplement_test_status(customer_name, full_flow=full_flow)}
+        final_reply = clean_customer_reply_text(pi_reply)
+        _supplement_commit_test_reply(
+            job=job,
+            customer_key=customer_key,
+            customer_name=customer_name,
+            trace_id=trace_id,
+            messages=pi_messages,
+            message_hash=pi_message_hash,
+            selected_needs=selected_needs or pi_state.get("selected_needs") or [],
+            latest_text=body,
+            reply_text=pi_reply,
+            next_stage=pi_next_stage,
+            pending_next_stage=pi_pending_next_stage,
+            details={**pi_details, "after_ack": True},
+            supplement_state=pi_state,
+            reason="test_pi_after_ack",
+        )
+    return {"ok": True, "reply_text": final_reply, **supplement_test_status(customer_name, full_flow=full_flow)}
 
 
 def wecom_status() -> dict:
@@ -590,11 +1265,51 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if parsed.path in {"/supplement-test", "/supplement-test/"}:
+            body = SUPPLEMENT_TEST_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path in {"/supplement-full-test", "/supplement-full-test/"}:
+            body = SUPPLEMENT_FULL_TEST_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path.startswith("/static/"):
             _send_static_response(self, parsed.path.removeprefix("/static/"))
             return
+        if parsed.path.startswith("/supplement-test/static/"):
+            _send_static_response(
+                self,
+                parsed.path.removeprefix("/supplement-test/static/"),
+                root_dir=SUPPLEMENT_TEST_FRONTEND_DIR,
+            )
+            return
+        if parsed.path.startswith("/supplement-full-test/static/"):
+            _send_static_response(
+                self,
+                parsed.path.removeprefix("/supplement-full-test/static/"),
+                root_dir=SUPPLEMENT_FULL_TEST_FRONTEND_DIR,
+            )
+            return
         if parsed.path == "/health":
             _json_response(self, 200, {"ok": True, "version": __version__})
+            return
+        if parsed.path == "/api/supplement-test/status":
+            params = parse_qs(parsed.query)
+            customer = (params.get("customer") or ["测试客户"])[0]
+            _json_response(self, 200, {"ok": True, **supplement_test_status(customer)})
+            return
+        if parsed.path == "/api/supplement-full-test/status":
+            params = parse_qs(parsed.query)
+            customer = (params.get("customer") or ["完整问答测试客户"])[0]
+            _json_response(self, 200, {"ok": True, **supplement_test_status(customer, full_flow=True)})
             return
         if parsed.path == "/api/review/items":
             params = parse_qs(parsed.query)
@@ -632,6 +1347,49 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         parts = [part for part in parsed.path.split("/") if part]
+        if parsed.path == "/api/supplement-test/send":
+            try:
+                payload = _read_json(self)
+            except Exception as exc:
+                _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            result = supplement_test_send(
+                str(payload.get("customer") or "测试客户"),
+                str(payload.get("text") or ""),
+                new_user=bool(payload.get("new_user")),
+            )
+            _json_response(self, 200 if result.get("ok") else 409, result)
+            return
+        if parsed.path == "/api/supplement-full-test/send":
+            try:
+                payload = _read_json(self)
+            except Exception as exc:
+                _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            result = supplement_test_send(
+                str(payload.get("customer") or "完整问答测试客户"),
+                str(payload.get("text") or ""),
+                full_flow=True,
+                new_user=bool(payload.get("new_user")),
+            )
+            _json_response(self, 200 if result.get("ok") else 409, result)
+            return
+        if parsed.path == "/api/supplement-test/reset":
+            try:
+                payload = _read_json(self)
+            except Exception as exc:
+                _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            _json_response(self, 200, supplement_test_reset(str(payload.get("customer") or "测试客户")))
+            return
+        if parsed.path == "/api/supplement-full-test/reset":
+            try:
+                payload = _read_json(self)
+            except Exception as exc:
+                _json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+            _json_response(self, 200, supplement_test_reset(str(payload.get("customer") or "完整问答测试客户"), full_flow=True))
+            return
         if len(parts) == 5 and parts[:3] == ["api", "review", "issues"] and parts[4] == "complete":
             try:
                 task_id = int(parts[3])

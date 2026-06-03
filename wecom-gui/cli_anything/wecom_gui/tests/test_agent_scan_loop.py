@@ -544,7 +544,7 @@ def test_agent_loop_only_deep_scans_on_interval(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.agent._send_one_ready", lambda last, mode: {"sent": 0})
     monkeypatch.setattr(
         "cli_anything.wecom_gui.core.agent._read_one_pending",
-        lambda last, executor, futures, max_drafts: {"ok": True, "read": 0, "reason": "queue_empty"},
+        lambda **kwargs: {"ok": True, "read": 0, "reason": "queue_empty"},
     )
     monkeypatch.setattr("cli_anything.wecom_gui.core.agent._log_heartbeat", lambda **kwargs: None)
     monkeypatch.setattr("cli_anything.wecom_gui.core.agent._log", lambda message: None)

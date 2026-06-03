@@ -82,6 +82,164 @@ def test_review_mode_sends_approved_reply(monkeypatch, tmp_path):
     assert sent == [{"text": "鱼油建议随餐服用。", "dry_run": False, "submit": True}]
     assert state.list_queue(status="done")[0]["title"] == "客户A"
 
+
+def test_review_item_exposes_welcome_reply_source_and_system_messages(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "三水儿", "preview": "你已添加了 三水儿，现在可以开始聊天了。", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    trigger = {"role": "系统", "text": row["preview"], "content": row["preview"], "message_type": "system"}
+    state.mark_drafting(item["id"], message_hash="welcome-hash", messages=[trigger], latest=trigger)
+    state.mark_ready(item["id"], reply_text="{WELCOME_MESSAGE}", reply_source="welcome")
+
+    review_item = review_server.list_review_items(status="ready")[0]
+
+    assert review_item["reply_source"] == "welcome"
+    assert review_item["reply_text"] == "{WELCOME_MESSAGE}"
+    assert review_item["messages"][0]["role"] == "系统"
+    assert review_item["messages"][0]["message_type"] == "system"
+
+
+def test_supplement_full_test_uses_isolated_log_table(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    payload = review_server.supplement_test_status("客户A", full_flow=True)
+    customer_key = payload["customer_key"]
+    assert customer_key.startswith("supplement-full-test:")
+
+    state.log_supplement_full_test_event(
+        "full_flow_started",
+        trace_id="trace-full",
+        conversation_key=customer_key,
+        customer_id=customer_key,
+        conversation="客户A",
+        stage=state.SUPPLEMENT_DIGGING_NEED,
+        details={"step": "start"},
+    )
+    state.log_supplement_event(
+        "ordinary_started",
+        trace_id="trace-normal",
+        conversation_key=customer_key,
+        customer_id=customer_key,
+        conversation="客户A",
+        stage=state.SUPPLEMENT_DIGGING_NEED,
+        details={"step": "normal"},
+    )
+
+    payload = review_server.supplement_test_status("客户A", full_flow=True)
+    assert [item["event_type"] for item in payload["logs"]] == ["full_flow_started"]
+
+    reset = review_server.supplement_test_reset("客户A", full_flow=True)
+    assert reset["customer_key"] == customer_key
+    assert reset["logs"] == []
+    assert state.list_supplement_logs(trace_id="trace-normal")[0]["event_type"] == "ordinary_started"
+
+
+def test_supplement_test_old_user_non_supplement_waits_for_question(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+
+    result = review_server.supplement_test_send("老客户A", "你好", full_flow=True)
+
+    assert result["ok"] is True
+    assert result["skipped"] is True
+    assert result["reply_text"] == ""
+    assert result["state"] == {}
+    assert result["job"]["status"] == "done"
+    assert result["job"]["error"] == "no_recommendation_intent"
+    assert [message["message_type"] for message in result["messages"]] == ["customer"]
+
+
+def test_supplement_test_new_user_gets_fixed_welcome_followup(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+
+    result = review_server.supplement_test_send("新客户A", "", full_flow=True, new_user=True)
+
+    assert result["ok"] is True
+    assert result["reply_text"].startswith("您好~可以简单介绍下您的基本信息")
+    assert result["state"]["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
+    assert [message["message_type"] for message in result["messages"]] == ["reply", "reply"]
+    assert result["messages"][0]["text"].startswith("您好，新客户A")
+    assert "Luna 营养工厂健康顾问" in result["messages"][0]["text"]
+    assert "领产品说明书 https://docs.qq.com/s/tHMpjD9S811JnjY369QC2G" in result["messages"][0]["text"]
+    assert result["messages"][1]["text"].startswith("您好~可以简单介绍下您的基本信息")
+    assert result["logs"][0]["event_type"] == "supplement_route_evaluated"
+    assert result["logs"][0]["details"]["trigger_source"] == "new_user_welcome"
+    assert not [item for item in result["logs"] if item["event_type"] == "supplement_backend_agent_started"]
+
+
+def test_supplement_test_new_user_restart_does_not_call_backend_agent(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+
+    first = review_server.supplement_test_send("新客户B", "", full_flow=True, new_user=True)
+    assert first["ok"] is True
+
+    def fail_draft(*args, **kwargs):
+        raise AssertionError("new user restart should not call backend agent")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fail_draft)
+    second = review_server.supplement_test_send("新客户B", "", full_flow=True, new_user=True)
+
+    assert second["ok"] is True
+    assert second["reply_text"].startswith("您好~可以简单介绍下您的基本信息")
+    assert second["state"]["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
+    assert second["state"]["digging_count"] == 0
+    assert second["messages"][-2]["text"].startswith("您好，新客户B")
+    assert second["messages"][-1]["text"].startswith("您好~可以简单介绍下您的基本信息")
+    assert not [item for item in second["logs"] if item["event_type"] == "supplement_backend_agent_started"]
+
+
+def test_supplement_test_old_user_supplement_question_starts_flow_then_uses_backend_agent(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+
+    first = review_server.supplement_test_send("老客户B", "想改善睡眠", full_flow=True)
+
+    assert first["ok"] is True
+    assert first["reply_text"].startswith("您好~可以简单介绍下您的基本信息")
+    assert first["state"]["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
+
+    captured = {}
+
+    def fake_draft(messages, **kwargs):
+        captured["messages"] = messages
+        captured["kwargs"] = kwargs
+        return {
+            "ok": True,
+            "provider": "csbot-autonomous",
+            "worker": "pi",
+            "model": "deepseek-v4-flash",
+            "action": "clarify",
+            "text": "最近入睡大概需要多久？",
+            "message": "最近入睡大概需要多久？",
+            "raw": {
+                "codex": {
+                    "reply": {
+                        "action": "clarify",
+                        "reply_text": "最近入睡大概需要多久？",
+                        "commands_run": ["retrieve --customer-id supplement-full-test:test"],
+                        "retrieval_summary": "已走补剂 scoped 检索。",
+                        "used_script_sources": [],
+                        "used_vector_memories": [],
+                        "confidence": 0.7,
+                        "decision_basis": "继续挖需",
+                        "conflicts": [],
+                    }
+                }
+            },
+        }
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fake_draft)
+
+    result = review_server.supplement_test_send("老客户B", "2", full_flow=True)
+
+    assert result["ok"] is True
+    assert result["reply_text"] == "最近入睡大概需要多久？"
+    assert captured["kwargs"]["provider"] == "pi"
+    assert captured["kwargs"]["agent_mode"] == agent.SUPPLEMENT_REPLY_SOURCE
+    assert captured["kwargs"]["agent_context"]["customer_key"] == result["customer_key"]
+    assert [item["event_type"] for item in result["logs"] if item["event_type"].startswith("supplement_backend_agent")] == [
+        "supplement_backend_agent_started",
+        "supplement_backend_agent_done",
+    ]
+
+
 def test_review_approve_and_reject_ready_items(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     ready_row = {"title": "客户A", "preview": "鱼油怎么吃", "time": "刚刚", "tags": ["@微信"], "raw": []}

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>补剂完整问答测试台</title>
+    <link rel="stylesheet" href="/supplement-full-test/static/styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>补剂完整问答测试台</h1>
+      <div class="toolbar">
+        <a href="/" target="_blank" rel="noreferrer">审核页</a>
+        <span id="status">加载中...</span>
+      </div>
+    </header>
+    <main>
+      <section class="panel compose">
+        <div class="row">
+          <label>
+            客户名
+            <input id="customer" value="补剂完整问答客户" />
+          </label>
+          <label class="inline-check">
+            <input id="newUser" type="checkbox" />
+            新用户进线
+          </label>
+          <span class="mode-badge">网页微信 + 后端真实 Agent</span>
+        </div>
+        <textarea id="message" placeholder="老用户输入问题；新用户进线可留空，或补充第一条客户消息"></textarea>
+        <div class="actions">
+          <button id="send">发送客户消息</button>
+          <button id="reset" class="ghost">重置会话</button>
+        </div>
+      </section>
+      <section class="grid">
+        <article class="panel">
+          <h2>完整问答对话</h2>
+          <div id="conversation" class="conversation"></div>
+        </article>
+        <article class="panel">
+          <h2>当前状态</h2>
+          <div id="state" class="state"></div>
+        </article>
+      </section>
+      <section class="panel">
+        <h2>完整问答链路日志</h2>
+        <div id="logs" class="logs"></div>
+      </section>
+    </main>
+    <script src="/supplement-full-test/static/app.js" defer></script>
+  </body>
+</html>

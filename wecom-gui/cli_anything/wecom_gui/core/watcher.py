@@ -14,6 +14,9 @@ def latest_user_message(messages: list[dict]) -> dict | None:
     latest = messages[-1]
     if latest.get("role") != "用户":
         return None
+    text = str(latest.get("content") or latest.get("text") or "").strip()
+    if "以上是打招呼内容" in text or ("你已添加了" in text and "现在可以开始聊天了" in text):
+        return None
     return latest
 
 

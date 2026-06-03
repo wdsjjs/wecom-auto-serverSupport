@@ -1,0 +1,28 @@
+{
+  "action": "send",
+  "reply_text": "结合您的需求，优先为您推荐这几款产品组合。接下来，我详细为您介绍下：\n\n1.【南非醉茄】：针对您情绪压力方面的困扰，它可以辅助改善记忆认知、调节情绪压力、提升睡眠质量。采用Sensoril® 专利南非醉茄提取物，调节压力与焦虑来源-皮质醇。（市面同品质¥150-200/月，营养工厂¥68.2/月，每日仅需2.27元）\n适用年龄：18岁及以上；服用方法：每日2次，每次1粒，空腹或随餐。\n\n2.【奶蓟草】：针对熬夜护肝需求，它是保肝护肝的小帮手，有助于改善肝脏受损情况，减轻熬夜晚睡带来的肝脏负担。高含量水飞蓟宾，特别添加胆碱助力脂质代谢。（市面同品质¥120-200/月，营养工厂¥58.2/月，每日仅需1.94元）\n适用年龄：18岁及以上；服用方法：每日2粒，随餐服用。\n\n3.【辅酶Q10】：针对经常熬夜、保护身体机能的需要，它是护心能手，帮助身体抗氧化、抗疲劳，熬夜疲惫优选。采用行业头部Kaneka® 还原型辅酶Q10原料，生物利用度远高于普通氧化型Q10。（市面同品质¥300-600/月，营养工厂¥99/月，每日仅需3.3元）\n适用年龄：18岁及以上；服用方法：每日2-4粒，早上随餐服用。\n\n4.【叶黄素】：您平时经常用电脑，这款可以有效减少蓝光伤害，缓解眼疲劳，保护视网膜。美国FloraGLO® 专利天然游离形叶黄素，100+项人体临床试验验证。（市面同品质¥200-250/月，营养工厂¥68.2/月，每日仅需2.27元）\n适用年龄：14岁及以上；服用方法：每日4粒，随餐服用。\n\n如果您服用后感觉效果良好，后续可以搭配以下产品：\n5.【鱼油】：IFOS权威认证的95%高纯度鱼油，含人体必需的Omega-3脂肪酸，DHA和EPA黄金配比，对心血管健康、脑部功能以及抗炎都有显著好处（海鲜过敏者慎用）。（市面同品质¥200-300/月，营养工厂¥69/月，每日仅需2.3元）。\n\n以上产品均为膳食补充剂，不可替代药品治疗。建议根据自身情况选择，如有用药或特殊健康状况请遵医嘱。",
+  "used_script_sources": [
+    {"sheet": "10 补剂推荐", "row": 41, "field": "", "kb_doc_id": "aa113b7419f54778"},
+    {"sheet": "10 补剂推荐", "row": 43, "field": "", "kb_doc_id": "7e33b42c7550d430"},
+    {"sheet": "10 补剂推荐", "row": 44, "field": "", "kb_doc_id": "b03dcd88e80dbc08"},
+    {"sheet": "10 补剂推荐", "row": 48, "field": "", "kb_doc_id": "cd82034cf1847734"},
+    {"sheet": "5 产品常规信息", "row": 19, "field": "", "kb_doc_id": "59aa10b64c9ae5d9"},
+    {"sheet": "5 产品常规信息", "row": 14, "field": "", "kb_doc_id": "fea7e49d10256a36"},
+    {"sheet": "5 产品常规信息", "row": 21, "field": "", "kb_doc_id": "f191826f434040f9"},
+    {"sheet": "5 产品常规信息", "row": 17, "field": "", "kb_doc_id": "4ac80d22a34f1bb1"}
+  ],
+  "used_vector_memories": [],
+  "confidence": 0.85,
+  "commands_run": [
+    {"command": "python3 -m csbot retrieve --customer-id wecom-customer --query '女 50 情绪差 焦虑 护肝 熬夜 久坐 办公' --context-json '{\"scope\":\"supplement\",\"agent_mode\":\"supplement\"}'", "purpose": "双召回检索产品推荐规则和客户画像", "success": true},
+    {"command": "python3 -m csbot kb search --query '奶蓟草 护肝 肝脏 熬夜 50岁 女性' --context-json '{\"scope\":\"supplement\",\"agent_mode\":\"supplement\"}'", "purpose": "检索护肝类产品推荐规则", "success": true},
+    {"command": "python3 -m csbot kb search --query '南非醉茄 产品常规信息' --context-json '{\"scope\":\"supplement\",\"agent_mode\":\"supplement\"}'", "purpose": "检索南非醉茄产品详细信息", "success": true},
+    {"command": "python3 -m csbot kb search --query '奶蓟草 叶黄素 辅酶Q10 产品常规信息' --context-json '{\"scope\":\"supplement\",\"agent_mode\":\"supplement\"}'", "purpose": "检索核心产品详细信息及禁忌", "success": true},
+    {"command": "python3 -m csbot mem search --customer-id wecom-customer --query '女 50岁 情绪 护肝 久坐 熬夜'", "purpose": "查询MEM0客户画像和历史购买记录", "success": false}
+  ],
+  "conflicts": [
+    "MEM0接口返回502错误，无法获取客户画像和历史记录，但PG/script产品数据完整可用"
+  ],
+  "retrieval_summary": "通过PG/script检索到客户选择的三项需求（9抑郁焦虑情绪差 / 10护肝熬夜 / 11办公室久坐）对应的推荐规则和产品详细信息。南非醉茄匹配需求9（改善焦虑情绪，兜底推荐），奶蓟草和辅酶Q10匹配需求10（护肝排毒兜底推荐 和 经常熬夜保护 优先级高），叶黄素匹配需求11（经常对着电子设备，优先级高）。鱼油作为后续可搭配产品。通过产品常规信息表校验了各产品的适用年龄、服用方法和禁忌，均符合50岁女性使用条件。",
+  "decision_basis": "digging_count已达2轮上限，无需再追问。客户已提供年龄性别（女，50岁）和挖需结果（睡眠少/经常熬夜/经常用电脑）。推荐产品超过3个（4个核心+1个后续可搭配），按规范使用超过3个推荐产品话术结构。PG数据完整匹配了三项需求，confidence较高；但MEM0不可用，缺失画像辅助判断，confidence定为0.85。"
+}

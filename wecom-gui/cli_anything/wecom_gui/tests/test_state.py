@@ -30,6 +30,14 @@ def test_latest_user_message_requires_user_role():
     )
     assert latest == {"role": "用户", "content": "继续问"}
 
+
+def test_latest_user_message_ignores_welcome_system_text():
+    assert watcher.latest_user_message(
+        [{"role": "用户", "content": "你已添加了 三水儿，现在可以开始聊天了。"}]
+    ) is None
+    assert watcher.latest_user_message([{"role": "用户", "content": "以上是打招呼内容"}]) is None
+
+
 def test_conversation_signature_includes_unread_count():
     first = watcher._conversation_signature(
         {"title": "客户A", "preview": "你好", "time": "刚刚", "tags": ["@微信"], "unread_count": 1}
@@ -231,6 +239,131 @@ def test_queue_isolates_same_title_by_visible_slot(monkeypatch, tmp_path):
     assert changed_second is True
     assert first["conversation_key"] != second["conversation_key"]
     assert len(state.list_queue(status="pending")) == 2
+
+
+def test_visible_conversation_key_upgrades_to_stable_uid(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {
+        "title": "客户A",
+        "preview": "查订单",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "raw": [],
+        "source": "ocr",
+        "click_y": 240.0,
+    }
+    _changed, item = state.enqueue_conversation(row, "sig-a")
+    assert item["conversation_key"].startswith("visible:")
+
+    upgraded = state.upgrade_job_conversation_key_to_uid(item["id"], "wm-customer-a")
+
+    assert upgraded["id"] == item["id"]
+    assert upgraded["conversation_key"] == "uid:wm-customer-a"
+
+    next_row = {**row, "preview": "继续问", "click_y": 360.0, "external_userid": "wm-customer-a"}
+    changed, merged = state.enqueue_conversation(next_row, "sig-b")
+
+    assert changed is True
+    assert merged["id"] == item["id"]
+    assert merged["conversation_key"] == "uid:wm-customer-a"
+    assert merged["preview"] == "继续问"
+    assert len(state.list_queue()) == 1
+
+
+def test_welcome_state_uses_conversation_key_and_upgrades_to_uid(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    _changed, item = state.enqueue_conversation(
+        {
+            "title": "同名客户",
+            "preview": "你已添加了 同名客户，现在可以开始聊天了。",
+            "time": "刚刚",
+            "tags": ["@微信"],
+            "raw": [],
+            "source": "ocr",
+            "click_y": 240.0,
+        },
+        "sig-visible",
+    )
+    visible_key = item["conversation_key"]
+
+    state.mark_welcome_status(
+        visible_key,
+        state.WELCOME_PENDING,
+        conversation_key=visible_key,
+        conversation="同名客户",
+        job_id=item["id"],
+        reason="welcome_draft_ready",
+    )
+
+    upgraded = state.upgrade_job_conversation_key_to_uid(item["id"], "wm-customer-a")
+
+    assert upgraded["conversation_key"] == "uid:wm-customer-a"
+    assert state.get_welcome_state(visible_key) is None
+    welcome = state.get_welcome_state("uid:wm-customer-a")
+    assert welcome["status"] == state.WELCOME_PENDING
+    assert welcome["job_id"] == item["id"]
+
+
+def test_visible_conversation_key_merges_into_existing_uid_job(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    _changed, stable = state.enqueue_conversation(
+        {
+            "title": "客户A",
+            "preview": "旧消息",
+            "time": "刚刚",
+            "tags": ["@微信"],
+            "raw": [],
+            "external_userid": "wm-customer-a",
+        },
+        "sig-stable",
+    )
+    state.mark_handoff_pending(
+        stable["id"],
+        handoff_type="direct",
+        handoff_reason="客户要求人工",
+        reply_text="您好，我来处理。",
+    )
+    _changed, visible = state.enqueue_conversation(
+        {
+            "title": "客户A",
+            "preview": "新消息",
+            "time": "刚刚",
+            "tags": ["@微信"],
+            "raw": [],
+            "source": "ocr",
+            "click_y": 360.0,
+        },
+        "sig-visible",
+    )
+    state.record_conversation_messages(
+        conversation_key=visible["conversation_key"],
+        job_id=visible["id"],
+        message_hash="hash-visible",
+        messages=[{"role": "用户", "content": "新消息"}],
+    )
+
+    merged = state.upgrade_job_conversation_key_to_uid(visible["id"], "wm-customer-a")
+
+    assert merged["id"] == stable["id"]
+    assert merged["conversation_key"] == "uid:wm-customer-a"
+    assert merged["preview"] == "新消息"
+    assert merged["handoff_type"] == "direct"
+    assert merged["reply_text"] == "您好，我来处理。"
+    assert state.get_job(visible["id"]) is None
+    assert len(state.list_queue()) == 1
+    messages = state.list_conversation_messages(conversation_key="uid:wm-customer-a")
+    assert messages[0]["job_id"] == stable["id"]
+    assert messages[0]["text"] == "新消息"
+
+
+def test_lookup_by_duplicate_customer_name_is_ambiguous(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    state.bind_wecom_customer(uid="wm-a", customer_name="同名客户", source="test")
+    state.bind_wecom_customer(uid="wm-b", customer_name="同名客户", source="test")
+
+    assert state.lookup_wecom_customer(customer_name="同名客户") is None
+    assert state.lookup_wecom_customer(uid="wm-a")["customer_name"] == "同名客户"
+
 
 def test_ready_queue_item_is_not_overwritten(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)

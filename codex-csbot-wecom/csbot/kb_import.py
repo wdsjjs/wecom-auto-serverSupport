@@ -219,10 +219,16 @@ def _import_recommendations(conn, ws, kb_version: str) -> int:
             continue
         facts = {
             "需求点": data.get("需求点", ""),
+            "挖需铺垫": data.get("挖需铺垫", ""),
+            "挖需问题": data.get("挖需问题", ""),
             "挖需结果": data.get("挖需结果", ""),
             "推荐产品": product,
+            "相同挖需结果下的优先级": data.get("相同挖需结果下的优先级", ""),
+            "是否为兜底推荐产品": data.get("是否为兜底推荐产品", ""),
             "推荐产品介绍": data.get("推荐产品介绍", ""),
+            "推荐后免责话术": data.get("推荐后免责话术", ""),
             "备注": data.get("备注（不发出）", ""),
+            "第一段话术": data.get("第一段话术", ""),
         }
         kb_doc_id = _insert_doc(
             conn,
@@ -363,7 +369,10 @@ def _import_generic_sheet(conn, ws, kb_version: str, *, source_sheet: str, busin
 
 
 def import_workbook(xlsx_path: str | Path, db_path: str | Path, *, kb_version: str = "v1") -> dict[str, int]:
-    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    # Some Feishu-exported workbooks have stale sheet dimension metadata. Loading
+    # in normal mode lets openpyxl scan real cells instead of trusting the 1x1
+    # read_only dimension cache.
+    wb = load_workbook(xlsx_path, read_only=False, data_only=True)
     conn = connect(db_path)
     try:
         ensure_schema(conn)
