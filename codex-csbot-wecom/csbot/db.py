@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -56,7 +57,11 @@ def _connect_pg(dsn: str):
     import psycopg
     from psycopg.rows import dict_row
 
-    return PgCompatConnection(psycopg.connect(dsn, row_factory=dict_row))
+    try:
+        connect_timeout = int(os.environ.get("CSBOT_PG_CONNECT_TIMEOUT", "8"))
+    except ValueError:
+        connect_timeout = 8
+    return PgCompatConnection(psycopg.connect(dsn, row_factory=dict_row, connect_timeout=max(1, connect_timeout)))
 
 
 def connect(db_path: str | Path | None = None):
@@ -70,7 +75,7 @@ def connect(db_path: str | Path | None = None):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -169,6 +174,20 @@ def _ensure_sqlite_schema(conn: sqlite3.Connection) -> None:
             ON weiban_customer_service_faq (group_name);
         CREATE INDEX IF NOT EXISTS idx_weiban_customer_service_faq_content_hash
             ON weiban_customer_service_faq (content_hash);
+
+        CREATE TABLE IF NOT EXISTS knowledge_sync_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            message TEXT NOT NULL DEFAULT '',
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_knowledge_sync_log_source_created
+            ON knowledge_sync_log (source, created_at);
         """
     )
     conn.commit()
@@ -266,6 +285,20 @@ def _ensure_pg_schema(conn) -> None:
             ON weiban_customer_service_faq (group_name);
         CREATE INDEX IF NOT EXISTS idx_weiban_customer_service_faq_content_hash
             ON weiban_customer_service_faq (content_hash);
+
+        CREATE TABLE IF NOT EXISTS knowledge_sync_log (
+            id BIGSERIAL PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            message TEXT NOT NULL DEFAULT '',
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_knowledge_sync_log_source_created
+            ON knowledge_sync_log (source, created_at);
         """
     )
     conn.commit()

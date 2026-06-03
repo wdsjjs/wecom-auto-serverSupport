@@ -149,9 +149,13 @@ root = Path(sys.argv[1])
 env_file = Path(sys.argv[2])
 errors: list[str] = []
 notes: list[str] = []
+warnings: list[str] = []
 
 def add_error(message: str) -> None:
     errors.append(message)
+
+def add_warning(message: str) -> None:
+    warnings.append(message)
 
 def command_path(value: str) -> str:
     value = (value or "").strip()
@@ -239,13 +243,81 @@ if dsn:
     try:
         import psycopg
 
-        with psycopg.connect(dsn, connect_timeout=3) as conn:
+        with psycopg.connect(dsn, connect_timeout=int(os.environ.get("CSBOT_PG_CONNECT_TIMEOUT", "8"))) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
         notes.append("postgres=ok")
     except Exception as exc:
         add_error(f"CSBOT_PG_DSN connection failed: {type(exc).__name__}: {exc}")
+else:
+    add_warning("CSBOT_PG_DSN is not set; csbot will use SQLite compatibility mode")
+
+feishu_values = {
+    "FEISHU_APP_ID": os.environ.get("FEISHU_APP_ID", "").strip(),
+    "FEISHU_APP_SECRET": os.environ.get("FEISHU_APP_SECRET", "").strip(),
+    "FEISHU_APP_TOKEN": os.environ.get("FEISHU_APP_TOKEN", "").strip(),
+}
+if all(feishu_values.values()):
+    try:
+        payload = json.dumps(
+            {"app_id": feishu_values["FEISHU_APP_ID"], "app_secret": feishu_values["FEISHU_APP_SECRET"]}
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=8) as response:
+            token_data = json.loads(response.read().decode("utf-8"))
+        if token_data.get("code") != 0:
+            add_warning(f"Feishu token check failed: code={token_data.get('code')} msg={token_data.get('msg')}")
+        else:
+            token = str(token_data.get("tenant_access_token") or "")
+            app_token = feishu_values["FEISHU_APP_TOKEN"]
+            request = urllib.request.Request(
+                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables?page_size=20",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(request, timeout=8) as response:
+                table_data = json.loads(response.read().decode("utf-8"))
+            if table_data.get("code") != 0:
+                add_warning(f"Feishu Bitable check failed: code={table_data.get('code')} msg={table_data.get('msg')}")
+            else:
+                table_count = len((table_data.get("data") or {}).get("items") or [])
+                notes.append(f"feishu=ok({table_count} tables)")
+    except Exception as exc:
+        add_warning(f"Feishu check failed: {type(exc).__name__}: {exc}")
+else:
+    missing = ",".join(key for key, value in feishu_values.items() if not value)
+    add_warning(f"Feishu config incomplete: {missing}")
+
+weiban_values = {
+    "WEIBAN_BASE_URL": os.environ.get("WEIBAN_BASE_URL", "https://open.weibanzhushou.com").strip(),
+    "WEIBAN_CORP_ID": os.environ.get("WEIBAN_CORP_ID", "").strip(),
+    "WEIBAN_SECRET": os.environ.get("WEIBAN_SECRET", "").strip(),
+}
+if all(weiban_values.values()):
+    try:
+        payload = json.dumps(
+            {"corp_id": weiban_values["WEIBAN_CORP_ID"], "secret": weiban_values["WEIBAN_SECRET"]}
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{weiban_values['WEIBAN_BASE_URL'].rstrip('/')}/open-api/access_token/get",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=8) as response:
+            token_data = json.loads(response.read().decode("utf-8"))
+        if token_data.get("errcode") != 0:
+            add_warning(f"Weiban token check failed: errcode={token_data.get('errcode')} msg={token_data.get('errmsg') or token_data.get('msg')}")
+        else:
+            notes.append("weiban=ok")
+    except Exception as exc:
+        add_warning(f"Weiban check failed: {type(exc).__name__}: {exc}")
+else:
+    missing = ",".join(key for key, value in weiban_values.items() if not value)
+    add_warning(f"Weiban config incomplete: {missing}")
 
 mem0_url = os.environ.get("CSBOT_MEM0_URL", "").strip().rstrip("/")
 if mem0_url:
@@ -256,10 +328,20 @@ if mem0_url:
         )
         with urllib.request.urlopen(request, timeout=3) as response:
             if response.status >= 400:
-                add_error(f"CSBOT_MEM0_URL returned HTTP {response.status}: {mem0_url}")
+                add_warning(f"CSBOT_MEM0_URL returned HTTP {response.status}: {mem0_url}")
         notes.append("mem0=ok")
     except Exception as exc:
-        add_error(f"CSBOT_MEM0_URL check failed: {type(exc).__name__}: {exc}")
+        add_warning(f"CSBOT_MEM0_URL check failed: {type(exc).__name__}: {exc}")
+else:
+    add_warning("CSBOT_MEM0_URL is not set; vector/customer memory will be unavailable")
+
+if warnings:
+    print("Preflight warnings:", file=sys.stderr)
+    for warning in warnings:
+        print(f"  - {warning}", file=sys.stderr)
+    if os.environ.get("WECOM_AGENT_STRICT_KNOWLEDGE_PREFLIGHT", "0").strip() == "1":
+        for warning in warnings:
+            add_error(f"strict knowledge preflight: {warning}")
 
 if errors:
     print("ERROR: wecom-agent preflight failed:", file=sys.stderr)
@@ -270,6 +352,36 @@ if errors:
 
 print("Preflight OK: " + "; ".join(notes))
 PY
+}
+
+knowledge_sync_if_stale() {
+  if [[ "${WECOM_AGENT_KNOWLEDGE_SYNC_ON_START:-1}" == "0" ]]; then
+    echo "knowledge sync skipped: WECOM_AGENT_KNOWLEDGE_SYNC_ON_START=0"
+    return 0
+  fi
+  local csbot_dir="${WECOM_GUI_CSBOT_DIR:-$ROOT_DIR/../codex-csbot-wecom}"
+  if [[ ! -d "$csbot_dir" ]]; then
+    echo "knowledge sync skipped: csbot dir not found: $csbot_dir" >&2
+    return 0
+  fi
+
+  local max_age="${CSBOT_SYNC_MAX_AGE_SECONDS:-86400}"
+  local kb_version="${CSBOT_SYNC_STARTUP_KB_VERSION:-startup}"
+  local skip_mem0_arg=()
+  if [[ "${CSBOT_SYNC_STARTUP_SKIP_MEM0:-1}" == "1" ]]; then
+    skip_mem0_arg+=(--skip-mem0)
+  fi
+
+  echo "knowledge sync freshness check: max_age_seconds=$max_age kb_version=$kb_version"
+  (
+    cd "$csbot_dir"
+    PYTHONPATH="$PYTHONPATH_VALUE" "$PYTHON_BIN" -m csbot sync if-stale \
+      --max-age-seconds "$max_age" \
+      --kb-version "$kb_version" \
+      --non-blocking \
+      --compact \
+      "${skip_mem0_arg[@]}"
+  )
 }
 
 is_running() {
@@ -300,6 +412,13 @@ write_header() {
       "${WECOM_GUI_WINDOW_MODE:-fullscreen}" "${WECOM_GUI_COORD_MODE:-adaptive}" \
       "${WECOM_GUI_NORMALIZE_FULLSCREEN:-0}"
     printf 'SDKROOT=%s\n' "${SDKROOT:-}"
+    printf 'AI_CONCURRENCY=max:%s text:%s image:%s\n' \
+      "$MAX_DRAFTS" "${WECOM_AGENT_TEXT_WORKERS:-}" "${WECOM_AGENT_IMAGE_WORKERS:-}"
+    printf 'KNOWLEDGE=pg:%s feishu:%s weiban:%s mem0:%s\n' \
+      "$([[ -n "${CSBOT_PG_DSN:-}" ]] && echo configured || echo missing)" \
+      "$([[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" && -n "${FEISHU_APP_TOKEN:-}" ]] && echo configured || echo missing)" \
+      "$([[ -n "${WEIBAN_CORP_ID:-}" && -n "${WEIBAN_SECRET:-}" ]] && echo configured || echo missing)" \
+      "$([[ -n "${CSBOT_MEM0_URL:-}" && -n "${CSBOT_MEM0_API_KEY:-}" ]] && echo configured || echo missing)"
   } >> "$LOG_FILE"
 }
 
@@ -310,10 +429,14 @@ start_agent() {
     return 0
   fi
 
-  preflight_agent
-
   : > "$LOG_FILE"
   write_header
+  if ! preflight_agent 2>&1 | tee -a "$LOG_FILE"; then
+    echo "preflight failed; see log: $LOG_FILE" >&2
+    return 1
+  fi
+  knowledge_sync_if_stale 2>&1 | tee -a "$LOG_FILE" || true
+
   local command
   command="cd '$ROOT_DIR' && PYTHONPATH='$PYTHONPATH_VALUE' '$PYTHON_BIN' -u -m cli_anything.wecom_gui agent --mode '$MODE' --poll '$POLL' --scan-interval '$SCAN_INTERVAL' --inbox-limit '$INBOX_LIMIT' --scan-pages '$SCAN_PAGES' --scroll-ticks '$SCROLL_TICKS' --deep-scan-interval '$DEEP_SCAN_INTERVAL' --max-drafts '$MAX_DRAFTS' --last '$LAST_MESSAGES' --log-interval '$LOG_INTERVAL' >> '$LOG_FILE' 2>&1"
   screen -dmS "$SESSION_NAME" zsh -lc "$command"

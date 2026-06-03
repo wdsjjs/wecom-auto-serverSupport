@@ -12,6 +12,7 @@ from .db import connect, ensure_schema
 from .feishu_sync import sync_feishu_tables
 from .kb_import import import_workbook
 from .kb_rebuild import rebuild_kb_docs_from_sources
+from .knowledge_sync import DEFAULT_MAX_AGE_SECONDS, knowledge_sync_status, sync_all_parallel, sync_if_stale
 from .mem0_client import Mem0Client
 from .ops_gateway import handoff_notify, logistics_query, order_query, ticket_draft, wecom_user_lookup
 from .retrieve import retrieve
@@ -23,6 +24,54 @@ from .worker_router import claim_worker, complete_worker, heartbeat_worker, list
 
 def _print_json(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _compact_sync_result(value: dict) -> dict:
+    def compact_status(status: dict) -> dict:
+        return {
+            key: status.get(key)
+            for key in ("ok", "fresh", "reason", "last_success_at", "age_seconds", "max_age_seconds")
+            if key in status
+        }
+
+    def compact_task(task: dict) -> dict:
+        result = task.get("result") or {}
+        compacted = {
+            key: task.get(key)
+            for key in ("ok", "source", "attempts", "elapsed_ms", "error")
+            if key in task
+        }
+        if isinstance(result, dict):
+            compacted["rows"] = result.get("rows")
+            compacted["groups"] = result.get("groups")
+            compacted["skipped_groups"] = len(result.get("skipped_groups") or []) if "skipped_groups" in result else None
+        return compacted
+
+    compacted = {
+        key: value.get(key)
+        for key in ("ok", "skipped", "reason")
+        if key in value
+    }
+    if isinstance(value.get("status"), dict):
+        compacted["status"] = compact_status(value["status"])
+    sync = value.get("sync")
+    if isinstance(sync, dict):
+        compacted["sync"] = {
+            key: sync.get(key)
+            for key in ("ok", "dry_run", "parallel", "knowledge_backend", "mem0_skipped", "elapsed_ms")
+            if key in sync
+        }
+        compacted["sync"]["sources"] = {
+            source: compact_task(task)
+            for source, task in (sync.get("sources") or {}).items()
+            if isinstance(task, dict)
+        }
+        compacted["sync"]["followups"] = {
+            source: compact_task(task)
+            for source, task in (sync.get("followups") or {}).items()
+            if isinstance(task, dict)
+        }
+    return compacted
 
 
 def _load_context(raw: str | None) -> dict:
@@ -137,27 +186,43 @@ def cmd_kb_rebuild(args: argparse.Namespace) -> int:
 
 
 def cmd_sync_all(args: argparse.Namespace) -> int:
-    db_path = _db_arg(args)
-    feishu = sync_feishu_tables(dry_run=args.dry_run, db_path=db_path)
-    weiban = sync_weiban_faq(dry_run=args.dry_run, db_path=db_path)
-    if args.dry_run:
-        _print_json({"ok": True, "dry_run": True, "feishu": feishu, "weiban": weiban})
-        return 0
-    counts = rebuild_kb_docs_from_sources(kb_version=args.kb_version, db_path=db_path)
-    vector_count = 0 if args.skip_mem0 else import_kb_docs_as_memories(db_path, progress=args.progress)
-    _print_json(
-        {
-            "ok": True,
-            "dry_run": False,
-            "knowledge_backend": "postgres" if using_pg() else "sqlite",
-            "feishu": feishu,
-            "weiban": weiban,
-            "counts": counts,
-            "mem0_imported": vector_count,
-            "mem0_skipped": bool(args.skip_mem0),
-        }
+    result = sync_all_parallel(
+        dry_run=args.dry_run,
+        db_path=_db_arg(args),
+        kb_version=args.kb_version,
+        skip_mem0=args.skip_mem0,
+        progress=args.progress,
+        attempts=args.attempts,
+        retry_delay_seconds=args.retry_delay,
     )
-    return 0
+    _print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_sync_status(args: argparse.Namespace) -> int:
+    result = knowledge_sync_status(db_path=_db_arg(args), max_age_seconds=args.max_age_seconds)
+    ok = bool(result.get("ok"))
+    if args.compact:
+        _print_json(_compact_sync_result({"status": result}))
+    else:
+        _print_json(result)
+    return 0 if ok else 1
+
+
+def cmd_sync_if_stale(args: argparse.Namespace) -> int:
+    result = sync_if_stale(
+        db_path=_db_arg(args),
+        max_age_seconds=args.max_age_seconds,
+        kb_version=args.kb_version,
+        skip_mem0=args.skip_mem0,
+        progress=args.progress,
+        dry_run=args.dry_run,
+        force=args.force,
+    )
+    _print_json(_compact_sync_result(result) if args.compact else result)
+    if result.get("ok"):
+        return 0
+    return 0 if args.non_blocking else 1
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -385,7 +450,23 @@ def build_parser() -> argparse.ArgumentParser:
     sync_all.add_argument("--kb-version", default="pg")
     sync_all.add_argument("--skip-mem0", action="store_true", help="Only rebuild PG kb_docs/kb_aliases, do not import MEM0")
     sync_all.add_argument("--progress", action="store_true", help="Print MEM0/vector import progress to stderr")
+    sync_all.add_argument("--attempts", type=int, default=None, help="Retry attempts for each sync task, default CSBOT_SYNC_RETRY_ATTEMPTS or 3")
+    sync_all.add_argument("--retry-delay", type=float, default=None, help="Seconds between retries, default CSBOT_SYNC_RETRY_DELAY_SECONDS or 2")
     sync_all.set_defaults(func=cmd_sync_all)
+    sync_status = sync_sub.add_parser("status")
+    sync_status.add_argument("--max-age-seconds", type=int, default=DEFAULT_MAX_AGE_SECONDS)
+    sync_status.add_argument("--compact", action="store_true")
+    sync_status.set_defaults(func=cmd_sync_status)
+    sync_if_stale_cmd = sync_sub.add_parser("if-stale")
+    sync_if_stale_cmd.add_argument("--dry-run", action="store_true")
+    sync_if_stale_cmd.add_argument("--force", action="store_true")
+    sync_if_stale_cmd.add_argument("--max-age-seconds", type=int, default=DEFAULT_MAX_AGE_SECONDS)
+    sync_if_stale_cmd.add_argument("--kb-version", default="startup")
+    sync_if_stale_cmd.add_argument("--skip-mem0", action="store_true", help="Only rebuild PG kb_docs/kb_aliases, do not import MEM0")
+    sync_if_stale_cmd.add_argument("--progress", action="store_true", help="Print MEM0/vector import progress to stderr")
+    sync_if_stale_cmd.add_argument("--non-blocking", action=argparse.BooleanOptionalAction, default=True, help="Return 0 even when stale sync fails; failures are logged")
+    sync_if_stale_cmd.add_argument("--compact", action="store_true", help="Print compact startup-friendly JSON")
+    sync_if_stale_cmd.set_defaults(func=cmd_sync_if_stale)
 
     autonomous = sub.add_parser("autonomous-reply")
     autonomous.add_argument("--customer-id", required=True)

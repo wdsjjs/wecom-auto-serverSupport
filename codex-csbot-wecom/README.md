@@ -55,6 +55,23 @@ python -m csbot sync all --progress
 python -m csbot kb rebuild --vector
 ```
 
+Weiban sync writes diagnostic progress logs to stderr by default and keeps the
+final JSON result on stdout. Useful diagnosis knobs:
+
+```bash
+WEIBAN_GROUP_FETCH_MODE=top_level \
+WEIBAN_SYNC_WORKERS=4 \
+WEIBAN_SYNC_MAX_GROUPS=20 \
+WEIBAN_REQUEST_TIMEOUT_SECONDS=10 \
+WEIBAN_TOKEN_TIMEOUT_SECONDS=10 \
+python -m csbot weiban sync --dry-run > /tmp/weiban-sync.json 2> /tmp/weiban-sync.log
+```
+
+`WEIBAN_GROUP_FETCH_MODE=top_level` is the default and avoids re-fetching child
+groups that are already included in top-level group results. Use
+`WEIBAN_GROUP_FETCH_MODE=all` only when diagnosing parent/child data gaps. Set
+`WEIBAN_SYNC_LOG=0` to silence the progress logs.
+
 `sync all` runs Feishu sync, Weiban FAQ sync, rebuilds `kb_docs/kb_aliases`, and
 imports the unified KB into MEM0 `global-kb`. The WeCom GUI queue SQLite is
 local to each Mac and is not migrated by this knowledge sync.

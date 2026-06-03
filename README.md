@@ -142,6 +142,23 @@ WECOM_REVIEW_HOST=0.0.0.0
 WECOM_REVIEW_PORT=8122
 ```
 
+AI drafting concurrency can be tuned per machine in `wecom-gui/.env.local`.
+This file is intentionally ignored by git because it may also contain local
+secrets. The current local machine is configured as:
+
+```env
+WECOM_AGENT_MAX_DRAFTS=20
+WECOM_AGENT_TEXT_WORKERS=15
+WECOM_AGENT_IMAGE_WORKERS=5
+```
+
+`WECOM_AGENT_MAX_DRAFTS` is the total number of AI drafts allowed in flight.
+`WECOM_AGENT_TEXT_WORKERS` limits text-only customer turns, while
+`WECOM_AGENT_IMAGE_WORKERS` limits turns whose latest customer message includes
+captured images. WeCom GUI reading, clicking, and sending still run through a
+single GUI lock; these settings only increase concurrent AI drafting after a
+conversation has been read.
+
 Shared knowledge settings are usually written by `scripts/install-config.sh`
 from `deploy/mac.shared.env`.
 
@@ -220,3 +237,9 @@ deploy/mac.shared.env              Shared LAN service config generated during in
   page, queue states, testing.
 - `wecom-gui/WECOM_GUI.md`: GUI automation SOP and safety checklist.
 - `codex-csbot-wecom/README.md`: knowledge sync, retrieval, debug UI, ops tools.
+- `docs/project-architecture.md`: Chinese architecture walkthrough from top
+  modules down to service internals, including context flow, external user ID,
+  concurrency, and protection mechanisms.
+- `docs/knowledge-sync-configuration.md`: Chinese record of Feishu/Weiban/PG/Mem0
+  sync configuration, validation commands, startup preflight checks, and current
+  connectivity status.
