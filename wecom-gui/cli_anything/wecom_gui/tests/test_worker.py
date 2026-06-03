@@ -172,8 +172,11 @@ def test_fast_agent_pipeline_reads_drafts_and_sends(monkeypatch, tmp_path):
         lambda messages, **kwargs: {"ok": True, "provider": "fake", "text": "随餐服用", "message": "随餐服用"},
     )
     monkeypatch.setattr(
-        "cli_anything.wecom_gui.core.reply.send_text",
-        lambda text, dry_run=False, submit=True: sent.append({"text": text, "dry_run": dry_run, "submit": submit}),
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(
+            {"text": text, "dry_run": dry_run, "submit": submit}
+        )
+        or {"ok": True},
     )
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -237,8 +240,11 @@ def test_fast_agent_rechecks_without_resending_when_reply_not_visible_once(monke
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
     monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
     monkeypatch.setattr(
-        "cli_anything.wecom_gui.core.reply.send_text",
-        lambda text, dry_run=False, submit=True: sent.append({"text": text, "dry_run": dry_run, "submit": submit}),
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(
+            {"text": text, "dry_run": dry_run, "submit": submit}
+        )
+        or {"ok": True},
     )
     monkeypatch.setattr(
         "cli_anything.wecom_gui.utils.macos_backend.paste_and_enter",
@@ -279,8 +285,8 @@ def test_fast_agent_does_not_mark_done_when_sent_reply_is_not_visible(monkeypatc
         lambda messages, **kwargs: {"ok": True, "provider": "fake", "text": "随餐服用", "message": "随餐服用"},
     )
     monkeypatch.setattr(
-        "cli_anything.wecom_gui.core.reply.send_text",
-        lambda text, dry_run=False, submit=True: {"ok": True, "submitted": True},
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: {"ok": True, "submitted": True},
     )
     monkeypatch.setattr("cli_anything.wecom_gui.core.agent.time.sleep", lambda seconds: None)
 
@@ -316,7 +322,7 @@ def test_fast_agent_skips_stale_context_before_send(monkeypatch, tmp_path):
         },
     )
     monkeypatch.setattr(
-        "cli_anything.wecom_gui.core.reply.send_text",
+        "cli_anything.wecom_gui.core.reply.send_message",
         lambda text, dry_run=False, submit=True: sent.append(text),
     )
 

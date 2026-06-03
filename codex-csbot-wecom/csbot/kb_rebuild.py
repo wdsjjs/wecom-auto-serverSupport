@@ -88,6 +88,7 @@ def _feishu_business_type(pg_table: str) -> str:
         "feishu_logistics_faq": "logistics_exception",
         "feishu_supplement_recommendations": "recommendation_rule",
         "feishu_product_certifications": "raw_material_certification",
+        "feishu_brand_comparison": "brand_comparison",
         "feishu_shipping_status_templates": "shipping_template",
     }.get(pg_table, "general")
 
@@ -109,6 +110,8 @@ def _feishu_product_topic(pg_table: str, data: dict) -> tuple[str, str]:
         return _first(data, "推荐产品", "产品"), _first(data, "需求点", "挖需结果", "补剂推荐")
     if pg_table == "feishu_product_certifications":
         return _first(data, "产品全称", "产品常用名", "产品", "原料名称", "原料", "对标品牌", "品牌", "列1"), _first(data, "认证类型", "专利信息", "原料专利认证")
+    if pg_table == "feishu_brand_comparison":
+        return _first(data, "产品全称", "产品常用名", "产品", "对标品牌", "品牌"), _first(data, "对标品牌", "授权", "品牌授权", "对标品牌与授权")
     if pg_table == "feishu_papers":
         return _first(data, "产品全称", "产品常用名", "产品", "论文方向"), _first(data, "论文名称", "标题", "论文方向", "论文表")
     if pg_table == "feishu_logistics_faq":

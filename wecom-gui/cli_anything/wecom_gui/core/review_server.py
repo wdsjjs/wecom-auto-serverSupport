@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from cli_anything.wecom_gui import __version__
-from cli_anything.wecom_gui.core import agent, llm, state
+from cli_anything.wecom_gui.core import agent, llm, message_config, state
 from cli_anything.wecom_gui.core.text import clean_customer_reply_text, clean_history_message_text
 from cli_anything.wecom_gui.utils import macos_backend
 
@@ -44,17 +44,7 @@ REVIEW_HTML = _load_frontend_text("index.html")
 REVIEW_FRONTEND_JS = _load_frontend_text("app.js")
 SUPPLEMENT_TEST_HTML = _load_frontend_text("index.html", root=SUPPLEMENT_TEST_FRONTEND_DIR)
 SUPPLEMENT_FULL_TEST_HTML = _load_frontend_text("index.html", root=SUPPLEMENT_FULL_TEST_FRONTEND_DIR)
-SUPPLEMENT_WELCOME_TEMPLATE = """您好，{用户名}
-我是您专属的——Luna 营养工厂健康顾问
-✓已为超 40 万人提供营养咨询服务
-
-领产品说明书 https://docs.qq.com/s/tHMpjD9S811JnjY369QC2G
-
-留下您的性别、年龄和需求，我为您【搭配补剂】。比如失眠、肥胖、脱发、三高…等等～
-
-👇【今日限时福利】进群领 50 元券包🎁
-docs.qq.com
-docs.qq.com"""
+SUPPLEMENT_WELCOME_TEMPLATE = message_config.fixed_message("welcome", "supplement_web_welcome_template")
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status_code: int, payload: dict) -> None:
@@ -556,14 +546,14 @@ def _supplement_fixed_reply_for_stage(text: str, supplement_state: dict | None) 
     selected_needs = _supplement_selected_needs(text)
     if not current_stage:
         has_profile = agent._has_supplement_profile(text)
-        reply = agent.SUPPLEMENT_FIRST_REPLY_CHOICES_ONLY if has_profile else agent.SUPPLEMENT_FIRST_REPLY_WITH_PROFILE
+        reply = agent.supplement_first_reply_choices_only() if has_profile else agent.supplement_first_reply_with_profile()
         return reply, state.SUPPLEMENT_COLLECTING_PROFILE, state.SUPPLEMENT_DIGGING_NEED, {
             "action": "first_prompt",
             "has_profile": has_profile,
             "selected_needs": selected_needs,
         }
     if current_stage == state.SUPPLEMENT_COLLECTING_PROFILE and agent._is_supplement_need_selection(text):
-        return agent.SUPPLEMENT_SELECTION_ACK, state.SUPPLEMENT_DIGGING_NEED, state.SUPPLEMENT_DIGGING_NEED, {
+        return agent.supplement_selection_ack(), state.SUPPLEMENT_DIGGING_NEED, state.SUPPLEMENT_DIGGING_NEED, {
             "action": "need_selection_ack",
             "selected_needs": selected_needs,
             "need_numbers": agent._selected_supplement_need_numbers(text),
@@ -573,7 +563,8 @@ def _supplement_fixed_reply_for_stage(text: str, supplement_state: dict | None) 
 
 def _supplement_welcome_text(customer_name: str) -> str:
     title = str(customer_name or "客户").strip() or "客户"
-    return SUPPLEMENT_WELCOME_TEMPLATE.replace("{用户名}", title)
+    template = message_config.fixed_message("welcome", "supplement_web_welcome_template") or SUPPLEMENT_WELCOME_TEMPLATE
+    return template.replace("{用户名}", title)
 
 
 def _supplement_web_welcome_message(customer_name: str) -> dict:
@@ -653,6 +644,61 @@ def _supplement_reply_for_stage(text: str, supplement_state: dict | None, *, mes
     next_stage = state.SUPPLEMENT_DIGGING_NEED if action == "clarify" else state.SUPPLEMENT_READY_TO_RECOMMEND
     pending_next = state.SUPPLEMENT_DIGGING_NEED if action == "clarify" else state.SUPPLEMENT_RECOMMENDED
     return str(draft.get("text") or draft.get("message") or ""), next_stage, pending_next, _supplement_draft_details(draft)
+
+
+def _ordinary_test_reply(
+    *,
+    job: dict,
+    customer_key: str,
+    customer_name: str,
+    messages: list[dict],
+    message_hash: str,
+) -> dict:
+    started = time.perf_counter()
+    state.mark_drafting(
+        int(job["id"]),
+        message_hash=message_hash,
+        messages=messages,
+        latest=messages[-1],
+    )
+    draft = llm.draft_reply(
+        messages,
+        customer_name=customer_name,
+        customer_uid="",
+    )
+    duration_ms = round((time.perf_counter() - started) * 1000)
+    reply_text = clean_customer_reply_text(str(draft.get("text") or draft.get("message") or ""))
+    state.mark_ready(
+        int(job["id"]),
+        reply_text=reply_text,
+        reply_source="ai",
+        duration_ms=duration_ms,
+        action=str(draft.get("action") or ""),
+    )
+    state.mark_done(
+        int(job["id"]),
+        message_hash=message_hash,
+        reply_text=reply_text,
+        reply_source="ai",
+        duration_ms=duration_ms,
+    )
+    state.append_event(
+        {
+            "type": "supplement_test_ordinary_agent_done",
+            "job_id": int(job["id"]),
+            "conversation": customer_name,
+            "conversation_key": customer_key,
+            "duration_ms": duration_ms,
+            "provider": draft.get("provider"),
+            "action": draft.get("action"),
+        }
+    )
+    return {
+        "ok": True,
+        "reply_text": reply_text,
+        "ordinary_agent": True,
+        "duration_ms": duration_ms,
+    }
 
 
 def _supplement_commit_test_reply(
@@ -818,7 +864,7 @@ def supplement_test_send(customer: str, text: str, *, full_flow: bool = False, n
         if item.get("text")
     ]
     supplement_state = state.get_supplement_state(customer_key)
-    is_new_user_start = bool(new_user)
+    is_new_user_start = bool(new_user) and not bool(supplement_state)
     if is_new_user_start:
         messages.append(_supplement_web_welcome_message(customer_name))
     if body:
@@ -861,14 +907,8 @@ def supplement_test_send(customer: str, text: str, *, full_flow: bool = False, n
         },
     )
     if not route.get("triggered"):
-        state.mark_read_logged(
-            int(job["id"]),
-            message_hash=message_hash,
-            messages=messages,
-            reason=str(route.get("reason") or "old_user_waiting_for_question"),
-        )
         _supplement_log(
-            "supplement_route_skipped",
+            "supplement_route_to_ordinary_agent",
             trace_id=trace_id,
             job=job,
             customer_key=customer_key,
@@ -880,7 +920,23 @@ def supplement_test_send(customer: str, text: str, *, full_flow: bool = False, n
                 "channel": "web_wechat_simulator",
             },
         )
-        return {"ok": True, "reply_text": "", "skipped": True, **supplement_test_status(customer_name, full_flow=full_flow)}
+        try:
+            ordinary = _ordinary_test_reply(
+                job=job,
+                customer_key=customer_key,
+                customer_name=customer_name,
+                messages=messages,
+                message_hash=message_hash,
+            )
+        except Exception as exc:
+            state.mark_read_logged(
+                int(job["id"]),
+                message_hash=message_hash,
+                messages=messages,
+                reason=str(route.get("reason") or "ordinary_agent_failed"),
+            )
+            return {"ok": False, "error": str(exc), **supplement_test_status(customer_name, full_flow=full_flow)}
+        return {**ordinary, **supplement_test_status(customer_name, full_flow=full_flow)}
     _supplement_log(
         "supplement_state_loaded",
         trace_id=trace_id,
@@ -898,7 +954,7 @@ def supplement_test_send(customer: str, text: str, *, full_flow: bool = False, n
     try:
         fixed_reply = (
             (
-                agent.SUPPLEMENT_FIRST_REPLY_WITH_PROFILE,
+                agent.supplement_first_reply_with_profile(),
                 state.SUPPLEMENT_COLLECTING_PROFILE,
                 state.SUPPLEMENT_DIGGING_NEED,
                 {

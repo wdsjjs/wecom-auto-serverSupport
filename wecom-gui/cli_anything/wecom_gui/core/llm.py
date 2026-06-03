@@ -29,6 +29,23 @@ ANALYSIS_LEAK_PATTERNS = (
     re.compile(r"^\s*Context from conversation:\s*$", re.I | re.M),
     re.compile(r"^\s*Key knowledge from .+?:\s*$", re.I | re.M),
 )
+INTERNAL_REPLY_REPLACEMENTS = {
+    "知识库中没有记录": "我这边暂时没有查到明确资料",
+    "知识库没有记录": "我这边暂时没有查到明确资料",
+    "数据库中没有记录": "我这边暂时没有查到明确资料",
+    "数据库没有记录": "我这边暂时没有查到明确资料",
+    "知识库": "资料",
+    "数据库": "资料",
+    "免责话术": "使用提醒",
+    "合规话术": "使用提醒",
+    "系统提示": "规则",
+    "提示词": "规则",
+    "内部资料": "资料",
+    "内部规则": "规则",
+    "检索": "查询",
+    "prompt": "规则",
+    "tool": "工具",
+}
 
 def build_prompt(messages: list[dict]) -> list[dict]:
     """Build a chat-completions message list from GUI-extracted context."""
@@ -363,6 +380,8 @@ def _validate_customer_reply_text(message: str) -> str:
         return ""
     if _looks_like_analysis_leak(text):
         raise RuntimeError("AI output contains analysis/debug text; refusing to send.")
+    for old, new in INTERNAL_REPLY_REPLACEMENTS.items():
+        text = text.replace(old, new)
     return text
 
 

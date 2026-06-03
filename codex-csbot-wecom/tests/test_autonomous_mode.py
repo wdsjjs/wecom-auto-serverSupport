@@ -87,6 +87,18 @@ class AutonomousWorkerContractTest(unittest.TestCase):
                     (kb_doc_id, kb_version, business_type, product, topic, text, facts_json,
                      source_sheet, source_row, source_field)
                 VALUES
+                    ('doc-brand-profile-1', 'test-v1', 'product_profile', '女士复合维生素', '产品常规信息',
+                     '产品常用名: 女维\n品牌授权: 营养工厂自有产品授权信息以页面为准',
+                     '{"产品常用名":"女维","产品全称":"女士复合维生素","品牌授权":"营养工厂自有产品授权信息以页面为准","备注":"未记录其他对标品牌"}',
+                     '5 产品常规信息', 3, 'row')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO kb_docs
+                    (kb_doc_id, kb_version, business_type, product, topic, text, facts_json,
+                     source_sheet, source_row, source_field)
+                VALUES
                     ('doc-paper-1', 'test-v1', 'research_evidence', '婴幼少儿 DHA 藻油', 'DHA 与儿童成长研究',
                      '产品: 婴幼少儿 DHA 藻油\n论文方向: 儿童成长研究\n标题: DHA 与儿童成长研究\n链接: https://example.com/dha-paper',
                      '{"产品":"婴幼少儿 DHA 藻油","论文方向":"儿童成长研究","标题":"DHA 与儿童成长研究","链接":"https://example.com/dha-paper"}',
@@ -249,11 +261,215 @@ class AutonomousWorkerContractTest(unittest.TestCase):
                 )
 
         reply_text = result["reply"]["reply_text"]
-        self.assertIn("相关论文参考：", reply_text)
-        self.assertIn("DHA 与儿童成长研究：https://example.com/dha-paper", reply_text)
+        self.assertNotIn("相关论文参考：", reply_text)
+        self.assertIn("以下为论文研究表明的营养成分科普和产品特点介绍。", reply_text)
+        self.assertIn("婴幼少儿 DHA 藻油：适合儿童成长相关需求。", reply_text)
+        self.assertIn("论文参考：DHA 与儿童成长研究：https://example.com/dha-paper", reply_text)
         self.assertIn(
             {"sheet": "6 论文表", "row": 8, "field": "row", "kb_doc_id": "doc-paper-1"},
             result["reply"]["used_script_sources"],
+        )
+        self.assertTrue(result["validation"]["ok"])
+
+    def test_supplement_non_recommendation_does_not_append_papers(self) -> None:
+        reply = {
+            "action": "send",
+            "reply_text": "DHA 藻油一般建议随餐服用，具体用量可以按产品说明来。",
+            "used_script_sources": [],
+            "used_vector_memories": [],
+            "confidence": 0.9,
+            "commands_run": [],
+            "conflicts": [],
+            "retrieval_summary": "已查询服用方法。",
+            "decision_basis": "回答服用方法，不是推品。",
+        }
+
+        def fake_run(command, **kwargs):
+            out_path = Path(command[command.index("--output-last-message") + 1])
+            out_path.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch("csbot.codex_cli.ensure_model_catalog") as catalog_mock:
+            catalog_mock.return_value.enabled = True
+            catalog_mock.return_value.path = str(Path(self.tmp.name) / "catalog.json")
+            catalog_mock.return_value.generated = False
+            catalog_mock.return_value.error = ""
+            with mock.patch("csbot.autonomous_worker.subprocess.run", side_effect=fake_run):
+                result = run_autonomous_worker(
+                    customer_id="cust-supplement",
+                    query="DHA 藻油怎么吃",
+                    context={"agent_mode": "supplement", "agent_context": {"reply_source": "supplement"}},
+                    db_path=self.db,
+                    timeout=30,
+                )
+
+        reply_text = result["reply"]["reply_text"]
+        self.assertNotIn("以下为论文研究表明", reply_text)
+        self.assertNotIn("论文参考：", reply_text)
+        self.assertNotIn("https://example.com/dha-paper", reply_text)
+
+    def test_supplement_reply_sanitizes_internal_terms(self) -> None:
+        reply = {
+            "action": "send",
+            "reply_text": "知识库中没有记录这个授权信息，建议按免责话术转人工。",
+            "used_script_sources": [],
+            "used_vector_memories": [],
+            "confidence": 0.9,
+            "commands_run": [],
+            "conflicts": [],
+            "retrieval_summary": "查询完成。",
+            "decision_basis": "测试清洗。",
+        }
+
+        def fake_run(command, **kwargs):
+            out_path = Path(command[command.index("--output-last-message") + 1])
+            out_path.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch("csbot.codex_cli.ensure_model_catalog") as catalog_mock:
+            catalog_mock.return_value.enabled = True
+            catalog_mock.return_value.path = str(Path(self.tmp.name) / "catalog.json")
+            catalog_mock.return_value.generated = False
+            catalog_mock.return_value.error = ""
+            with mock.patch("csbot.autonomous_worker.subprocess.run", side_effect=fake_run):
+                result = run_autonomous_worker(
+                    customer_id="cust-supplement",
+                    query="你们对标什么品牌",
+                    context={"agent_mode": "supplement", "agent_context": {"reply_source": "supplement"}},
+                    db_path=self.db,
+                    timeout=30,
+                )
+
+        reply_text = result["reply"]["reply_text"]
+        self.assertNotIn("知识库", reply_text)
+        self.assertNotIn("免责话术", reply_text)
+        self.assertIn("我这边先帮您确认一下", reply_text)
+        self.assertEqual(result["reply"]["action"], "handoff")
+        self.assertTrue(any(item.get("type") == "internal_term_sanitized" for item in result["reply"]["conflicts"]))
+
+    def test_supplement_send_does_not_append_unmatched_paper_fallback(self) -> None:
+        reply = {
+            "action": "send",
+            "reply_text": "结合您的需求，为您推荐这几款产品组合。接下来，我详细为您介绍下：\n综合营养包：适合儿童成长相关需求。",
+            "used_script_sources": [],
+            "used_vector_memories": [],
+            "confidence": 0.9,
+            "commands_run": [],
+            "conflicts": [],
+            "retrieval_summary": "已查询补剂推荐规则。",
+            "decision_basis": "命中儿童成长推荐规则。",
+        }
+
+        def fake_run(command, **kwargs):
+            out_path = Path(command[command.index("--output-last-message") + 1])
+            out_path.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch("csbot.codex_cli.ensure_model_catalog") as catalog_mock:
+            catalog_mock.return_value.enabled = True
+            catalog_mock.return_value.path = str(Path(self.tmp.name) / "catalog.json")
+            catalog_mock.return_value.generated = False
+            catalog_mock.return_value.error = ""
+            with mock.patch("csbot.autonomous_worker.subprocess.run", side_effect=fake_run):
+                result = run_autonomous_worker(
+                    customer_id="cust-supplement",
+                    query="儿童成长 推荐",
+                    context={"agent_mode": "supplement", "agent_context": {"reply_source": "supplement"}},
+                    db_path=self.db,
+                    timeout=30,
+                )
+
+        reply_text = result["reply"]["reply_text"]
+        self.assertNotIn("相关论文参考：", reply_text)
+        self.assertNotIn("论文参考：", reply_text)
+        self.assertNotIn("https://example.com/dha-paper", reply_text)
+        self.assertNotIn(
+            {"sheet": "6 论文表", "row": 8, "field": "row", "kb_doc_id": "doc-paper-1"},
+            result["reply"]["used_script_sources"],
+        )
+        self.assertTrue(result["validation"]["ok"])
+
+    def test_supplement_brand_auth_reply_is_constrained_to_product_profile(self) -> None:
+        reply = {
+            "action": "send",
+            "reply_text": "女维对标国际品牌X，并有品牌X授权。",
+            "used_script_sources": [
+                {"sheet": "5 产品常规信息", "row": 3, "field": "row", "kb_doc_id": "doc-brand-profile-1"}
+            ],
+            "used_vector_memories": [],
+            "confidence": 0.9,
+            "commands_run": [],
+            "conflicts": [],
+            "retrieval_summary": "查询 5 产品常规信息。",
+            "decision_basis": "命中 5 产品常规信息。",
+        }
+
+        def fake_run(command, **kwargs):
+            out_path = Path(command[command.index("--output-last-message") + 1])
+            out_path.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch("csbot.codex_cli.ensure_model_catalog") as catalog_mock:
+            catalog_mock.return_value.enabled = True
+            catalog_mock.return_value.path = str(Path(self.tmp.name) / "catalog.json")
+            catalog_mock.return_value.generated = False
+            catalog_mock.return_value.error = ""
+            with mock.patch("csbot.autonomous_worker.subprocess.run", side_effect=fake_run):
+                result = run_autonomous_worker(
+                    customer_id="cust-supplement",
+                    query="女维对标什么品牌，有授权吗",
+                    context={"agent_mode": "supplement", "agent_context": {"reply_source": "supplement"}},
+                    db_path=self.db,
+                    timeout=30,
+                )
+
+        reply_text = result["reply"]["reply_text"]
+        self.assertIn("产品常用名：女维", reply_text)
+        self.assertIn("品牌授权：营养工厂自有产品授权信息以页面为准", reply_text)
+        self.assertNotIn("国际品牌X", reply_text)
+        self.assertTrue(
+            any(item.get("type") == "brand_auth_reply_constrained_to_fact_rows" for item in result["reply"]["conflicts"])
+        )
+        self.assertTrue(result["validation"]["ok"])
+
+    def test_supplement_brand_auth_reply_without_product_profile_or_brand_source_handoffs(self) -> None:
+        reply = {
+            "action": "send",
+            "reply_text": "女维对标国际品牌X，并有品牌X授权。",
+            "used_script_sources": [
+                {"sheet": "6 论文表", "row": 8, "field": "row", "kb_doc_id": "doc-paper-1"}
+            ],
+            "used_vector_memories": [],
+            "confidence": 0.9,
+            "commands_run": [],
+            "conflicts": [],
+            "retrieval_summary": "误用论文表。",
+            "decision_basis": "模型误判。",
+        }
+
+        def fake_run(command, **kwargs):
+            out_path = Path(command[command.index("--output-last-message") + 1])
+            out_path.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch("csbot.codex_cli.ensure_model_catalog") as catalog_mock:
+            catalog_mock.return_value.enabled = True
+            catalog_mock.return_value.path = str(Path(self.tmp.name) / "catalog.json")
+            catalog_mock.return_value.generated = False
+            catalog_mock.return_value.error = ""
+            with mock.patch("csbot.autonomous_worker.subprocess.run", side_effect=fake_run):
+                result = run_autonomous_worker(
+                    customer_id="cust-supplement",
+                    query="女维对标什么品牌，有授权吗",
+                    context={"agent_mode": "supplement", "agent_context": {"reply_source": "supplement"}},
+                    db_path=self.db,
+                    timeout=30,
+                )
+
+        self.assertEqual(result["reply"]["action"], "handoff")
+        self.assertNotIn("国际品牌X", result["reply"]["reply_text"])
+        self.assertTrue(
+            any(item.get("type") == "brand_auth_missing_fact_source" for item in result["reply"]["conflicts"])
         )
         self.assertTrue(result["validation"]["ok"])
 
@@ -353,6 +569,59 @@ class AutonomousWorkerContractTest(unittest.TestCase):
         self.assertEqual(captured["command"][captured["command"].index("--model") + 1], "deepseek-v4-flash")
         self.assertFalse(any(str(arg).startswith("@") for arg in captured["command"]))
         self.assertFalse(result["codex_cli"]["supports_images"])
+
+    def test_pi_worker_writes_invocation_log_when_enabled(self) -> None:
+        reply = autonomous_reply()
+        log_dir = Path(self.tmp.name) / "pi-logs"
+
+        def fake_run(command, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(reply, ensure_ascii=False),
+                stderr="api_key=sk-testsecret123456",
+            )
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "CSBOT_AUTONOMOUS_PROVIDER": "pi",
+                "CSBOT_PI_COMMAND": "/opt/homebrew/bin/pi",
+                "CSBOT_PI_PROVIDER": "uda-openai",
+                "CSBOT_PI_TEXT_MODEL": "deepseek-v4-flash",
+                "CSBOT_PI_LOG_DIR": str(log_dir),
+            },
+            clear=False,
+        ):
+            with mock.patch("csbot.autonomous_worker.subprocess.run", side_effect=fake_run):
+                result = run_autonomous_worker(
+                    customer_id="cust-1",
+                    query="鱼油怎么吃",
+                    context={
+                        "agent_mode": "supplement",
+                        "agent_context": {"reply_source": "supplement", "stage": "digging_need"},
+                        "messages": [{"role": "用户", "text": "鱼油怎么吃"}],
+                    },
+                    db_path=self.db,
+                    timeout=30,
+                )
+
+        log_path = log_dir / "invocations.jsonl"
+        self.assertTrue(log_path.exists())
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["event"], "pi_autonomous_worker")
+        self.assertEqual(payload["provider"], "pi")
+        self.assertEqual(payload["model"], "deepseek-v4-flash")
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertEqual(payload["validation"]["ok"], True)
+        self.assertEqual(payload["reply"]["action"], "send")
+        self.assertEqual(payload["context"]["agent_mode"], "supplement")
+        self.assertEqual(payload["context"]["stage"], "digging_need")
+        self.assertIn("api_key=***", payload["stderr"])
+        self.assertNotIn("sk-testsecret123456", lines[0])
+        self.assertEqual(result["reply"], reply)
 
     def test_autonomous_worker_records_local_handoff_action(self) -> None:
         reply = {

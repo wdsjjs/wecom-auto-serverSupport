@@ -17,11 +17,13 @@ from cli_anything.wecom_gui.core.text import clean_customer_reply_text, clean_hi
 
 ACTIVE_STATUSES = {"processing", "reading", "drafting", "ready", "approved", "sending"}
 REPLACEABLE_ACTIVE_STATUSES = {"processing", "reading", "drafting"}
+REPLY_PREVIEW_PROTECTED_STATUSES = {"ready", "approved", "sending", "done", "failed"}
 DONE_REOPEN_COOLDOWN_SECONDS = 60.0
 HANDOFF_TERMS = ("人工", "转人工", "人工客服")
 HANDOFF_WAITING_ERROR = "handoff_waiting"
 HANDOFF_NEW_MESSAGE_ERROR = "handoff_new_message"
 HANDOFF_SESSION_SECONDS = 600.0
+HANDOFF_VISIBLE_STATUSES = {"pending", "processing", "reading", "drafting", "ready", "approved", "sending", "failed"}
 LATENCY_BUCKETS = (
     (5_000, "0-5s"),
     (15_000, "5-15s"),
@@ -374,6 +376,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         ON reply_issue_tasks(status, updated_at)
         """
     )
+    _collapse_visible_conversation_keys_by_title(conn)
     conn.commit()
 
 
@@ -537,24 +540,18 @@ def _short_hash(value: str) -> str:
 
 def conversation_key_for_row(row: dict) -> str:
     """Return the queue isolation key for a visible WeCom conversation row."""
-    for key in (
-        "conversation_key",
-        "external_userid",
-        "external_user_id",
-        "externalUserId",
-        "uid",
-        "user_id",
-        "conversation_id",
-        "chat_id",
-    ):
+    explicit_key = _clean_key_part(row.get("conversation_key"))
+    if explicit_key:
+        return explicit_key
+    for key in ("external_userid", "external_user_id", "externalUserId", "uid", "user_id"):
         value = _clean_key_part(row.get(key))
         if value:
-            if key == "conversation_key":
-                return value
-            prefix = "uid" if "user" in key.lower() or key == "uid" else "conversation"
-            return f"{prefix}:{value}"
+            return f"uid:{value}"
 
     title = _clean_key_part(row.get("title"))
+    if title:
+        return _legacy_conversation_key(title)
+
     tags = ",".join(_clean_key_part(tag) for tag in row.get("tags", []) if _clean_key_part(tag))
     source = _clean_key_part(row.get("source"))
     slot = ""
@@ -986,6 +983,258 @@ def _update_visible_row(conn: sqlite3.Connection, row: dict, signature: str, now
     )
 
 
+def _append_preview_customer_message(
+    conn: sqlite3.Connection,
+    *,
+    row: dict,
+    conversation_key: str,
+    job_id: int | None,
+    message_hash: str,
+    now: float,
+) -> None:
+    preview = clean_history_message_text(row.get("preview") or "")
+    conversation_key = str(conversation_key or "").strip()
+    if not conversation_key or not preview:
+        return
+    last = conn.execute(
+        """
+        SELECT text, message_type
+        FROM conversation_messages
+        WHERE conversation_key = ?
+        ORDER BY seq DESC, id DESC
+        LIMIT 1
+        """,
+        (conversation_key,),
+    ).fetchone()
+    if (
+        last is not None
+        and str(last["message_type"] or "") == "customer"
+        and str(last["text"] or "") == preview
+    ):
+        return
+    seq_row = conn.execute(
+        "SELECT COALESCE(MAX(seq), -1) + 1 AS next_seq FROM conversation_messages WHERE conversation_key = ?",
+        (conversation_key,),
+    ).fetchone()
+    seq = int(seq_row["next_seq"] if seq_row else 0)
+    raw = {"source": "unread-preview", "row": row}
+    conn.execute(
+        """
+        INSERT INTO conversation_messages
+            (conversation_key, job_id, message_hash, seq, role, text,
+             time_text, source, role_confidence, message_type, media_json,
+             raw_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            conversation_key,
+            job_id,
+            message_hash,
+            seq,
+            "用户",
+            preview,
+            str(row.get("time") or ""),
+            "unread-preview",
+            "low",
+            "customer",
+            "[]",
+            json.dumps(raw, ensure_ascii=False),
+            now,
+        ),
+    )
+
+
+def _move_conversation_related_records(
+    conn: sqlite3.Connection,
+    *,
+    source_key: str,
+    target_key: str,
+    source_job_id: int | None,
+    target_job_id: int | None,
+) -> None:
+    source_value = str(source_key or "").strip()
+    target_value = str(target_key or "").strip()
+    if not source_value or not target_value or source_value == target_value:
+        return
+    conn.execute(
+        "UPDATE conversation_messages SET conversation_key = ?, job_id = ? WHERE conversation_key = ?",
+        (target_value, target_job_id, source_value),
+    )
+    conn.execute(
+        """
+        UPDATE metric_events
+        SET conversation_key = ?,
+            job_id = CASE WHEN job_id IS NULL OR job_id = ? THEN ? ELSE job_id END
+        WHERE conversation_key = ?
+        """,
+        (target_value, source_job_id, target_job_id, source_value),
+    )
+    conn.execute(
+        "UPDATE reply_issue_tasks SET conversation_key = ?, job_id = ? WHERE conversation_key = ?",
+        (target_value, target_job_id, source_value),
+    )
+    target_metric = conn.execute(
+        "SELECT 1 FROM conversation_metric_state WHERE conversation_key = ?",
+        (target_value,),
+    ).fetchone()
+    if target_metric is None:
+        conn.execute(
+            "UPDATE conversation_metric_state SET conversation_key = ? WHERE conversation_key = ?",
+            (target_value, source_value),
+        )
+    else:
+        conn.execute("DELETE FROM conversation_metric_state WHERE conversation_key = ?", (source_value,))
+    conn.execute(
+        "UPDATE supplement_agent_logs SET conversation_key = ?, job_id = ? WHERE conversation_key = ?",
+        (target_value, target_job_id, source_value),
+    )
+    conn.execute(
+        "UPDATE supplement_full_test_logs SET conversation_key = ?, job_id = ? WHERE conversation_key = ?",
+        (target_value, target_job_id, source_value),
+    )
+    _move_welcome_state_key(conn, source_key=source_value, target_key=target_value, job_id=target_job_id)
+    _move_supplement_state_key(conn, source_key=source_value, target_key=target_value, job_id=target_job_id)
+
+
+def _merge_reply_queue_row(
+    conn: sqlite3.Connection,
+    *,
+    source: sqlite3.Row,
+    target: sqlite3.Row,
+    target_key: str,
+    now: float,
+) -> sqlite3.Row | None:
+    source_key = str(source["conversation_key"] or "")
+    target_id = int(target["id"])
+    source_is_newer = float(source["updated_at"] or 0) >= float(target["updated_at"] or 0)
+    if source_is_newer:
+        target_is_handoff = bool(str(target["handoff_type"] or "").strip())
+        merged_handoff_type = str(source["handoff_type"] or target["handoff_type"] or "")
+        merged_handoff_reason = str(source["handoff_reason"] or target["handoff_reason"] or "")
+        merged_reply_text = source["reply_text"]
+        merged_reply_attachments = source["reply_attachments_json"]
+        if target_is_handoff and not str(source["reply_text"] or "").strip():
+            merged_reply_text = target["reply_text"]
+            if str(source["reply_attachments_json"] or "[]") == "[]":
+                merged_reply_attachments = target["reply_attachments_json"]
+        conn.execute(
+            """
+            UPDATE reply_queue
+            SET title = ?, preview = ?, time_text = ?, tags_json = ?, raw_json = ?,
+                signature = ?, status = ?, attempts = ?, last_message_hash = ?,
+                context_json = ?, click_x = ?, click_y = ?, source = ?,
+                reply_text = ?, handoff_type = ?, handoff_reason = ?,
+                reply_source = ?, reply_attachments_json = ?, error = ?,
+                locked_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                source["title"],
+                source["preview"],
+                source["time_text"],
+                source["tags_json"],
+                source["raw_json"],
+                source["signature"],
+                source["status"],
+                source["attempts"],
+                source["last_message_hash"],
+                source["context_json"],
+                source["click_x"],
+                source["click_y"],
+                source["source"],
+                merged_reply_text,
+                merged_handoff_type,
+                merged_handoff_reason,
+                source["reply_source"],
+                merged_reply_attachments,
+                source["error"],
+                source["locked_at"],
+                now,
+                target_id,
+            ),
+        )
+    _move_conversation_related_records(
+        conn,
+        source_key=source_key,
+        target_key=target_key,
+        source_job_id=int(source["id"]),
+        target_job_id=target_id,
+    )
+    conn.execute("DELETE FROM reply_queue WHERE id = ?", (source["id"],))
+    return conn.execute("SELECT * FROM reply_queue WHERE id = ?", (target_id,)).fetchone()
+
+
+def _collapse_visible_conversation_keys_by_title(conn: sqlite3.Connection) -> None:
+    """Move old visible-position rows to the current title fallback key."""
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM reply_queue
+        WHERE conversation_key LIKE 'visible:%'
+          AND TRIM(title) != ''
+        ORDER BY title ASC, updated_at DESC, id DESC
+        """
+    ).fetchall()
+    now = time.time()
+    for source in rows:
+        source_key = str(source["conversation_key"] or "")
+        target_key = _legacy_conversation_key(source["title"])
+        if not target_key or source_key == target_key:
+            continue
+        target = conn.execute("SELECT * FROM reply_queue WHERE conversation_key = ?", (target_key,)).fetchone()
+        if target is None:
+            conn.execute(
+                "UPDATE reply_queue SET conversation_key = ?, updated_at = ? WHERE id = ?",
+                (target_key, now, source["id"]),
+            )
+            _move_conversation_related_records(
+                conn,
+                source_key=source_key,
+                target_key=target_key,
+                source_job_id=int(source["id"]),
+                target_job_id=int(source["id"]),
+            )
+            continue
+        if int(target["id"]) == int(source["id"]):
+            continue
+        _merge_reply_queue_row(conn, source=source, target=target, target_key=target_key, now=now)
+
+
+def _merge_title_fallback_into_uid(
+    conn: sqlite3.Connection,
+    *,
+    row: dict,
+    uid_key: str,
+    existing: sqlite3.Row | None,
+    now: float,
+) -> sqlite3.Row | None:
+    if not uid_key.startswith("uid:"):
+        return existing
+    title = _clean_key_part(row.get("title"))
+    if not title:
+        return existing
+    source_key = _legacy_conversation_key(title)
+    if source_key == uid_key:
+        return existing
+    source = conn.execute("SELECT * FROM reply_queue WHERE conversation_key = ?", (source_key,)).fetchone()
+    if source is None or (existing is not None and int(source["id"]) == int(existing["id"])):
+        return existing
+    if existing is None:
+        conn.execute(
+            "UPDATE reply_queue SET conversation_key = ?, updated_at = ? WHERE id = ?",
+            (uid_key, now, source["id"]),
+        )
+        _move_conversation_related_records(
+            conn,
+            source_key=source_key,
+            target_key=uid_key,
+            source_job_id=int(source["id"]),
+            target_job_id=int(source["id"]),
+        )
+        return conn.execute("SELECT * FROM reply_queue WHERE id = ?", (source["id"],)).fetchone()
+    return _merge_reply_queue_row(conn, source=source, target=existing, target_key=uid_key, now=now)
+
+
 def _record_customer_message_metric(
     conn: sqlite3.Connection,
     *,
@@ -1051,7 +1300,27 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
             "SELECT * FROM reply_queue WHERE conversation_key = ?",
             (conversation_key,),
         ).fetchone()
+        existing = _merge_title_fallback_into_uid(
+            conn,
+            row=row,
+            uid_key=conversation_key,
+            existing=existing,
+            now=now,
+        )
         if existing and existing["signature"] == signature:
+            existing_reply_text = str(existing["reply_text"] or "").strip()
+            preview_text = str(row.get("preview", "")).strip()
+            if (
+                existing["status"] in REPLY_PREVIEW_PROTECTED_STATUSES
+                and existing_reply_text
+                and existing_reply_text == preview_text
+            ):
+                _update_visible_row(conn, row, signature, now, conversation_key)
+                item = conn.execute(
+                    "SELECT * FROM reply_queue WHERE conversation_key = ?",
+                    (conversation_key,),
+                ).fetchone()
+                return False, _row_to_dict(item)
             handoff_session_active = _handoff_session_active(existing, now=now)
             can_reopen_done = (
                 existing["status"] == "done"
@@ -1112,8 +1381,6 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
             existing_reply_text = str(existing["reply_text"] or "").strip()
             if (
                 existing_handoff_type
-                and existing["status"] == "ready"
-                and existing_error == HANDOFF_WAITING_ERROR
                 and existing_reply_text
                 and preview_text == existing_reply_text
             ):
@@ -1141,7 +1408,7 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
                     (conversation_key,),
                 ).fetchone()
                 return False, _row_to_dict(item)
-            if existing_handoff_type and existing["status"] == "ready" and row_has_unread and not same_preview:
+            if existing_handoff_type and row_has_unread and not same_preview:
                 _update_visible_row(conn, row, signature, now, conversation_key)
                 conn.execute(
                     """
@@ -1153,6 +1420,44 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
                     WHERE conversation_key = ?
                     """,
                     (HANDOFF_NEW_MESSAGE_ERROR, now, conversation_key),
+                )
+                item = conn.execute(
+                    "SELECT * FROM reply_queue WHERE conversation_key = ?",
+                    (conversation_key,),
+                ).fetchone()
+                _append_preview_customer_message(
+                    conn,
+                    row=row,
+                    conversation_key=conversation_key,
+                    job_id=item["id"] if item else None,
+                    message_hash=signature,
+                    now=now,
+                )
+                _record_customer_message_metric(
+                    conn,
+                    row=row,
+                    conversation_key=conversation_key,
+                    job_id=item["id"] if item else None,
+                    now=now,
+                )
+                return True, _row_to_dict(item)
+            if (
+                existing["status"] == "ready"
+                and row_has_unread
+                and not same_preview
+                and str(existing["reply_source"] or "").strip() in {"welcome", SUPPLEMENT_REPLY_SOURCE}
+            ):
+                _update_visible_row(conn, row, signature, now, conversation_key)
+                conn.execute(
+                    """
+                    UPDATE reply_queue
+                    SET status = 'pending', error = ?, locked_at = NULL,
+                        context_json = NULL, last_message_hash = NULL,
+                        reply_text = NULL, reply_attachments_json = '[]',
+                        updated_at = ?
+                    WHERE conversation_key = ?
+                    """,
+                    ("fixed_reply_superseded_by_customer_message", now, conversation_key),
                 )
                 item = conn.execute(
                     "SELECT * FROM reply_queue WHERE conversation_key = ?",
@@ -1196,7 +1501,7 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
             return False, _row_to_dict(existing)
         if (
             existing
-            and existing["status"] == "done"
+            and existing["status"] in REPLY_PREVIEW_PROTECTED_STATUSES
             and (existing["reply_text"] or "").strip()
             and (existing["reply_text"] or "").strip() == str(row.get("preview", "")).strip()
         ):
@@ -1772,87 +2077,26 @@ def upgrade_job_conversation_key_to_uid(job_id: int, uid: str) -> dict | None:
             return _row_to_dict(source)
         target = conn.execute("SELECT * FROM reply_queue WHERE conversation_key = ?", (target_key,)).fetchone()
         if target is not None and int(target["id"]) != int(job_id):
-            source_is_newer = float(source["updated_at"] or 0) >= float(target["updated_at"] or 0)
-            if source_is_newer:
-                target_is_handoff = bool(str(target["handoff_type"] or "").strip())
-                merged_handoff_type = str(source["handoff_type"] or target["handoff_type"] or "")
-                merged_handoff_reason = str(source["handoff_reason"] or target["handoff_reason"] or "")
-                merged_reply_text = source["reply_text"]
-                merged_reply_attachments = source["reply_attachments_json"]
-                if target_is_handoff and not str(source["reply_text"] or "").strip():
-                    merged_reply_text = target["reply_text"]
-                    if str(source["reply_attachments_json"] or "[]") == "[]":
-                        merged_reply_attachments = target["reply_attachments_json"]
-                conn.execute(
-                    """
-                    UPDATE reply_queue
-                    SET title = ?, preview = ?, time_text = ?, tags_json = ?, raw_json = ?,
-                        signature = ?, status = ?, attempts = ?, last_message_hash = ?,
-                        context_json = ?, click_x = ?, click_y = ?, source = ?,
-                        reply_text = ?, handoff_type = ?, handoff_reason = ?,
-                        reply_source = ?, reply_attachments_json = ?, error = ?,
-                        locked_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        source["title"],
-                        source["preview"],
-                        source["time_text"],
-                        source["tags_json"],
-                        source["raw_json"],
-                        source["signature"],
-                        source["status"],
-                        source["attempts"],
-                        source["last_message_hash"],
-                        source["context_json"],
-                        source["click_x"],
-                        source["click_y"],
-                        source["source"],
-                        merged_reply_text,
-                        merged_handoff_type,
-                        merged_handoff_reason,
-                        source["reply_source"],
-                        merged_reply_attachments,
-                        source["error"],
-                        source["locked_at"],
-                        now,
-                        target["id"],
-                    ),
-                )
-            conn.execute(
-                "UPDATE conversation_messages SET conversation_key = ?, job_id = ? WHERE conversation_key = ?",
-                (target_key, target["id"], source_key),
+            row = _merge_reply_queue_row(
+                conn,
+                source=source,
+                target=target,
+                target_key=target_key,
+                now=now,
             )
-            conn.execute(
-                """
-                UPDATE metric_events
-                SET conversation_key = ?,
-                    job_id = CASE WHEN job_id IS NULL OR job_id = ? THEN ? ELSE job_id END
-                WHERE conversation_key = ?
-                """,
-                (target_key, job_id, target["id"], source_key),
-            )
-            conn.execute(
-                "UPDATE reply_issue_tasks SET conversation_key = ?, job_id = ? WHERE conversation_key = ?",
-                (target_key, target["id"], source_key),
-            )
-            conn.execute("DELETE FROM conversation_metric_state WHERE conversation_key = ?", (source_key,))
-            _move_welcome_state_key(conn, source_key=source_key, target_key=target_key, job_id=target["id"])
-            _move_supplement_state_key(conn, source_key=source_key, target_key=target_key, job_id=target["id"])
-            conn.execute("DELETE FROM reply_queue WHERE id = ?", (job_id,))
-            row = conn.execute("SELECT * FROM reply_queue WHERE id = ?", (target["id"],)).fetchone()
             return _row_to_dict(row) if row else None
 
         conn.execute(
             "UPDATE reply_queue SET conversation_key = ?, updated_at = ? WHERE id = ?",
             (target_key, now, job_id),
         )
-        conn.execute("UPDATE conversation_messages SET conversation_key = ? WHERE conversation_key = ?", (target_key, source_key))
-        conn.execute("UPDATE metric_events SET conversation_key = ? WHERE conversation_key = ?", (target_key, source_key))
-        conn.execute("UPDATE reply_issue_tasks SET conversation_key = ? WHERE conversation_key = ?", (target_key, source_key))
-        conn.execute("UPDATE conversation_metric_state SET conversation_key = ? WHERE conversation_key = ?", (target_key, source_key))
-        _move_welcome_state_key(conn, source_key=source_key, target_key=target_key, job_id=job_id)
-        _move_supplement_state_key(conn, source_key=source_key, target_key=target_key, job_id=job_id)
+        _move_conversation_related_records(
+            conn,
+            source_key=source_key,
+            target_key=target_key,
+            source_job_id=job_id,
+            target_job_id=job_id,
+        )
         row = conn.execute("SELECT * FROM reply_queue WHERE id = ?", (job_id,)).fetchone()
         return _row_to_dict(row) if row else None
 
@@ -1870,13 +2114,15 @@ def handoff_pending_count() -> int:
     """Return active items that require manual handoff handling."""
     expire_stale_handoffs()
     with connect() as conn:
+        placeholders = ",".join("?" for _ in HANDOFF_VISIBLE_STATUSES)
         row = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS count
             FROM reply_queue
-            WHERE status IN ('ready', 'approved', 'sending')
+            WHERE status IN ({placeholders})
               AND COALESCE(handoff_type, '') != ''
-            """
+            """,
+            tuple(HANDOFF_VISIBLE_STATUSES),
         ).fetchone()
     return int(row["count"] if row else 0)
 
@@ -1885,16 +2131,16 @@ def handoff_attention_count() -> int:
     """Return handoff items where the customer has sent a new message."""
     expire_stale_handoffs()
     with connect() as conn:
+        placeholders = ",".join("?" for _ in HANDOFF_VISIBLE_STATUSES)
         row = conn.execute(
-            """
+            f"""
             SELECT COUNT(*) AS count
             FROM reply_queue
-            WHERE status = 'ready'
+            WHERE status IN ({placeholders})
               AND COALESCE(handoff_type, '') != ''
               AND error = ?
-            """
-            ,
-            (HANDOFF_NEW_MESSAGE_ERROR,),
+            """,
+            (*tuple(HANDOFF_VISIBLE_STATUSES), HANDOFF_NEW_MESSAGE_ERROR),
         ).fetchone()
     return int(row["count"] if row else 0)
 
@@ -1927,16 +2173,23 @@ def list_ready_for_review(*, handoff: bool = False, limit: int = 100) -> list[di
     expire_stale_handoffs()
     with connect() as conn:
         if handoff:
+            placeholders = ",".join("?" for _ in HANDOFF_VISIBLE_STATUSES)
             rows = conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM reply_queue
-                WHERE status IN ('ready', 'approved', 'sending')
+                WHERE status IN ({placeholders})
                   AND COALESCE(handoff_type, '') != ''
-                ORDER BY updated_at DESC
+                ORDER BY
+                  CASE
+                    WHEN error = ? THEN 0
+                    WHEN status IN ('pending', 'reading', 'drafting') THEN 1
+                    ELSE 2
+                  END,
+                  updated_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (*tuple(HANDOFF_VISIBLE_STATUSES), HANDOFF_NEW_MESSAGE_ERROR, limit),
             ).fetchall()
             return [_row_to_dict(row) for row in rows]
         rows = conn.execute(
@@ -2119,6 +2372,7 @@ def claim_ready_to_send() -> dict | None:
             FROM reply_queue
             WHERE status = 'ready'
               AND COALESCE(handoff_type, '') = ''
+              AND COALESCE(reply_source, '') NOT IN ('welcome', 'supplement')
             ORDER BY updated_at ASC
             LIMIT 1
             """
@@ -2520,6 +2774,7 @@ def mark_handoff_pending(
         kind = "indirect"
     reason = str(handoff_reason or "").strip() or "需要人工处理"
     final_reply = clean_customer_reply_text(reply_text)
+    reply_source = "ai" if final_reply else "human"
     now = time.time()
     with connect() as conn:
         row = conn.execute(
@@ -2531,12 +2786,12 @@ def mark_handoff_pending(
         conn.execute(
             """
             UPDATE reply_queue
-            SET status = 'ready', reply_text = ?, reply_source = 'ai',
+            SET status = 'ready', reply_text = ?, reply_source = ?,
                 handoff_type = ?, handoff_reason = ?, error = NULL,
                 locked_at = NULL, updated_at = ?
             WHERE id = ?
             """,
-            (final_reply, kind, reason, now, job_id),
+            (final_reply or None, reply_source, kind, reason, now, job_id),
         )
         _record_metric_event(
             conn,
@@ -2544,7 +2799,7 @@ def mark_handoff_pending(
             conversation_key=conversation_key,
             conversation=conversation,
             job_id=job_id,
-            reply_source="ai",
+            reply_source=reply_source,
             handoff_type=kind,
             duration_ms=duration_ms,
             details={"action": "handoff", "reason": reason, "reply_preview": final_reply[:240]},
@@ -2568,7 +2823,7 @@ def mark_handoff_pending(
                 conversation_key=conversation_key,
                 conversation=conversation,
                 job_id=job_id,
-                reply_source="ai",
+                reply_source=reply_source,
                 handoff_type=kind,
                 duration_ms=duration_ms,
                 details={"reason": reason},
@@ -2698,12 +2953,22 @@ def mark_approved(job_id: int, *, reply_text: str | None = None, attachments: li
                 details={"action": "approve"},
                 created_at=now,
             )
-        if cur.rowcount == 1 and (is_handoff or reply_was_edited):
+        if cur.rowcount == 1 and is_handoff:
+            _append_conversation_reply(
+                conn,
+                conversation_key=str(row["conversation_key"] or ""),
+                job_id=job_id,
+                message_hash="",
+                reply_text=final_reply,
+                attachments=final_attachments,
+                now=now,
+            )
+        if cur.rowcount == 1 and reply_was_edited and not is_handoff:
             create_reply_issue_task(
                 job_id=job_id,
                 conversation_key=str(row["conversation_key"] or ""),
                 conversation=str(row["title"] or ""),
-                source="handoff_reply" if is_handoff else "review_edit",
+                source="review_edit",
                 original_reply=previous_reply,
                 final_reply=final_reply,
                 attachments=final_attachments,
@@ -2841,6 +3106,42 @@ def mark_approved_retry(job_id: int, *, reply_text: str, reason: str = "") -> No
         )
 
 
+def mark_send_verification_failed(job_id: int, *, reply_text: str, reason: str = "sent_reply_not_visible") -> None:
+    """Return a failed send to review without recording it as sent or re-pasting automatically."""
+    final_reply = clean_customer_reply_text(reply_text)
+    now = time.time()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT conversation_key, title, reply_source, handoff_type FROM reply_queue WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return
+        is_handoff = bool(str(row["handoff_type"] or "").strip())
+        next_status = "ready" if is_handoff else "failed"
+        next_reply_source = str(row["reply_source"] or "").strip() or ("human" if is_handoff else "ai")
+        conn.execute(
+            """
+            UPDATE reply_queue
+            SET status = ?, reply_text = ?, reply_source = ?,
+                error = ?, locked_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (next_status, final_reply, next_reply_source, reason or "sent_reply_not_visible", now, job_id),
+        )
+        _record_metric_event(
+            conn,
+            event_type="agent_send_verification_failed",
+            conversation_key=str(row["conversation_key"] or ""),
+            conversation=str(row["title"] or ""),
+            job_id=job_id,
+            reply_source=next_reply_source,
+            handoff_type=str(row["handoff_type"] or ""),
+            details={"reason": reason or "sent_reply_not_visible", "reply_preview": final_reply[:240]},
+            created_at=now,
+        )
+
+
 def reject_ready(job_id: int, reason: str = "review_rejected") -> bool:
     """Reject a ready reply from the review UI."""
     now = time.time()
@@ -2907,6 +3208,7 @@ def mark_done(
     reply_text: str | None = None,
     reply_source: str | None = None,
     attachments: list[dict] | None = None,
+    reply_parts: list[str] | None = None,
     duration_ms: float | int | None = None,
 ) -> None:
     final_reply = clean_customer_reply_text(reply_text) if reply_text is not None else None
@@ -2927,15 +3229,20 @@ def mark_done(
             (message_hash, final_reply, final_reply_source, now, job_id),
         )
         if row is not None:
-            _append_conversation_reply(
-                conn,
-                conversation_key=str(row["conversation_key"] or ""),
-                job_id=job_id,
-                message_hash=message_hash or "",
-                reply_text=final_reply,
-                attachments=attachments,
-                now=now,
-            )
+            parts = [clean_customer_reply_text(part) for part in (reply_parts or [])]
+            parts = [part for part in parts if part]
+            if not parts:
+                parts = [final_reply or ""]
+            for index, part in enumerate(parts):
+                _append_conversation_reply(
+                    conn,
+                    conversation_key=str(row["conversation_key"] or ""),
+                    job_id=job_id,
+                    message_hash=message_hash or "",
+                    reply_text=part,
+                    attachments=attachments if index == len(parts) - 1 else [],
+                    now=now,
+                )
             _set_last_reply_source(
                 conn,
                 conversation_key=str(row["conversation_key"] or ""),

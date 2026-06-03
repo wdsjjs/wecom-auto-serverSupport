@@ -254,6 +254,7 @@ class DualRetrievalTest(unittest.TestCase):
             ("product_profile", "5 产品常规信息"),
             ("safety_policy", "7 L0级注意事项"),
             ("research_evidence", "6 论文表"),
+            ("brand_comparison", "对标品牌与授权（有部分重复信息）"),
         }
         self.assertTrue(
             {
@@ -269,6 +270,17 @@ class DualRetrievalTest(unittest.TestCase):
         self.assertTrue(paper_hits)
         self.assertEqual(paper_hits[0]["source"]["sheet"], "6 论文表")
         self.assertEqual(paper_hits[0]["facts"]["链接"], "https://example.com/dha-paper")
+
+    def test_supplement_scope_includes_brand_comparison(self) -> None:
+        result = script_search("女维 对标品牌 授权", self.db, {"scope": "supplement"})
+
+        brand_hits = [hit for hit in result["hits"] if hit["business_type"] == "brand_comparison"]
+        product_hits = [hit for hit in result["hits"] if hit["business_type"] == "product_profile"]
+        self.assertTrue(product_hits)
+        self.assertEqual(product_hits[0]["source"]["sheet"], "5 产品常规信息")
+        self.assertTrue(brand_hits)
+        self.assertEqual(brand_hits[0]["source"]["sheet"], "对标品牌与授权（有部分重复信息）")
+        self.assertEqual(brand_hits[0]["facts"]["对标品牌"], "对标品牌A")
 
     def test_fish_shipping_is_ambiguous(self) -> None:
         result = retrieve(customer_id="cust-2", query="鱼油发货时间", db_path=self.db, context={})

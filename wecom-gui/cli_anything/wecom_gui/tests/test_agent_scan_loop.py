@@ -513,7 +513,7 @@ def test_scan_once_tolerates_scroll_failure(monkeypatch, tmp_path):
 def test_agent_loop_only_deep_scans_on_interval(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     pages_used = []
-    times = iter([0, 0.5, 1.0])
+    clock = {"value": 0.0}
 
     reset_values = []
     monkeypatch.setenv("WECOM_GUI_CODEX_TIMEOUT", "300")
@@ -548,11 +548,21 @@ def test_agent_loop_only_deep_scans_on_interval(monkeypatch, tmp_path):
     )
     monkeypatch.setattr("cli_anything.wecom_gui.core.agent._log_heartbeat", lambda **kwargs: None)
     monkeypatch.setattr("cli_anything.wecom_gui.core.agent._log", lambda message: None)
-    def fake_sleep(seconds):
-        if len(pages_used) >= 3:
-            raise StopIteration
 
-    monkeypatch.setattr("cli_anything.wecom_gui.core.agent.time.time", lambda: next(times))
+    class StopLoop(Exception):
+        pass
+
+    sleep_calls = {"count": 0}
+
+    def fake_sleep(seconds):
+        sleep_calls["count"] += 1
+        clock["value"] += 0.5
+        if len(pages_used) >= 3:
+            raise StopLoop
+        if sleep_calls["count"] > 5:
+            raise AssertionError("agent_loop did not reach the expected finite scan count")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.agent.time.time", lambda: clock["value"])
     monkeypatch.setattr("cli_anything.wecom_gui.core.agent.time.sleep", fake_sleep)
 
     try:
@@ -568,7 +578,7 @@ def test_agent_loop_only_deep_scans_on_interval(monkeypatch, tmp_path):
             deep_scan_interval=30,
             once=False,
         )
-    except StopIteration:
+    except StopLoop:
         pass
 
     assert pages_used == [3, 1, 1]

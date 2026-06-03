@@ -32,7 +32,7 @@ def test_review_mode_does_not_send_unapproved_ready_reply(monkeypatch, tmp_path)
     sent = []
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: (_ for _ in ()).throw(AssertionError("should not open GUI")))
     monkeypatch.setattr(
-        "cli_anything.wecom_gui.core.reply.send_text",
+        "cli_anything.wecom_gui.core.reply.send_message",
         lambda text, dry_run=False, submit=True: sent.append(text),
     )
 
@@ -72,8 +72,11 @@ def test_review_mode_sends_approved_reply(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
     monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
     monkeypatch.setattr(
-        "cli_anything.wecom_gui.core.reply.send_text",
-        lambda text, dry_run=False, submit=True: sent.append({"text": text, "dry_run": dry_run, "submit": submit}),
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(
+            {"text": text, "dry_run": dry_run, "submit": submit}
+        )
+        or {"ok": True},
     )
 
     result = agent._send_one_ready(last=12, mode="review")
@@ -133,18 +136,61 @@ def test_supplement_full_test_uses_isolated_log_table(monkeypatch, tmp_path):
     assert state.list_supplement_logs(trace_id="trace-normal")[0]["event_type"] == "ordinary_started"
 
 
-def test_supplement_test_old_user_non_supplement_waits_for_question(monkeypatch, tmp_path):
+def test_supplement_test_old_user_non_supplement_uses_ordinary_agent(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+
+    captured = {}
+
+    def fake_draft(messages, **kwargs):
+        captured["messages"] = messages
+        captured["kwargs"] = kwargs
+        return {
+            "ok": True,
+            "provider": "csbot-autonomous",
+            "text": "您好，发货时间我帮您查一下。",
+            "message": "您好，发货时间我帮您查一下。",
+            "action": "send",
+        }
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fake_draft)
 
     result = review_server.supplement_test_send("老客户A", "你好", full_flow=True)
 
     assert result["ok"] is True
-    assert result["skipped"] is True
-    assert result["reply_text"] == ""
+    assert result["ordinary_agent"] is True
+    assert result["reply_text"] == "您好，发货时间我帮您查一下。"
     assert result["state"] == {}
     assert result["job"]["status"] == "done"
-    assert result["job"]["error"] == "no_recommendation_intent"
-    assert [message["message_type"] for message in result["messages"]] == ["customer"]
+    assert result["job"]["reply_source"] == "ai"
+    assert captured["kwargs"].get("agent_mode", "") == ""
+    assert [message["message_type"] for message in result["messages"]] == ["customer", "reply"]
+
+
+def test_supplement_full_test_same_customer_keeps_history_and_routes_ordinary_to_ai(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+
+    replies = iter(["您好，我在。", "鱼油发货时间我帮您按订单查询。"])
+
+    def stable_fake_draft(messages, **kwargs):
+        text = next(replies)
+        return {"ok": True, "provider": "csbot-autonomous", "text": text, "message": text, "action": "send"}
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", stable_fake_draft)
+
+    first = review_server.supplement_test_send("补剂完整问答客户3", "你好", full_flow=True)
+    second = review_server.supplement_test_send("补剂完整问答客户3", "我的鱼油什么时候发货", full_flow=True)
+
+    assert first["ordinary_agent"] is True
+    assert second["ordinary_agent"] is True
+    assert first["customer_key"] == second["customer_key"]
+    assert [message["text"] for message in second["messages"]] == [
+        "你好",
+        "您好，我在。",
+        "我的鱼油什么时候发货",
+        "鱼油发货时间我帮您按订单查询。",
+    ]
+    assert second["state"] == {}
+    assert not [item for item in second["logs"] if item["event_type"] == "supplement_state_loaded"]
 
 
 def test_supplement_test_new_user_gets_fixed_welcome_followup(monkeypatch, tmp_path):
@@ -171,25 +217,26 @@ def test_supplement_test_new_user_restart_does_not_call_backend_agent(monkeypatc
     first = review_server.supplement_test_send("新客户B", "", full_flow=True, new_user=True)
     assert first["ok"] is True
 
-    def fail_draft(*args, **kwargs):
-        raise AssertionError("new user restart should not call backend agent")
+    def fake_draft(messages, **kwargs):
+        return {"ok": True, "text": "您好，我继续帮您处理。", "message": "您好，我继续帮您处理。", "action": "send"}
 
-    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fail_draft)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.llm.draft_reply", fake_draft)
     second = review_server.supplement_test_send("新客户B", "", full_flow=True, new_user=True)
 
     assert second["ok"] is True
-    assert second["reply_text"].startswith("您好~可以简单介绍下您的基本信息")
+    assert second["ordinary_agent"] is True
+    assert second["reply_text"] == "您好，我继续帮您处理。"
     assert second["state"]["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
     assert second["state"]["digging_count"] == 0
-    assert second["messages"][-2]["text"].startswith("您好，新客户B")
-    assert second["messages"][-1]["text"].startswith("您好~可以简单介绍下您的基本信息")
+    assert not second["messages"][-2]["text"].startswith("您好，新客户B")
+    assert second["messages"][-1]["text"] == "您好，我继续帮您处理。"
     assert not [item for item in second["logs"] if item["event_type"] == "supplement_backend_agent_started"]
 
 
-def test_supplement_test_old_user_supplement_question_starts_flow_then_uses_backend_agent(monkeypatch, tmp_path):
+def test_supplement_test_old_user_explicit_supplement_question_starts_flow_then_uses_backend_agent(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
 
-    first = review_server.supplement_test_send("老客户B", "想改善睡眠", full_flow=True)
+    first = review_server.supplement_test_send("老客户B", "补剂推荐", full_flow=True)
 
     assert first["ok"] is True
     assert first["reply_text"].startswith("您好~可以简单介绍下您的基本信息")
@@ -584,6 +631,7 @@ def test_direct_handoff_enters_handoff_queue_without_ai_draft(monkeypatch, tmp_p
     assert item["handoff_pending"] is True
     assert item["handoff_type"] == "direct"
     assert "转人工" in item["handoff_reason"]
+    assert item["reply_text"] == ""
 
 
 def test_indirect_ai_handoff_enters_handoff_queue(monkeypatch, tmp_path):
@@ -613,6 +661,7 @@ def test_indirect_ai_handoff_enters_handoff_queue(monkeypatch, tmp_path):
     item = review_server.list_review_items(status="handoff")[0]
     assert item["handoff_type"] == "indirect"
     assert item["handoff_reason"] == "复杂售后问题"
+    assert item["reply_text"] == ""
 
 
 def test_markdown_cleanup_for_review_save_approve_and_send(monkeypatch, tmp_path):
@@ -648,7 +697,10 @@ def test_markdown_cleanup_for_review_save_approve_and_send(monkeypatch, tmp_path
     sent = []
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
     monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
-    monkeypatch.setattr("cli_anything.wecom_gui.core.reply.send_text", lambda text, dry_run=False, submit=True: sent.append(text))
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(text) or {"ok": True},
+    )
 
     result = agent._send_one_ready(last=12, mode="review")
 
@@ -975,8 +1027,8 @@ def test_review_mode_skips_stale_context_before_send(monkeypatch, tmp_path):
         },
     )
     monkeypatch.setattr(
-        "cli_anything.wecom_gui.core.reply.send_text",
-        lambda text, dry_run=False, submit=True: sent.append(text),
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(text) or {"ok": True},
     )
 
     result = agent._send_one_ready(last=12, mode="review")
@@ -1021,8 +1073,8 @@ def test_handoff_reply_stays_in_handoff_queue_until_finished(monkeypatch, tmp_pa
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
     monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
     monkeypatch.setattr(
-        "cli_anything.wecom_gui.core.reply.send_text",
-        lambda text, dry_run=False, submit=True: sent.append(text),
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(text) or {"ok": True},
     )
 
     result = agent._send_one_ready(last=12, mode="review")
@@ -1036,9 +1088,7 @@ def test_handoff_reply_stays_in_handoff_queue_until_finished(monkeypatch, tmp_pa
     assert handoff_item["reply_text"] == "人工回复第一条"
     assert handoff_item["messages"][-1]["message_type"] == "reply"
     assert handoff_item["messages"][-1]["text"] == "人工回复第一条"
-    issue_tasks = review_server.list_review_items(status="issues")
-    assert issue_tasks[0]["source"] == "handoff_reply"
-    assert issue_tasks[0]["final_reply"] == "人工回复第一条"
+    assert review_server.list_review_items(status="issues") == []
     assert state.get_job(job["id"])["reply_source"] == "human"
     assert review_server.save_item(job["id"], reply_text="人工回复第二条")["ok"] is True
     assert review_server.approve_item(job["id"], reply_text="人工回复第二条")["ok"] is True
@@ -1048,7 +1098,7 @@ def test_handoff_reply_stays_in_handoff_queue_until_finished(monkeypatch, tmp_pa
         reply_text="人工回复第二条",
         reply_source="human",
     )
-    assert review_server.review_counts()["issues"] == 2
+    assert review_server.review_counts()["issues"] == 0
     assert review_server.finish_item(job["id"])["ok"] is True
     assert review_server.review_counts()["handoff"] == 0
     assert state.get_job(job["id"])["status"] == "done"
@@ -1085,8 +1135,8 @@ def test_handoff_duplicate_visible_reply_is_not_sent_again(monkeypatch, tmp_path
         },
     )
     monkeypatch.setattr(
-        "cli_anything.wecom_gui.core.reply.send_text",
-        lambda text, dry_run=False, submit=True: sent.append(text),
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(text) or {"ok": True},
     )
 
     result = agent._send_one_ready(last=12, mode="review")

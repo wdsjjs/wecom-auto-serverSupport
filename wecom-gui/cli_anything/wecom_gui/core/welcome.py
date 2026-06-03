@@ -7,6 +7,8 @@ import os
 import re
 import unicodedata
 
+from cli_anything.wecom_gui.core import message_config
+
 
 DEFAULT_WELCOME_MESSAGE = "{WELCOME_MESSAGE}"
 NEW_CUSTOMER_PREFIX = "你已添加了"
@@ -57,7 +59,10 @@ def is_new_customer_context(row: dict, messages: list[dict]) -> bool:
 
 def welcome_message() -> str:
     """Return the configured fixed welcome message without calling an LLM."""
-    return os.environ.get("WECOM_GUI_WELCOME_MESSAGE", DEFAULT_WELCOME_MESSAGE).strip() or DEFAULT_WELCOME_MESSAGE
+    configured = os.environ.get("WECOM_GUI_WELCOME_MESSAGE", "").strip()
+    if configured:
+        return configured
+    return message_config.fixed_message("welcome", "wecom_fixed_welcome").strip() or DEFAULT_WELCOME_MESSAGE
 
 
 def message_hash(conversation_key: str, system_text: str) -> str:

@@ -144,17 +144,6 @@
           }
         });
       }
-      function captureConversationHtml() {
-        const result = {};
-        document.querySelectorAll("article.item[data-id] .conversation").forEach(el => {
-          const item = el.closest("article.item[data-id]");
-          if (item) {
-            const key = String(item.dataset.id);
-            result[key] = {html: el.innerHTML, scrollTop: el.scrollTop};
-          }
-        });
-        return result;
-      }
       function observeImportantCounts(counts, options = {}) {
         const allowAutoSwitch = options.allowAutoSwitch !== false;
         const current = {
@@ -283,16 +272,7 @@
         restoreEditorState(editorState);
       }
       function softMergeItems(items) {
-        const preservedConversations = captureConversationHtml();
         renderItems(items || [], {restoreEditor: true});
-        document.querySelectorAll("article.item[data-id] .conversation").forEach(el => {
-          const item = el.closest("article.item[data-id]");
-          const key = item ? String(item.dataset.id) : "";
-          const preserved = preservedConversations[key];
-          if (!preserved) return;
-          el.innerHTML = preserved.html;
-          el.scrollTop = preserved.scrollTop || 0;
-        });
       }
       function sourceLabel(value) {
         if (value === "handoff_reply") return "人工回复";
@@ -366,7 +346,7 @@
       function replyTextFor(item) {
         const key = String(item.id);
         if (replyDrafts.has(key)) return replyDrafts.get(key);
-        if (item.handoff_pending && item.handoff_waiting) return "";
+        if (item.handoff_pending) return "";
         return item.reply_text || "";
       }
       async function refresh(options = {}) {

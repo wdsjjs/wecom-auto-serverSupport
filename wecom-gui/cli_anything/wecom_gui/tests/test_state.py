@@ -211,7 +211,7 @@ def test_queue_isolates_same_title_by_external_uid(monkeypatch, tmp_path):
     assert len(items) == 2
     assert sorted(item["preview"] for item in items) == ["第一位的问题", "第二位的问题"]
 
-def test_queue_isolates_same_title_by_visible_slot(monkeypatch, tmp_path):
+def test_queue_merges_same_title_by_name_when_uid_missing(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     first_row = {
         "title": "同名客户",
@@ -237,8 +237,10 @@ def test_queue_isolates_same_title_by_visible_slot(monkeypatch, tmp_path):
 
     assert changed_first is True
     assert changed_second is True
-    assert first["conversation_key"] != second["conversation_key"]
-    assert len(state.list_queue(status="pending")) == 2
+    assert first["conversation_key"] == second["conversation_key"]
+    assert second["id"] == first["id"]
+    assert second["preview"] == "下方客户的问题"
+    assert len(state.list_queue(status="pending")) == 1
 
 
 def test_visible_conversation_key_upgrades_to_stable_uid(monkeypatch, tmp_path):
@@ -253,7 +255,7 @@ def test_visible_conversation_key_upgrades_to_stable_uid(monkeypatch, tmp_path):
         "click_y": 240.0,
     }
     _changed, item = state.enqueue_conversation(row, "sig-a")
-    assert item["conversation_key"].startswith("visible:")
+    assert item["conversation_key"].startswith("legacy:")
 
     upgraded = state.upgrade_job_conversation_key_to_uid(item["id"], "wm-customer-a")
 
@@ -284,12 +286,12 @@ def test_welcome_state_uses_conversation_key_and_upgrades_to_uid(monkeypatch, tm
         },
         "sig-visible",
     )
-    visible_key = item["conversation_key"]
+    name_key = item["conversation_key"]
 
     state.mark_welcome_status(
-        visible_key,
+        name_key,
         state.WELCOME_PENDING,
-        conversation_key=visible_key,
+        conversation_key=name_key,
         conversation="同名客户",
         job_id=item["id"],
         reason="welcome_draft_ready",
@@ -298,7 +300,7 @@ def test_welcome_state_uses_conversation_key_and_upgrades_to_uid(monkeypatch, tm
     upgraded = state.upgrade_job_conversation_key_to_uid(item["id"], "wm-customer-a")
 
     assert upgraded["conversation_key"] == "uid:wm-customer-a"
-    assert state.get_welcome_state(visible_key) is None
+    assert state.get_welcome_state(name_key) is None
     welcome = state.get_welcome_state("uid:wm-customer-a")
     assert welcome["status"] == state.WELCOME_PENDING
     assert welcome["job_id"] == item["id"]
@@ -619,3 +621,42 @@ def test_gui_lock_uses_state_dir(monkeypatch, tmp_path):
 
     with state.gui_lock():
         assert (tmp_path / "gui.lock").exists()
+
+
+def test_handoff_unread_preview_stays_visible_while_pending(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "转人工", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig-a")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash-a",
+        messages=[{"role": "用户", "content": "转人工", "text": "转人工"}],
+        latest={"role": "用户", "content": "转人工"},
+    )
+    state.mark_handoff_pending(
+        job["id"],
+        handoff_type="direct",
+        handoff_reason="客户要求人工",
+        reply_text="我来处理。",
+    )
+    state.mark_handoff_waiting(
+        job["id"],
+        message_hash="hash-sent",
+        reply_text="我来处理。",
+        reply_source="human",
+    )
+
+    changed, item = state.enqueue_conversation(
+        {**row, "preview": "还有一个问题", "time": "1分钟前", "unread_count": 1},
+        "sig-b",
+    )
+
+    assert changed is True
+    assert item["status"] == "pending"
+    assert item["handoff_type"] == "direct"
+    assert state.handoff_pending_count() == 1
+    assert state.list_ready_for_review(handoff=True)[0]["id"] == job["id"]
+    messages = state.list_conversation_messages(conversation_key=item["conversation_key"], limit=10)
+    assert messages[-1]["message_type"] == "customer"
+    assert messages[-1]["text"] == "还有一个问题"

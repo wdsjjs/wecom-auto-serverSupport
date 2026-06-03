@@ -18,8 +18,20 @@ LOGISTICS_EXCEPTION_TERMS = ("异常物流", "清关", "物流异常", "轨迹",
 BRAND_TERMS = ("对标", "品牌", "授权")
 CERTIFICATION_TERMS = ("专利", "认证", "原料", "工厂")
 PROMOTION_TERMS = ("促单", "活动", "促销")
-SUPPLEMENT_SCOPE_BUSINESS_TYPES = ("recommendation_rule", "product_profile", "safety_policy", "research_evidence")
-SUPPLEMENT_SCOPE_SOURCE_SHEETS = ("10 补剂推荐", "5 产品常规信息", "7 L0级注意事项", "6 论文表")
+SUPPLEMENT_SCOPE_BUSINESS_TYPES = (
+    "recommendation_rule",
+    "product_profile",
+    "safety_policy",
+    "research_evidence",
+    "brand_comparison",
+)
+SUPPLEMENT_SCOPE_SOURCE_SHEETS = (
+    "10 补剂推荐",
+    "5 产品常规信息",
+    "7 L0级注意事项",
+    "6 论文表",
+    "对标品牌与授权（有部分重复信息）",
+)
 
 
 def _is_supplement_scope(context: dict | None) -> bool:
@@ -89,6 +101,10 @@ def _supplement_doc_score(query: str, row, terms: list[str]) -> float:
     text = row["text"] or ""
     if row["source_sheet"] in SUPPLEMENT_SCOPE_SOURCE_SHEETS and row["business_type"] != "research_evidence":
         score += 0.2
+    if row["business_type"] == "product_profile" and any(term in query for term in BRAND_TERMS):
+        score += 0.55
+    if row["business_type"] == "brand_comparison" and any(term in query for term in BRAND_TERMS):
+        score += 0.8
     if row["business_type"] == "recommendation_rule":
         score += 0.15
     if row["business_type"] == "research_evidence":
@@ -158,6 +174,12 @@ def _supplement_facts(row) -> dict[str, str]:
             "主要成分及含量",
             "产品规格",
             "1v1商品链接",
+            "品牌",
+            "品牌授权",
+            "授权",
+            "对标品牌",
+            "回复话术",
+            "备注",
         ]
     elif row["business_type"] == "research_evidence":
         keys = [
@@ -173,6 +195,8 @@ def _supplement_facts(row) -> dict[str, str]:
             "DOI",
             "备注",
         ]
+    elif row["business_type"] == "brand_comparison":
+        keys = ["产品", "产品常用名", "产品全称", "对标品牌", "授权", "回复话术", "备注"]
     else:
         keys = ["分类", "问题", "回复话术", "备注"]
     return {key: normalize_text(facts.get(key)) for key in keys if normalize_text(facts.get(key))}
@@ -236,7 +260,9 @@ def _business_types_for_intent(intent: str) -> list[str]:
         return ["product_profile"]
     if intent == "activity_rule":
         return ["activity_rule"]
-    if intent in {"research_evidence", "logistics_exception", "brand_comparison", "raw_material_certification", "promotion_notice"}:
+    if intent == "brand_comparison":
+        return ["product_profile", "brand_comparison"]
+    if intent in {"research_evidence", "logistics_exception", "raw_material_certification", "promotion_notice"}:
         return [intent]
     return [
         "product_profile",

@@ -164,8 +164,11 @@ async function send() {
     }
     render(payload);
     messageEl.value = "";
-    if (payload.skipped) {
-      setStatus("老用户非补剂问题：已记录，未触发补剂 Agent");
+    if (isNewUser && newUserEl) newUserEl.checked = false;
+    if (payload.ordinary_agent) {
+      setStatus("普通对话 Agent 已返回");
+    } else if (payload.skipped) {
+      setStatus("已记录，未触发补剂 Agent");
     } else {
       setStatus("后端真实链路已返回");
     }

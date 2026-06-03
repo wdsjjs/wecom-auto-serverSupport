@@ -29,6 +29,11 @@ if [[ -z "${SDKROOT:-}" && -d "/Library/Developer/CommandLineTools/SDKs/MacOSX15
   export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk"
 fi
 
+PI_LOG_DIR="${CSBOT_PI_LOG_DIR:-${WECOM_GUI_PI_LOG_DIR:-$RUN_DIR/pi}}"
+export WECOM_GUI_PI_LOG_DIR="$PI_LOG_DIR"
+export CSBOT_PI_LOG_DIR="$PI_LOG_DIR"
+mkdir -p "$PI_LOG_DIR"
+
 MODE="${WECOM_AGENT_MODE:-review}"
 POLL="${WECOM_AGENT_POLL:-0.5}"
 SCAN_INTERVAL="${WECOM_AGENT_SCAN_INTERVAL:-1}"
@@ -419,6 +424,7 @@ write_header() {
       "$([[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" && -n "${FEISHU_APP_TOKEN:-}" ]] && echo configured || echo missing)" \
       "$([[ -n "${WEIBAN_CORP_ID:-}" && -n "${WEIBAN_SECRET:-}" ]] && echo configured || echo missing)" \
       "$([[ -n "${CSBOT_MEM0_URL:-}" && -n "${CSBOT_MEM0_API_KEY:-}" ]] && echo configured || echo missing)"
+    printf 'PI_LOG_DIR=%s\n' "$PI_LOG_DIR"
   } >> "$LOG_FILE"
 }
 
@@ -476,6 +482,7 @@ status_agent() {
   if [[ -f "$LOG_FILE" ]]; then
     echo "log: $LOG_FILE"
   fi
+  echo "pi log: $PI_LOG_DIR/invocations.jsonl"
 }
 
 logs_agent() {

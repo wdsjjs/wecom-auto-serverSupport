@@ -17,7 +17,7 @@ import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from cli_anything.wecom_gui.core import chat, handoff, inbox, llm, reply, state, watcher, worker, welcome
+from cli_anything.wecom_gui.core import chat, handoff, inbox, llm, message_config, reply, state, watcher, worker, welcome
 from cli_anything.wecom_gui.core.text import clean_customer_reply_text
 from cli_anything.wecom_gui.utils import macos_backend
 
@@ -33,32 +33,25 @@ WELCOME_REPLY_SOURCE = "welcome"
 WELCOME_ADDED_PATTERN = re.compile(r"你已添加了\s*(?P<nickname>.+?)\s*，现在可以开始聊天了。")
 WELCOME_GREETING_SYSTEM_TEXT = "以上是打招呼内容"
 SUPPLEMENT_REPLY_SOURCE = "supplement"
-SUPPLEMENT_TRIGGER_TERMS = ("推荐", "适合", "吃什么", "怎么搭配", "需要补", "补什么", "改善", "增肌", "睡眠", "抗氧化")
-SUPPLEMENT_NEED_CHOICES_TEXT = """请问您想改善哪方面呢，请选择您最关心的3-5个需求，可以直接回复【数字】：
-1.抗衰/身体机能下降
-2.睡眠质量差
-3.身体代谢差/免疫力
-4.白发、脱发、头皮活力
-5.减脂减重/改善体型
-6.皮肤松弛暗沉/长痘痘
-7.晨起疲惫，精神不振
-8.每天用脑超八小时，注意力难集中
-9.抑郁焦虑，情绪差
-10.肝脏排毒功能差，熬夜伤肝
-11.办公室久坐不动人群
-12.用眼过度，眼疲劳
-13.女性保养
-14.肠胃不好，便秘或菌群失调
-15.男性性功能问题
-16备孕支持
-17.运动健身人群
-18.需促进骨骼健康，强健骨质
-19.经常抽烟，烟瘾重
-20.儿童成长，助力身体发育"""
-SUPPLEMENT_PROFILE_PROMPT = "您好~可以简单介绍下您的基本信息（年龄、性别、身高、体重等），方便了解您的身体状况哦～"
-SUPPLEMENT_FIRST_REPLY_WITH_PROFILE = SUPPLEMENT_PROFILE_PROMPT + "\n" + SUPPLEMENT_NEED_CHOICES_TEXT
-SUPPLEMENT_FIRST_REPLY_CHOICES_ONLY = "您好~\n" + SUPPLEMENT_NEED_CHOICES_TEXT
-SUPPLEMENT_SELECTION_ACK = "收到，我先根据您选择的需求和基础信息做匹配，请稍等一下～"
+SUPPLEMENT_TRIGGER_TERMS = (
+    "补剂推荐",
+    "推荐补剂",
+    "营养补剂",
+    "搭配补剂",
+    "补剂搭配",
+    "补剂怎么搭配",
+    "推荐搭配",
+    "怎么搭配",
+    "需要补什么",
+    "需要补点什么",
+    "吃什么补剂",
+    "适合什么补剂",
+)
+SUPPLEMENT_NEED_CHOICES_TEXT = message_config.supplement_need_choices_text()
+SUPPLEMENT_PROFILE_PROMPT = message_config.supplement_profile_prompt()
+SUPPLEMENT_FIRST_REPLY_WITH_PROFILE = message_config.supplement_first_reply_with_profile()
+SUPPLEMENT_FIRST_REPLY_CHOICES_ONLY = message_config.supplement_first_reply_choices_only()
+SUPPLEMENT_SELECTION_ACK = message_config.fixed_message("supplement", "selection_ack")
 SUPPLEMENT_PROFILE_OPT_OUT_TERMS = (
     "不想提供",
     "不愿意提供",
@@ -342,7 +335,80 @@ def _is_supplement_need_selection(text: str) -> bool:
     body = str(text or "").strip()
     if not body:
         return False
-    return any(term in body for term in SUPPLEMENT_TRIGGER_TERMS)
+    return _has_explicit_supplement_recommendation_intent(body)
+
+
+def supplement_first_reply_with_profile() -> str:
+    return message_config.supplement_first_reply_with_profile()
+
+
+def supplement_first_reply_choices_only() -> str:
+    return message_config.supplement_first_reply_choices_only()
+
+
+def supplement_selection_ack() -> str:
+    return message_config.fixed_message("supplement", "selection_ack")
+
+
+def _supplement_wecom_welcome_text(customer_name: str) -> str:
+    title = str(customer_name or "客户").strip() or "客户"
+    template = message_config.fixed_message("welcome", "supplement_web_welcome_template")
+    return clean_customer_reply_text(template.replace("{用户名}", title))
+
+
+def _supplement_welcome_send_parts(final_reply: str, context: dict) -> list[str]:
+    """Return separate WeCom messages for the welcome follow-up flow."""
+    body = clean_customer_reply_text(final_reply)
+    if not body:
+        return []
+    welcome_text = clean_customer_reply_text(context.get("supplement_welcome_text") or "")
+    followup_text = clean_customer_reply_text(context.get("supplement_followup_text") or "")
+    if not welcome_text or not followup_text:
+        return [body]
+    if body == clean_customer_reply_text(f"{welcome_text}\n\n{followup_text}"):
+        return [welcome_text, followup_text]
+    if body.startswith(welcome_text):
+        remainder = clean_customer_reply_text(body[len(welcome_text):])
+        if remainder:
+            return [welcome_text, remainder]
+    return [body]
+
+
+def _supplement_first_reply_text(*, has_profile: bool, customer_name: str = "", from_welcome: bool = False) -> str:
+    first_reply = supplement_first_reply_choices_only() if has_profile else supplement_first_reply_with_profile()
+    if not from_welcome:
+        return first_reply
+    welcome_text = _supplement_wecom_welcome_text(customer_name)
+    return clean_customer_reply_text(f"{welcome_text}\n\n{first_reply}" if welcome_text else first_reply)
+
+
+def _has_explicit_supplement_recommendation_intent(text: str) -> bool:
+    body = str(text or "").strip()
+    if not body:
+        return False
+    if any(term in body for term in SUPPLEMENT_TRIGGER_TERMS):
+        return True
+    has_supplement = "补剂" in body or "营养品" in body
+    if has_supplement and any(term in body for term in ("推荐", "搭配", "适合", "吃什么", "补什么", "改善")):
+        return True
+    return False
+
+
+def _non_supplement_reason(text: str) -> str:
+    body = str(text or "").strip()
+    if not body:
+        return "empty_message"
+    if any(term in body for term in ("价格", "多少钱", "优惠", "链接", "起拍")):
+        return "price_intent"
+    if any(term in body for term in ("发货", "物流")):
+        return "shipping_intent"
+    if "订单" in body:
+        return "order_intent"
+    if "改地址" in body:
+        return "address_change_intent"
+    if body in {"你好", "您好", "在吗", "在不在", "hello", "hi"}:
+        return "ordinary_greeting"
+    return ""
 
 
 def _supplement_route(latest_text: str, *, active_state: dict | None = None) -> dict:
@@ -350,6 +416,19 @@ def _supplement_route(latest_text: str, *, active_state: dict | None = None) -> 
     active_exists = bool(active_state and str(active_state.get("stage") or "") in state.SUPPLEMENT_ACTIVE_STAGES)
     matched_terms = [term for term in SUPPLEMENT_TRIGGER_TERMS if term in text]
     skip_terms = [term for term in SUPPLEMENT_SKIP_TERMS if term in text]
+    non_supplement_reason = _non_supplement_reason(text)
+    if non_supplement_reason and not (
+        _is_supplement_need_selection(text)
+        or _has_supplement_profile(text)
+        or _declines_supplement_profile(text)
+    ):
+        return {
+            "triggered": False,
+            "matched_terms": matched_terms,
+            "active_state_exists": active_exists,
+            "detected_intent": "non_supplement",
+            "reason": non_supplement_reason,
+        }
     if active_exists:
         return {
             "triggered": True,
@@ -358,7 +437,7 @@ def _supplement_route(latest_text: str, *, active_state: dict | None = None) -> 
             "detected_intent": "active_supplement_flow",
             "reason": "",
         }
-    if matched_terms and not skip_terms:
+    if _has_explicit_supplement_recommendation_intent(text) and not skip_terms:
         return {
             "triggered": True,
             "matched_terms": matched_terms,
@@ -366,15 +445,7 @@ def _supplement_route(latest_text: str, *, active_state: dict | None = None) -> 
             "detected_intent": "supplement_recommendation",
             "reason": "",
         }
-    reason = "price_intent" if any(term in text for term in ("价格", "多少钱", "优惠", "链接", "起拍")) else ""
-    if not reason:
-        reason = "shipping_intent" if any(term in text for term in ("发货", "物流")) else ""
-    if not reason:
-        reason = "order_intent" if "订单" in text else ""
-    if not reason:
-        reason = "address_change_intent" if "改地址" in text else ""
-    if not reason:
-        reason = "no_recommendation_intent"
+    reason = non_supplement_reason or "no_recommendation_intent"
     return {
         "triggered": False,
         "matched_terms": matched_terms,
@@ -641,6 +712,12 @@ def _handoff_waiting_same_hash(job: dict, current: dict) -> bool:
 
 
 def _keep_handoff_open(job: dict, current: dict, *, reason: str) -> dict:
+    reply_visible = _reply_already_visible(current.get("messages", []), job.get("reply_text"))
+    final_reason = (
+        "handoff_waiting_same_hash"
+        if _handoff_waiting_same_hash(job, current) or (reply_visible and reason.startswith("latest_message_not_user:"))
+        else reason
+    )
     state.mark_handoff_waiting(
         job["id"],
         message_hash=current.get("hash") or job.get("last_message_hash"),
@@ -654,7 +731,7 @@ def _keep_handoff_open(job: dict, current: dict, *, reason: str) -> dict:
         "drafting": 0,
         "handoff": 0,
         "conversation": job.get("title") or "",
-        "reason": reason,
+        "reason": final_reason,
     }
 
 
@@ -1197,20 +1274,43 @@ def _mark_supplement_first_reply_ready(
 ) -> dict:
     stage = state.SUPPLEMENT_COLLECTING_PROFILE
     latest_text = _message_text(latest)
-    reply_text = SUPPLEMENT_FIRST_REPLY_CHOICES_ONLY if has_profile else SUPPLEMENT_FIRST_REPLY_WITH_PROFILE
+    first_reply = supplement_first_reply_choices_only() if has_profile else supplement_first_reply_with_profile()
+    welcome_text = _supplement_wecom_welcome_text(str(job.get("title") or "")) if from_welcome else ""
+    reply_text = _supplement_first_reply_text(
+        has_profile=has_profile,
+        customer_name=str(job.get("title") or ""),
+        from_welcome=from_welcome,
+    )
+    extra_context = {
+        "agent_mode": SUPPLEMENT_REPLY_SOURCE,
+        "supplement_trace_id": trace_id,
+        "supplement_customer_key": customer_key,
+        "supplement_stage": stage,
+        "supplement_from_welcome": from_welcome,
+    }
+    if from_welcome:
+        extra_context.update(
+            {
+                "supplement_welcome_text": welcome_text,
+                "supplement_followup_text": first_reply,
+            }
+        )
     state.mark_drafting(
         job["id"],
         message_hash=str(current.get("hash") or ""),
         messages=current.get("messages", []),
         latest=latest,
-        extra_context={
-            "agent_mode": SUPPLEMENT_REPLY_SOURCE,
-            "supplement_trace_id": trace_id,
-            "supplement_customer_key": customer_key,
-            "supplement_stage": stage,
-            "supplement_from_welcome": from_welcome,
-        },
+        extra_context=extra_context,
     )
+    if from_welcome:
+        state.mark_welcome_status(
+            customer_key,
+            state.WELCOME_PENDING,
+            conversation_key=str(job.get("conversation_key") or ""),
+            conversation=str(job.get("title") or ""),
+            job_id=job["id"],
+            reason="supplement_welcome_ready",
+        )
     state.mark_supplement_state(
         customer_key,
         stage,
@@ -1317,7 +1417,7 @@ def _mark_supplement_selection_ack_ready(
     )
     state.mark_ready(
         job["id"],
-        reply_text=SUPPLEMENT_SELECTION_ACK,
+        reply_text=supplement_selection_ack(),
         reply_source=SUPPLEMENT_REPLY_SOURCE,
         action="clarify",
     )
@@ -1399,30 +1499,6 @@ def _read_one_pending(
                 "reason": "handoff_waiting_same_hash",
             }
 
-        welcome_trigger = _welcome_trigger_message(current.get("messages", []))
-        if welcome_trigger is not None and not str(job.get("handoff_type") or "").strip():
-            customer_key = _supplement_customer_key(job, visible_uid)
-            if customer_key:
-                trace_id = _new_trace_id(job["id"], customer_key)
-                return _mark_supplement_first_reply_ready(
-                    job,
-                    current,
-                    welcome_trigger,
-                    customer_key=customer_key,
-                    trace_id=trace_id,
-                    has_profile=False,
-                    route={
-                        "triggered": True,
-                        "matched_terms": [],
-                        "active_state_exists": False,
-                        "detected_intent": "welcome_followup",
-                    },
-                    from_welcome=True,
-                )
-            welcome_result = _mark_welcome_ready_if_needed(job, current, welcome_trigger, visible_uid=visible_uid)
-            if welcome_result is not None:
-                return welcome_result
-
         saved_current, saved_latest = _saved_supplement_context_after_ack(job)
         if saved_current and saved_latest is not None:
             current = saved_current
@@ -1432,6 +1508,45 @@ def _read_one_pending(
         else:
             current, latest, reason = _resolve_latest_for_job(title, job, current)
         if latest is None:
+            welcome_trigger = _welcome_trigger_message(current.get("messages", []))
+            if (
+                welcome_trigger is not None
+                and not str(job.get("handoff_type") or "").strip()
+                and _welcome_recheck_still_current(current.get("messages", []), _message_text(welcome_trigger))
+            ):
+                customer_key = _supplement_customer_key(job, visible_uid)
+                if customer_key:
+                    existing_supplement = state.get_supplement_state(customer_key)
+                    if existing_supplement and str(existing_supplement.get("stage") or "") in state.SUPPLEMENT_ACTIVE_STAGES | {state.SUPPLEMENT_RECOMMENDED}:
+                        state.mark_skipped(job["id"], "supplement_welcome_duplicate")
+                        _log(f"[AI客服] 跳过重复新用户补剂话术：{title}｜customer_key={customer_key}")
+                        return {
+                            "ok": True,
+                            "read": 1,
+                            "drafting": 0,
+                            "supplement": 0,
+                            "conversation": title,
+                            "reason": "supplement_welcome_duplicate",
+                        }
+                    trace_id = _new_trace_id(job["id"], customer_key)
+                    return _mark_supplement_first_reply_ready(
+                        job,
+                        current,
+                        welcome_trigger,
+                        customer_key=customer_key,
+                        trace_id=trace_id,
+                        has_profile=False,
+                        route={
+                            "triggered": True,
+                            "matched_terms": [],
+                            "active_state_exists": False,
+                            "detected_intent": "welcome_followup",
+                        },
+                        from_welcome=True,
+                    )
+                welcome_result = _mark_welcome_ready_if_needed(job, current, welcome_trigger, visible_uid=visible_uid)
+                if welcome_result is not None:
+                    return welcome_result
             if str(job.get("handoff_type") or "").strip():
                 _log(f"[AI客服] 转人工会话未读到新的客户消息，继续人工接管：{title}｜原因={_reason_text(reason or '')}")
                 return _keep_handoff_open(job, current, reason=reason or "handoff_no_customer_message")
@@ -1508,7 +1623,7 @@ def _read_one_pending(
                 job["id"],
                 handoff_type="direct",
                 handoff_reason=reason,
-                reply_text=handoff.HANDOFF_REPLY_TEXT,
+                reply_text="",
             )
             state.append_event(
                 {
@@ -1573,17 +1688,27 @@ def _read_one_pending(
             current_stage = str((supplement_state or {}).get("stage") or "") or state.SUPPLEMENT_DIGGING_NEED
             digging_count = min(2, int((supplement_state or {}).get("digging_count") or 0))
             known_profile = _merge_supplement_known_profile((supplement_state or {}).get("known_profile") or {}, latest_turn_text)
+            stage_for_drafting = (
+                state.SUPPLEMENT_READY_TO_RECOMMEND
+                if current_stage == state.SUPPLEMENT_READY_TO_RECOMMEND or digging_count >= 2
+                else state.SUPPLEMENT_DIGGING_NEED
+            )
+            pending_next_stage = (
+                state.SUPPLEMENT_RECOMMENDED
+                if stage_for_drafting == state.SUPPLEMENT_READY_TO_RECOMMEND
+                else state.SUPPLEMENT_DIGGING_NEED
+            )
             agent_mode = SUPPLEMENT_REPLY_SOURCE
             agent_context = _supplement_agent_context(
                 state_row={**(supplement_state or {}), "digging_count": digging_count, "known_profile": known_profile},
                 route=supplement_route,
                 customer_key=customer_key,
                 trace_id=trace_id,
-                stage=current_stage,
+                stage=stage_for_drafting,
             )
             state.mark_supplement_state(
                 customer_key,
-                state.SUPPLEMENT_DIGGING_NEED,
+                stage_for_drafting,
                 conversation_key=str(job.get("conversation_key") or ""),
                 conversation=str(job.get("title") or ""),
                 job_id=job["id"],
@@ -1592,7 +1717,7 @@ def _read_one_pending(
                 selected_needs=selected_needs or (supplement_state or {}).get("selected_needs") or [],
                 known_profile=known_profile,
                 message_hash=str(current.get("hash") or ""),
-                pending_next_stage=state.SUPPLEMENT_READY_TO_RECOMMEND if digging_count >= 2 else state.SUPPLEMENT_DIGGING_NEED,
+                pending_next_stage=pending_next_stage,
                 reason="supplement_agent_drafting",
             )
             _log_supplement(
@@ -1600,11 +1725,11 @@ def _read_one_pending(
                 job=job,
                 customer_key=customer_key,
                 trace_id=trace_id,
-                stage=current_stage,
+                stage=stage_for_drafting,
                 message_hash=str(current.get("hash") or ""),
                 latest_text=latest_turn_text,
                 details={
-                    "current_stage": current_stage,
+                    "current_stage": stage_for_drafting,
                     "digging_count": digging_count,
                     "selected_needs": selected_needs or (supplement_state or {}).get("selected_needs") or [],
                     "profile_opt_out": bool(known_profile.get("profile_opt_out")),
@@ -1733,7 +1858,7 @@ def _finish_drafts(futures: dict[int, Future]) -> dict:
                     job_id,
                     handoff_type="indirect",
                     handoff_reason=reason,
-                    reply_text=draft["text"] or handoff.HANDOFF_REPLY_TEXT,
+                    reply_text="",
                     duration_ms=elapsed_ms,
                 )
             else:
@@ -1747,13 +1872,16 @@ def _finish_drafts(futures: dict[int, Future]) -> dict:
                 )
                 if agent_mode == SUPPLEMENT_REPLY_SOURCE and job and customer_key:
                     action_value = str(draft.get("action") or "")
+                    current_supplement_state = state.get_supplement_state(customer_key) or {}
+                    current_digging_count = min(2, int(current_supplement_state.get("digging_count") or 0))
+                    next_digging_count = min(2, current_digging_count + 1) if action_value == "clarify" else current_digging_count
                     next_stage = (
                         state.SUPPLEMENT_DIGGING_NEED
                         if action_value == "clarify"
                         else state.SUPPLEMENT_READY_TO_RECOMMEND
                     )
                     pending_next_stage = (
-                        state.SUPPLEMENT_DIGGING_NEED
+                        (state.SUPPLEMENT_READY_TO_RECOMMEND if next_digging_count >= 2 else state.SUPPLEMENT_DIGGING_NEED)
                         if action_value == "clarify"
                         else state.SUPPLEMENT_RECOMMENDED
                     )
@@ -1764,6 +1892,7 @@ def _finish_drafts(futures: dict[int, Future]) -> dict:
                         conversation=title,
                         job_id=job_id,
                         trace_id=trace_id,
+                        digging_count=next_digging_count,
                         message_hash=expected_hash,
                         pending_next_stage=pending_next_stage,
                         reason="supplement_draft_ready",
@@ -1778,6 +1907,8 @@ def _finish_drafts(futures: dict[int, Future]) -> dict:
                         details={
                             "action": str(draft.get("action") or ""),
                             "duration_ms": elapsed_ms,
+                            "digging_count": next_digging_count,
+                            "pending_next_stage": pending_next_stage,
                             "reply_preview": str(draft.get("text") or "")[:160],
                         },
                     )
@@ -2085,6 +2216,68 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
             elif supplement_welcome_context_ok:
                 _log(f"[AI客服] 发送前复核：{title}，欢迎后补剂首段话术仍在当前会话，准备发送")
 
+            send_parts = _supplement_welcome_send_parts(final_reply, context) if supplement_from_welcome else [final_reply]
+            text_send_parts = [part for part in send_parts if clean_customer_reply_text(part)]
+            visible_parts = [
+                part for part in send_parts if part and worker._messages_contain_text(current.get("messages", []), part)
+            ]
+            if text_send_parts and len(visible_parts) == len(text_send_parts):
+                state.mark_done(
+                    job["id"],
+                    message_hash=current["hash"],
+                    reply_text=final_reply,
+                    reply_source=str(job.get("reply_source") or "") or None,
+                    attachments=job.get("reply_attachments") or [],
+                    reply_parts=send_parts,
+                )
+                state.append_event(
+                    {
+                        "type": "agent_send_already_visible",
+                        "conversation": title,
+                        "hash": current["hash"],
+                        "reply": final_reply,
+                    }
+                )
+                if is_welcome_reply:
+                    state.mark_welcome_status(
+                        str(job.get("conversation_key") or ""),
+                        state.WELCOME_SENT,
+                        conversation_key=str(job.get("conversation_key") or ""),
+                        conversation=title,
+                        job_id=job["id"],
+                        reason="already_visible",
+                    )
+                if supplement_from_welcome and supplement_customer_key:
+                    state.mark_welcome_status(
+                        supplement_customer_key,
+                        state.WELCOME_SENT,
+                        conversation_key=str(job.get("conversation_key") or ""),
+                        conversation=title,
+                        job_id=job["id"],
+                        reason="already_visible_with_supplement_first_prompt",
+                    )
+                if is_supplement_reply and supplement_customer_key:
+                    current_state = state.get_supplement_state(supplement_customer_key) or {}
+                    stage_after_send = (
+                        state.SUPPLEMENT_RECOMMENDED
+                        if str(current_state.get("pending_next_stage") or "") == state.SUPPLEMENT_RECOMMENDED
+                        else state.SUPPLEMENT_READY_TO_RECOMMEND
+                        if str(current_state.get("pending_next_stage") or "") == state.SUPPLEMENT_READY_TO_RECOMMEND
+                        else str(current_state.get("stage") or state.SUPPLEMENT_DIGGING_NEED)
+                    )
+                    state.mark_supplement_state(
+                        supplement_customer_key,
+                        stage_after_send,
+                        conversation_key=str(job.get("conversation_key") or ""),
+                        conversation=title,
+                        job_id=job["id"],
+                        trace_id=supplement_trace_id or str(current_state.get("trace_id") or ""),
+                        message_hash=current["hash"],
+                        reason="already_visible",
+                    )
+                _log(f"[AI客服] 回复已在会话中可见，记录完成并跳过重复发送：{title}｜{_short(final_reply, 140)}")
+                return {"ok": True, "sent": 0, "already_visible": 1, "conversation": title}
+
             if mode == "dry-run":
                 state.mark_done(
                     job["id"],
@@ -2092,40 +2285,79 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                     reply_text=final_reply,
                     reply_source=str(job.get("reply_source") or "") or None,
                     attachments=job.get("reply_attachments") or [],
+                    reply_parts=send_parts,
                 )
                 _log(f"[AI客服] 演练模式，不发送：{title}｜{_short(final_reply, 140)}")
                 return {"ok": True, "sent": 0, "dry_run": True, "conversation": title}
 
             _log(f"[AI客服] 发送前复核：{title}，最新客户消息未变化，准备发送")
-            reply.send_message(
-                final_reply,
-                attachments=job.get("reply_attachments") or [],
-                dry_run=False,
-                submit=True,
-            )
+            attachments = job.get("reply_attachments") or []
+            for index, part in enumerate(send_parts):
+                reply.send_message(
+                    part,
+                    attachments=attachments if index == len(send_parts) - 1 else [],
+                    dry_run=False,
+                    submit=True,
+                )
+                if index < len(send_parts) - 1:
+                    time.sleep(float(os.environ.get("WECOM_AGENT_SPLIT_SEND_DELAY", "0.35")))
             time.sleep(0.5)
             after_send = _read_current_with_retry(
                 last=last,
-                expected_visible_text=final_reply,
+                expected_visible_text=send_parts[-1] if send_parts else final_reply,
                 capture_images=False,
             )
-            if not worker._messages_contain_text(after_send["messages"], final_reply):
+            missing_parts = [part for part in text_send_parts if not worker._messages_contain_text(after_send["messages"], part)]
+            if missing_parts:
                 _log(f"[AI客服] 发送后暂未读到回复，继续复核：{title}")
                 after_send = _read_current_with_retry(
                     last=last,
-                    expected_visible_text=final_reply,
+                    expected_visible_text=send_parts[-1] if send_parts else final_reply,
                     capture_images=False,
                     attempts=max(2, int(os.environ.get("WECOM_AGENT_SEND_VERIFY_ATTEMPTS", "5"))),
                     delay=float(os.environ.get("WECOM_AGENT_SEND_VERIFY_DELAY", "0.45")),
                 )
-                if not worker._messages_contain_text(after_send["messages"], final_reply):
-                    raise RuntimeError("sent_reply_not_visible")
+                missing_parts = [part for part in text_send_parts if not worker._messages_contain_text(after_send["messages"], part)]
+                if missing_parts:
+                    state.mark_send_verification_failed(
+                        job["id"],
+                        reply_text=final_reply,
+                        reason="sent_reply_not_visible",
+                    )
+                    state.append_event(
+                        {
+                            "type": "agent_send_failed",
+                            "conversation": title,
+                            "error": "sent_reply_not_visible",
+                            "missing_parts": missing_parts,
+                        }
+                    )
+                    state.record_metric(
+                        "agent_send_failed",
+                        conversation_key=str(job.get("conversation_key") or ""),
+                        conversation=title,
+                        job_id=job["id"],
+                        reply_source=str(job.get("reply_source") or ""),
+                        details={"error": "sent_reply_not_visible", "missing_parts": missing_parts},
+                    )
+                    _log(
+                        f"[AI客服] 发送后未确认回复可见，已转入人工复核，避免重复粘贴："
+                        f"{title}｜缺失={len(missing_parts)}"
+                    )
+                    return {
+                        "ok": False,
+                        "sent": 0,
+                        "failed": 1,
+                        "conversation": title,
+                        "error": "sent_reply_not_visible",
+                    }
             state.mark_done(
                 job["id"],
                 message_hash=after_send["hash"],
                 reply_text=final_reply,
                 reply_source=str(job.get("reply_source") or "") or None,
                 attachments=job.get("reply_attachments") or [],
+                reply_parts=send_parts,
             )
             if is_welcome_reply:
                 state.mark_welcome_status(
@@ -2136,11 +2368,22 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                     job_id=job["id"],
                     reason="sent",
                 )
+            if supplement_from_welcome and supplement_customer_key:
+                state.mark_welcome_status(
+                    supplement_customer_key,
+                    state.WELCOME_SENT,
+                    conversation_key=str(job.get("conversation_key") or ""),
+                    conversation=title,
+                    job_id=job["id"],
+                    reason="sent_with_supplement_first_prompt",
+                )
             if is_supplement_reply and supplement_customer_key:
                 current_state = state.get_supplement_state(supplement_customer_key) or {}
                 stage_after_send = (
                     state.SUPPLEMENT_RECOMMENDED
                     if str(current_state.get("pending_next_stage") or "") == state.SUPPLEMENT_RECOMMENDED
+                    else state.SUPPLEMENT_READY_TO_RECOMMEND
+                    if str(current_state.get("pending_next_stage") or "") == state.SUPPLEMENT_READY_TO_RECOMMEND
                     else str(current_state.get("stage") or state.SUPPLEMENT_DIGGING_NEED)
                 )
                 state.mark_supplement_state(
@@ -2163,7 +2406,7 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                         details={"reply_preview": final_reply[:160]},
                     )
                 if (
-                    final_reply == SUPPLEMENT_SELECTION_ACK
+                    final_reply == supplement_selection_ack()
                     and str((state.get_supplement_state(supplement_customer_key) or {}).get("stage") or "")
                     in state.SUPPLEMENT_ACTIVE_STAGES
                 ):
@@ -2191,7 +2434,10 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
             _log(f"[AI客服] 已发送给 {title}：{_short(final_reply, 140)}")
             return {"ok": True, "sent": 1, "conversation": title}
     except Exception as exc:
-        state.mark_failed(job["id"], str(exc))
+        if str(job.get("handoff_type") or "").strip():
+            state.mark_send_verification_failed(job["id"], reply_text=job.get("reply_text") or "", reason=str(exc))
+        else:
+            state.mark_failed(job["id"], str(exc))
         state.append_event({"type": "agent_send_failed", "conversation": title, "error": str(exc)})
         state.record_metric(
             "agent_send_failed",
