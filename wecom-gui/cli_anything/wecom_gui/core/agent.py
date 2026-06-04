@@ -112,7 +112,7 @@ def _message_image_paths(messages: list[dict]) -> list[str]:
         for media in message.get("media") or []:
             if not isinstance(media, dict):
                 continue
-            path = str(media.get("capture_path") or "").strip()
+            path = llm.resolve_capture_path(media.get("capture_path"))
             if path and media.get("capture_ok", True):
                 paths.append(path)
     return paths
@@ -646,6 +646,28 @@ def _last_visible_text_matches(messages: list[dict], expected: str | None) -> bo
     return False
 
 
+def _reply_visible_enough(messages: list[dict], reply_text: str | None) -> bool:
+    final_reply = clean_customer_reply_text(reply_text or "")
+    if not final_reply:
+        return False
+    if worker._messages_contain_text(messages, final_reply):
+        return True
+    expected_key = worker._reply_match_key(final_reply)
+    if len(expected_key) < 80:
+        return False
+    head = expected_key[:80]
+    tail = expected_key[-80:]
+    for message in reversed(messages):
+        actual_key = worker._reply_match_key(_message_text(message))
+        if not actual_key:
+            continue
+        if expected_key in actual_key or actual_key in expected_key:
+            return True
+        if head in actual_key and tail in actual_key:
+            return True
+    return False
+
+
 def _latest_user_turn_texts(messages: list[dict]) -> list[str]:
     texts: list[str] = []
     for message in reversed(messages):
@@ -687,7 +709,7 @@ def _welcome_recheck_still_current(messages: list[dict], expected: str | None) -
 
 def _reply_already_visible(messages: list[dict], reply_text: str | None) -> bool:
     final_reply = clean_customer_reply_text(reply_text or "")
-    return bool(final_reply and worker._messages_contain_text(messages, final_reply))
+    return bool(final_reply and _reply_visible_enough(messages, final_reply))
 
 
 def _latest_non_welcome_customer_message(messages: list[dict]) -> dict | None:
@@ -1719,8 +1741,10 @@ def _read_one_pending(
             )
             _log(f"[AI客服] 转人工会话有新消息：{title}｜{_short(latest_turn_text)}")
             return {"ok": True, "read": 1, "drafting": 0, "handoff": 1, "conversation": title}
-        if handoff.detect_direct_handoff(latest_turn_text):
-            reason = handoff.direct_handoff_reason(latest_turn_text)
+        handoff_route = handoff.classify_handoff(latest_turn_text)
+        if handoff_route.get("type"):
+            handoff_type = str(handoff_route.get("type") or "indirect")
+            reason = str(handoff_route.get("reason") or "需要人工处理")
             state.mark_drafting(
                 job["id"],
                 message_hash=current["hash"],
@@ -1729,20 +1753,21 @@ def _read_one_pending(
             )
             state.mark_handoff_pending(
                 job["id"],
-                handoff_type="direct",
+                handoff_type=handoff_type,
                 handoff_reason=reason,
                 reply_text="",
             )
             state.append_event(
                 {
-                    "type": "agent_direct_handoff",
+                    "type": "agent_handoff_pre_ai",
                     "job_id": job["id"],
                     "conversation": title,
+                    "handoff_type": handoff_type,
                     "reason": reason,
                     "latest": latest_turn_text,
                 }
             )
-            _log(f"[AI客服] 客户要求转人工：{title}｜{_short(latest_turn_text)}")
+            _log(f"[AI客服] 前置转人工：{title}｜类型={handoff_type}｜原因={reason}｜{_short(latest_turn_text)}")
             return {"ok": True, "read": 1, "drafting": 0, "handoff": 1, "conversation": title, "reason": reason}
 
         customer_key = _supplement_customer_key(job, visible_uid)
@@ -2337,7 +2362,7 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
             send_parts = _supplement_welcome_send_parts(final_reply, context) if supplement_from_welcome else [final_reply]
             text_send_parts = [part for part in send_parts if clean_customer_reply_text(part)]
             visible_parts = [
-                part for part in send_parts if part and worker._messages_contain_text(current.get("messages", []), part)
+                part for part in send_parts if part and _reply_visible_enough(current.get("messages", []), part)
             ]
             if text_send_parts and len(visible_parts) == len(text_send_parts):
                 state.mark_done(
@@ -2424,18 +2449,19 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 last=last,
                 expected_visible_text=send_parts[-1] if send_parts else final_reply,
                 capture_images=False,
+                attempts=1,
             )
-            missing_parts = [part for part in text_send_parts if not worker._messages_contain_text(after_send["messages"], part)]
+            missing_parts = [part for part in text_send_parts if not _reply_visible_enough(after_send["messages"], part)]
             if missing_parts:
                 _log(f"[AI客服] 发送后暂未读到回复，继续复核：{title}")
                 after_send = _read_current_with_retry(
                     last=last,
                     expected_visible_text=send_parts[-1] if send_parts else final_reply,
                     capture_images=False,
-                    attempts=max(2, int(os.environ.get("WECOM_AGENT_SEND_VERIFY_ATTEMPTS", "5"))),
+                    attempts=max(1, int(os.environ.get("WECOM_AGENT_SEND_VERIFY_ATTEMPTS", "2"))),
                     delay=float(os.environ.get("WECOM_AGENT_SEND_VERIFY_DELAY", "0.45")),
                 )
-                missing_parts = [part for part in text_send_parts if not worker._messages_contain_text(after_send["messages"], part)]
+                missing_parts = [part for part in text_send_parts if not _reply_visible_enough(after_send["messages"], part)]
                 if missing_parts:
                     state.mark_send_verification_failed(
                         job["id"],

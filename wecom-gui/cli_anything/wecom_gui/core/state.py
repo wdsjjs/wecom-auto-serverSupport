@@ -12,6 +12,7 @@ from pathlib import Path
 
 import fcntl
 
+from cli_anything.wecom_gui.core import handoff
 from cli_anything.wecom_gui.core.text import clean_customer_reply_text, clean_history_message_text
 
 
@@ -86,10 +87,7 @@ def latency_bucket(duration_ms: object) -> str:
 
 def handoff_type_for_text(text: object) -> str:
     """Classify explicit customer handoff requests."""
-    body = str(text or "").strip()
-    if not body:
-        return ""
-    return "direct" if any(term in body for term in HANDOFF_TERMS) else ""
+    return str(handoff.classify_handoff(text).get("type") or "")
 
 
 def handoff_session_seconds() -> float:

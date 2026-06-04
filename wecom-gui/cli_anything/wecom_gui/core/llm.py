@@ -47,6 +47,27 @@ INTERNAL_REPLY_REPLACEMENTS = {
     "tool": "工具",
 }
 
+
+def resolve_capture_path(path: object) -> str:
+    """Return an absolute image path that survives csbot running from another cwd."""
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    image_path = Path(raw).expanduser()
+    if image_path.is_absolute():
+        return str(image_path)
+
+    project_root = Path(__file__).resolve().parents[3]
+    candidates = [project_root / image_path, Path.cwd() / image_path]
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return str(candidate.resolve())
+        except OSError:
+            continue
+    return str((project_root / image_path).resolve(strict=False))
+
+
 def build_prompt(messages: list[dict]) -> list[dict]:
     """Build a chat-completions message list from GUI-extracted context."""
     transcript = "\n".join(f"{m.get('role', 'unknown')}: {m.get('text', '')}" for m in messages)
@@ -192,7 +213,7 @@ def message_image_paths(messages: list[dict]) -> list[str]:
         for media in message.get("media") or []:
             if not isinstance(media, dict):
                 continue
-            path = str(media.get("capture_path") or "").strip()
+            path = resolve_capture_path(media.get("capture_path"))
             if path and media.get("capture_ok", True):
                 paths.append(path)
     return paths
@@ -220,9 +241,10 @@ def build_csbot_context(
         for media in message.get("media") or []:
             if not isinstance(media, dict):
                 continue
+            capture_path = resolve_capture_path(media.get("capture_path"))
             media_item = {
                 "type": media.get("type") or "image",
-                "capture_path": str(media.get("capture_path") or ""),
+                "capture_path": capture_path,
                 "capture_ok": bool(media.get("capture_ok")),
                 "error": str(media.get("error") or ""),
             }

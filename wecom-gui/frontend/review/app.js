@@ -215,23 +215,7 @@
         return Array.isArray(item.reply_attachments) ? item.reply_attachments : [];
       }
       function renderAttachments(item) {
-        const attachments = attachmentsFor(item);
-        if (!item.handoff_pending || item.status !== "ready") return "";
-        const chips = attachments.map(attachment => `
-          <span class="attachment">
-            ${escapeText(attachment.name || "图片")}
-            <button type="button" data-action="delete-attachment" data-id="${item.id}" data-attachment-id="${escapeText(attachment.id)}">移除</button>
-          </span>
-        `).join("");
-        return `
-          <div class="attachments" data-attachments-for="${item.id}">
-            ${chips}
-            <label class="attachment upload">
-              添加图片
-              <input type="file" accept="image/png,image/jpeg" data-upload-id="${item.id}" />
-            </label>
-          </div>
-        `;
+        return "";
       }
       function renderItems(items, options = {}) {
         const editorState = options.restoreEditor ? captureEditorState() : null;
@@ -382,13 +366,11 @@
         const body = {};
         if (action === "approve" && editor) {
           const replyText = editor.value.trim();
-          const attachments = attachmentDrafts.get(String(id)) || [];
-          if (!replyText && !attachments.length) {
-            setStatus("回复内容或图片不能为空。", true);
+          if (!replyText) {
+            setStatus("回复内容不能为空。", true);
             return;
           }
           body.reply_text = editor.value;
-          body.attachment_ids = attachments.map(item => item.id).filter(Boolean);
           replyDrafts.set(String(id), editor.value);
         }
         buttons.forEach(btn => btn.disabled = true);
@@ -413,7 +395,6 @@
         const button = event.target.closest("button[data-action]");
         if (!button) return;
         if (button.dataset.action === "delete-attachment") {
-          deleteAttachment(button.dataset.id, button.dataset.attachmentId);
           return;
         }
         if (button.dataset.action === "complete-issue") {
@@ -474,7 +455,6 @@
       listEl.addEventListener("change", (event) => {
         const input = event.target.closest("input[data-upload-id]");
         if (!input || !input.files || !input.files.length) return;
-        uploadAttachment(input.dataset.uploadId, input.files[0]).catch(err => setStatus(String(err.message || err), true));
       });
       listEl.addEventListener("input", (event) => {
         const editor = event.target.closest("textarea[data-id]");

@@ -634,6 +634,42 @@ def test_direct_handoff_enters_handoff_queue_without_ai_draft(monkeypatch, tmp_p
     assert item["reply_text"] == ""
 
 
+def test_complaint_with_image_enters_handoff_queue_before_ai(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "我要投诉你", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, "sig")
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {
+            "hash": "hash-complaint-image",
+            "messages": [
+                {
+                    "role": "用户",
+                    "content": "[图片]",
+                    "text": "[图片]",
+                    "media": [{"type": "image", "capture_ok": True, "capture_path": "/tmp/customer.png"}],
+                },
+                {"role": "用户", "content": "我要投诉你", "text": "我要投诉你"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.llm.draft_reply",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("AI should not draft complaint handoff")),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = agent._read_one_pending(last=12, executor=executor, futures={}, max_drafts=1)
+
+    assert result["handoff"] == 1
+    item = review_server.list_review_items(status="handoff")[0]
+    assert item["handoff_pending"] is True
+    assert item["handoff_type"] == "indirect"
+    assert "投诉" in item["handoff_reason"]
+    assert item["reply_text"] == ""
+
+
 def test_indirect_ai_handoff_enters_handoff_queue(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "这个问题很复杂", "time": "刚刚", "tags": ["@微信"], "raw": []}

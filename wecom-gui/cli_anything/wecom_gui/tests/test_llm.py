@@ -6,6 +6,7 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from unittest import mock
 from urllib import request
 
@@ -125,6 +126,23 @@ def test_latest_user_turn_text_keeps_captured_image_placeholder():
     )
 
     assert query == "[图片]\n这是什么？"
+
+def test_message_image_paths_resolves_relative_capture_paths():
+    relative_path = ".codex-run/wecom-images/customer.png"
+    project_root = Path(llm.__file__).resolve().parents[3]
+    expected = str((project_root / relative_path).resolve(strict=False))
+    messages = [
+        {
+            "role": "用户",
+            "content": "[图片]",
+            "media": [{"capture_ok": True, "capture_path": relative_path}],
+        }
+    ]
+
+    assert llm.message_image_paths(messages) == [expected]
+    context = llm.build_csbot_context(messages)
+    assert context["image_paths"] == [expected]
+    assert context["messages"][0]["media"][0]["capture_path"] == expected
 
 def test_uda_provider_extracts_data_message(monkeypatch):
     captured = {}

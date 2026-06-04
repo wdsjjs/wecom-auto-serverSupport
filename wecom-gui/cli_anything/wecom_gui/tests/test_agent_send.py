@@ -46,6 +46,7 @@ def test_agent_send_recheck_allows_same_latest_text_with_misread_role(monkeypatc
     sent = []
 
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.ensure_input_ready", lambda: {"ok": True})
     monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
     monkeypatch.setattr(
         "cli_anything.wecom_gui.core.reply.send_message",
@@ -203,6 +204,7 @@ def test_agent_marks_supplement_recommended_after_successful_send(monkeypatch, t
     sent = []
 
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.ensure_input_ready", lambda: {"ok": True})
     monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
     monkeypatch.setattr(
         "cli_anything.wecom_gui.core.reply.send_message",
@@ -418,6 +420,7 @@ def test_agent_send_recheck_retries_empty_live_read(monkeypatch, tmp_path):
     sent = []
 
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.ensure_input_ready", lambda: {"ok": True})
     monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
     monkeypatch.setattr("cli_anything.wecom_gui.core.agent.time.sleep", lambda seconds: None)
     monkeypatch.setattr(
@@ -591,6 +594,7 @@ def test_agent_send_verification_failure_does_not_record_sent_reply(monkeypatch,
     sent = []
 
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.ensure_input_ready", lambda: {"ok": True})
     monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
     monkeypatch.setattr("cli_anything.wecom_gui.core.agent.time.sleep", lambda seconds: None)
     monkeypatch.setattr(
@@ -607,6 +611,54 @@ def test_agent_send_verification_failure_does_not_record_sent_reply(monkeypatch,
     assert failed[0]["error"] == "sent_reply_not_visible"
     stored = state.list_conversation_messages(conversation_key=item["conversation_key"])
     assert [message["text"] for message in stored] == ["嗯"]
+
+
+def test_agent_send_verification_accepts_long_reply_visible_chunks(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "怎么搭配？", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    latest = {"role": "用户", "text": "怎么搭配？", "content": "怎么搭配？"}
+    long_reply = (
+        "结合您的需求，为您推荐这几款产品组合。接下来，我详细为您介绍下：\n"
+        "产品A适合日常营养支持，建议随餐服用。\n"
+        "产品B适合睡眠质量差的人群，建议晚间服用。\n"
+        "产品C适合精神不振的人群，建议按说明搭配。"
+    )
+    state.mark_drafting(item["id"], message_hash="hash1", messages=[latest], latest=latest)
+    state.mark_ready(item["id"], reply_text=long_reply)
+
+    reads = iter(
+        [
+            {"hash": "precheck", "messages": [latest]},
+            {
+                "hash": "after-send",
+                "messages": [
+                    latest,
+                    {
+                        "role": "客服",
+                        "text": long_reply[:95] + " ... " + long_reply[-95:],
+                        "content": long_reply[:95] + " ... " + long_reply[-95:],
+                    },
+                ],
+            },
+        ]
+    )
+    sent = []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.ensure_input_ready", lambda: {"ok": True})
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
+    monkeypatch.setattr("cli_anything.wecom_gui.core.agent.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(text) or {"ok": True},
+    )
+
+    result = agent._send_one_ready(last=12, mode="auto")
+
+    assert result["sent"] == 1
+    assert sent == [long_reply]
+    assert state.list_queue(status="done")[0]["reply_text"] == long_reply
 
 
 def test_agent_skips_send_when_reply_already_visible(monkeypatch, tmp_path):
