@@ -55,7 +55,8 @@ SUPPLEMENT_REPLY_SOURCE = "supplement"
 
 
 def state_dir() -> Path:
-    path = Path.home() / ".cli-anything-wecom-gui"
+    configured = os.environ.get("WECOM_GUI_STATE_DIR", "").strip()
+    path = Path(configured).expanduser() if configured else Path.home() / ".cli-anything-wecom-gui"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -1307,6 +1308,10 @@ def enqueue_conversation(row: dict, signature: str) -> tuple[bool, dict]:
             existing=existing,
             now=now,
         )
+        if existing:
+            cached_reason = _cached_read_reason_for_existing(conn, existing, row)
+            if cached_reason:
+                return False, _row_to_dict(existing)
         if existing and existing["signature"] == signature:
             existing_reply_text = str(existing["reply_text"] or "").strip()
             preview_text = str(row.get("preview", "")).strip()
@@ -1629,6 +1634,90 @@ def get_job_by_conversation_key(conversation_key: str) -> dict | None:
             (conversation_key,),
         ).fetchone()
     return _row_to_dict(row) if row else None
+
+
+def preview_matches_last_read_customer_message(row: dict) -> bool:
+    """Return whether the visible row preview matches the last read customer text."""
+    return bool(cached_read_reason_for_row(row) == "preview_matches_last_read_customer_message")
+
+
+def cached_read_reason_for_row(row: dict) -> str:
+    """Return why a visible row can be skipped because its latest message was read."""
+    preview = clean_history_message_text(row.get("preview") or "")
+    conversation_key = conversation_key_for_row(row)
+    if not conversation_key:
+        return ""
+    with connect() as conn:
+        queue_row = conn.execute(
+            "SELECT * FROM reply_queue WHERE conversation_key = ?",
+            (conversation_key,),
+        ).fetchone()
+        return _cached_read_reason_for_existing(conn, queue_row, row, preview=preview)
+
+
+def _cached_read_reason_for_existing(
+    conn: sqlite3.Connection,
+    existing: sqlite3.Row | None,
+    row: dict,
+    *,
+    preview: str | None = None,
+) -> str:
+    """Return a stable skip reason for unread badges that point to read content."""
+    if existing is None:
+        return ""
+    if str(existing["handoff_type"] or "").strip():
+        return ""
+    status = str(existing["status"] or "")
+    if status not in ACTIVE_STATUSES and status != "done":
+        return ""
+    preview = clean_history_message_text(row.get("preview") or "") if preview is None else preview
+    existing_preview = clean_history_message_text(existing["preview"] or "")
+    context = {}
+    try:
+        loaded_context = json.loads(str(existing["context_json"] or "{}"))
+        if isinstance(loaded_context, dict):
+            context = loaded_context
+    except json.JSONDecodeError:
+        context = {}
+    latest = context.get("latest") if isinstance(context, dict) else {}
+    if preview and isinstance(latest, dict):
+        latest_role = str(latest.get("role") or "")
+        latest_text = clean_history_message_text(latest.get("content") or latest.get("text") or "")
+        if latest_role == "用户" and latest_text == preview:
+            return "preview_matches_last_read_customer_message"
+    if preview and existing_preview == preview and str(existing["last_message_hash"] or "").strip():
+        return "preview_unchanged_after_read"
+    if (
+        not preview
+        and not existing_preview
+        and (
+            str(existing["last_message_hash"] or "").strip()
+            or int(context.get("message_count") or 0) > 0
+            or bool(context.get("read_only"))
+        )
+    ):
+        return "empty_preview_unchanged_after_read"
+    if not preview:
+        return ""
+    conversation_key = str(existing["conversation_key"] or conversation_key_for_row(row))
+    if conversation_key:
+        message = conn.execute(
+            """
+            SELECT role, text
+            FROM conversation_messages
+            WHERE conversation_key = ?
+            ORDER BY seq DESC
+            LIMIT 1
+            """,
+            (conversation_key,),
+        ).fetchone()
+        if (
+            message
+            and str(message["role"] or "") == "用户"
+            and clean_history_message_text(message["text"] or "") == preview
+        ):
+            return "preview_matches_last_read_customer_message"
+    return ""
 
 
 def get_welcome_state(customer_key: str) -> dict | None:

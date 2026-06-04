@@ -1,0 +1,40 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+RUN_DIR="$ROOT_DIR/.codex-run"
+ENV_FILE="${WECOM_AGENT_ENV:-$ROOT_DIR/.env.local}"
+SOURCE="$ROOT_DIR/cli_anything/wecom_gui/scripts/native_ax_window_dump.swift"
+DEFAULT_OUT_DIR="$RUN_DIR/ax-dumps"
+
+cd "$ROOT_DIR"
+mkdir -p "$DEFAULT_OUT_DIR"
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+if [[ -z "${SDKROOT:-}" && -d "/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk" ]]; then
+  export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk"
+fi
+
+timestamp="$(date '+%Y%m%d-%H%M%S')"
+OUT_FILE="${1:-$DEFAULT_OUT_DIR/wecom-native-ax-window-$timestamp.json}"
+mkdir -p "$(dirname "$OUT_FILE")"
+
+HELPER="$RUN_DIR/native_ax_window_dump"
+if [[ ! -x "$HELPER" || "$SOURCE" -nt "$HELPER" ]]; then
+  if ! command -v swiftc >/dev/null 2>&1; then
+    echo "ERROR: swiftc is required to compile the native AX dumper" >&2
+    exit 1
+  fi
+  tmp_helper="$HELPER.tmp.$$"
+  swiftc "$SOURCE" -o "$tmp_helper"
+  mv "$tmp_helper" "$HELPER"
+  chmod +x "$HELPER"
+fi
+
+"$HELPER" "$OUT_FILE"

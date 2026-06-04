@@ -38,7 +38,7 @@ def test_latest_user_message_ignores_welcome_system_text():
     assert watcher.latest_user_message([{"role": "用户", "content": "以上是打招呼内容"}]) is None
 
 
-def test_conversation_signature_includes_unread_count():
+def test_conversation_signature_ignores_unread_count():
     first = watcher._conversation_signature(
         {"title": "客户A", "preview": "你好", "time": "刚刚", "tags": ["@微信"], "unread_count": 1}
     )
@@ -46,7 +46,7 @@ def test_conversation_signature_includes_unread_count():
         {"title": "客户A", "preview": "你好", "time": "刚刚", "tags": ["@微信"], "unread_count": 2}
     )
 
-    assert first != second
+    assert first == second
 
 def test_done_queue_item_is_not_reopened_when_only_relative_time_changes(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
@@ -101,7 +101,7 @@ def test_done_queue_item_is_not_reopened_when_preview_is_our_reply(monkeypatch, 
     assert existing["preview"] == "您好，请问有什么可以帮您？"
     assert state.list_queue(status="pending") == []
 
-def test_done_queue_item_reopens_when_same_signature_still_has_unread(monkeypatch, tmp_path):
+def test_done_queue_item_is_not_reopened_by_stale_unread_badge(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     monkeypatch.setenv("WECOM_GUI_DONE_REOPEN_COOLDOWN_SECONDS", "0")
     row = {
@@ -120,10 +120,10 @@ def test_done_queue_item_reopens_when_same_signature_still_has_unread(monkeypatc
 
     changed_again, existing = state.enqueue_conversation(row, signature)
 
-    assert changed_again is True
-    assert existing["status"] == "pending"
-    assert existing["reply_text"] is None
-    assert state.list_queue(status="pending")[0]["title"] == "客户A"
+    assert changed_again is False
+    assert existing["status"] == "done"
+    assert existing["reply_text"] == "您好，请问有什么可以帮您？"
+    assert state.list_queue(status="pending") == []
 
 
 def test_read_only_done_item_is_not_reopened_by_same_unread_signature(monkeypatch, tmp_path):
@@ -152,6 +152,62 @@ def test_read_only_done_item_is_not_reopened_by_same_unread_signature(monkeypatc
     assert changed_again is False
     assert existing["status"] == "done"
     assert state.list_queue(status="pending") == []
+
+
+def test_done_queue_item_is_not_reopened_by_empty_preview_stale_badge(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {
+        "title": "客户A",
+        "preview": "",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "unread": True,
+        "unread_count": 1,
+        "raw": [],
+    }
+    signature = watcher._conversation_signature(row)
+    changed, item = state.enqueue_conversation(row, signature)
+    assert changed is True
+    state.mark_read_logged(
+        item["id"],
+        message_hash="read-hash",
+        messages=[{"role": "用户", "text": "[动画表情]", "message_type": "customer"}],
+    )
+
+    changed_again, existing = state.enqueue_conversation(
+        {**row, "unread_count": 9},
+        watcher._conversation_signature({**row, "unread_count": 9}),
+    )
+
+    assert changed_again is False
+    assert existing["status"] == "done"
+    assert state.list_queue(status="pending") == []
+
+
+def test_done_queue_item_reopens_when_unread_preview_changes(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    monkeypatch.setenv("WECOM_GUI_DONE_REOPEN_COOLDOWN_SECONDS", "0")
+    row = {
+        "title": "客户A",
+        "preview": "还在吗",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "unread": True,
+        "unread_count": 1,
+        "raw": [],
+    }
+    changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    assert changed is True
+    state.mark_done(item["id"], message_hash="hash", reply_text="您好，请问有什么可以帮您？")
+
+    changed_again, existing = state.enqueue_conversation(
+        {**row, "preview": "新的问题", "unread_count": 2},
+        watcher._conversation_signature({**row, "preview": "新的问题", "unread_count": 2}),
+    )
+
+    assert changed_again is True
+    assert existing["status"] == "pending"
+    assert existing["preview"] == "新的问题"
 
 
 def test_conversation_filter_skips_system_rows():

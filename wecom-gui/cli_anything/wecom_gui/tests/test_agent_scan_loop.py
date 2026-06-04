@@ -432,6 +432,66 @@ def test_scan_once_enqueues_without_clicking(monkeypatch, tmp_path):
     assert clicked["value"] is False
     assert state.list_queue(status="pending")[0]["title"] == "客户A"
 
+def test_scan_once_skips_cached_preview_without_opening(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {
+        "title": "客户A",
+        "preview": "你好",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "unread": True,
+        "unread_count": 1,
+        "raw": [],
+    }
+    state.enqueue_conversation(row, "sig1")
+    job = state.claim_pending_for_read()
+    state.mark_drafting(
+        job["id"],
+        message_hash="hash1",
+        messages=[{"role": "用户", "content": "你好", "text": "你好"}],
+        latest={"role": "用户", "content": "你好", "text": "你好"},
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.inbox.scan_visible",
+        lambda limit=12: {"ok": True, "conversations": [row]},
+    )
+
+    result = worker.scan_once(inbox_limit=12)
+
+    assert result["enqueued"] == 0
+    assert result["ignored_cached_preview"] == 1
+    assert result["ignored"] == 1
+
+
+def test_scan_once_skips_empty_preview_stale_unread_badge(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {
+        "title": "客户A",
+        "preview": "",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "unread": True,
+        "unread_count": 7,
+        "raw": [],
+    }
+    state.enqueue_conversation(row, "sig-empty")
+    job = state.claim_pending_for_read()
+    state.mark_read_logged(
+        job["id"],
+        message_hash="hash-empty",
+        messages=[{"role": "用户", "content": "[动画表情]", "text": "[动画表情]"}],
+    )
+    events = []
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.scan_visible", lambda limit=12: {"ok": True, "conversations": [row]})
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.append_event", lambda event: events.append(event))
+
+    result = worker.scan_once(inbox_limit=12)
+
+    assert result["enqueued"] == 0
+    assert result["ignored_cached_preview"] == 1
+    assert events[-1]["type"] == "queue_skip_cached_preview"
+    assert events[-1]["reason"] == "empty_preview_unchanged_after_read"
+
 def test_scan_once_scrolls_multiple_pages_and_deduplicates(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     pages = [

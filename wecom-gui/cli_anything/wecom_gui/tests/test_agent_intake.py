@@ -132,6 +132,33 @@ def test_agent_upgrades_visible_queue_key_to_sidebar_uid(monkeypatch, tmp_path):
     assert state.get_job(item["id"])["conversation_key"] == "uid:wm-visible"
 
 
+def test_agent_read_defers_when_opened_conversation_mismatches(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "查订单", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    assert changed is True
+
+    opened: list[str] = []
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: opened.append(job["title"]))
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.agent._selected_conversation_after_open",
+        lambda limit=30: {"title": "客户B", "preview": "别人的消息", "selected": True},
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not read mismatched chat")),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = agent._read_one_pending(last=12, executor=executor, futures={}, max_drafts=1)
+
+    assert result["reason"] == "opened_conversation_mismatch"
+    assert opened == ["客户A"]
+    pending = state.get_job(item["id"])
+    assert pending["status"] == "pending"
+    assert pending["error"] == "opened_conversation_mismatch"
+
+
 def test_agent_creates_welcome_ready_draft_from_system_text(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {
@@ -168,7 +195,7 @@ def test_agent_creates_welcome_ready_draft_from_system_text(monkeypatch, tmp_pat
     assert futures == {}
     ready = state.list_queue(status="ready")[0]
     assert ready["reply_text"].startswith("您好，三水儿")
-    assert "Luna 营养工厂健康顾问" in ready["reply_text"]
+    assert "营养工厂健康顾问" in ready["reply_text"]
     assert "您好~可以简单介绍下您的基本信息" in ready["reply_text"]
     assert "20.儿童成长" in ready["reply_text"]
     assert ready["reply_source"] == "supplement"
@@ -542,7 +569,7 @@ def test_agent_builds_supplement_prompt_for_new_customer_system_message(monkeypa
     assert futures == {}
     ready = state.list_queue(status="ready")[0]
     assert ready["reply_text"].startswith("您好，三水儿")
-    assert "Luna 营养工厂健康顾问" in ready["reply_text"]
+    assert "营养工厂健康顾问" in ready["reply_text"]
     assert agent.supplement_first_reply_with_profile() in ready["reply_text"]
     assert ready["reply_source"] == "supplement"
     assert state.get_supplement_state(ready["conversation_key"])["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE

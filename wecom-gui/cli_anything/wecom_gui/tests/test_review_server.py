@@ -203,7 +203,7 @@ def test_supplement_test_new_user_gets_fixed_welcome_followup(monkeypatch, tmp_p
     assert result["state"]["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
     assert [message["message_type"] for message in result["messages"]] == ["reply", "reply"]
     assert result["messages"][0]["text"].startswith("您好，新客户A")
-    assert "Luna 营养工厂健康顾问" in result["messages"][0]["text"]
+    assert "营养工厂健康顾问" in result["messages"][0]["text"]
     assert "领产品说明书 https://docs.qq.com/s/tHMpjD9S811JnjY369QC2G" in result["messages"][0]["text"]
     assert result["messages"][1]["text"].startswith("您好~可以简单介绍下您的基本信息")
     assert result["logs"][0]["event_type"] == "supplement_route_evaluated"

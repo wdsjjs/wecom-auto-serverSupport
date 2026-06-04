@@ -15,11 +15,13 @@ import tempfile
 import json
 import time
 import uuid
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_APP_NAMES = ("企业微信", "WeCom", "WeChat Work")
 DEFAULT_TAG_MARKERS = ("@微信", "外部", "部门", "BOT")
+NAVIGATION_ROW_TITLES = {"单聊", "群聊", "@我", "未读", "内部聊天"}
 _AX_SCAN_DISABLED_UNTIL = 0.0
 
 
@@ -358,7 +360,58 @@ def extract_wecom_external_user_id(texts: list[str]) -> str:
 
 def current_external_user_id(app_name: str | None = None) -> str:
     """Read current external_userid from visible WeCom sidebar debug content."""
+    try:
+        identity = sidebar_identity(app_name)
+        uid = str(identity.get("external_user_id") or identity.get("external_userid") or "").strip()
+        if uid:
+            return uid
+    except Exception:
+        pass
     return extract_wecom_external_user_id(visible_accessibility_text(app_name))
+
+
+def _swift_ax_sdkroot() -> str:
+    """Return a Swift SDKROOT that works with the local command-line Swift toolchain."""
+    def usable(path_text: str) -> bool:
+        path = Path(path_text)
+        if not path.exists():
+            return False
+        match = re.fullmatch(r"MacOSX(\d+(?:\.\d+)*)\.sdk", path.name)
+        if not match:
+            return True
+        version = tuple(int(part) for part in match.group(1).split("."))
+        return not version or version[0] < 26
+
+    configured = os.environ.get("WECOM_GUI_AX_SDKROOT", "").strip()
+    if configured and Path(configured).exists():
+        return configured
+    existing = os.environ.get("SDKROOT", "").strip()
+    if existing and usable(existing):
+        return existing
+    sdk_dir = Path("/Library/Developer/CommandLineTools/SDKs")
+    if not sdk_dir.exists():
+        return ""
+    candidates: list[tuple[tuple[int, ...], Path]] = []
+    for path in sdk_dir.glob("MacOSX*.sdk"):
+        match = re.fullmatch(r"MacOSX(\d+(?:\.\d+)*)\.sdk", path.name)
+        if not match:
+            continue
+        version = tuple(int(part) for part in match.group(1).split("."))
+        if version and version[0] >= 26:
+            continue
+        candidates.append((version, path))
+    if not candidates:
+        return ""
+    return str(max(candidates, key=lambda item: item[0])[1])
+
+
+def _swift_ax_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("WECOM_GUI_BUNDLE_ID", "com.tencent.WeWorkMac")
+    sdkroot = _swift_ax_sdkroot()
+    if sdkroot:
+        env["SDKROOT"] = sdkroot
+    return env
 
 
 def _swift_ax(command: str | list[str]) -> list[dict]:
@@ -369,8 +422,7 @@ def _swift_ax(command: str | list[str]) -> list[dict]:
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "ax_wecom.swift"
     if not script_path.exists():
         return []
-    env = os.environ.copy()
-    env.setdefault("WECOM_GUI_BUNDLE_ID", "com.tencent.WeWorkMac")
+    env = _swift_ax_env()
     args = command.split(" ") if isinstance(command, str) else command
     scan_commands = {"geometry", "rows", "selected-row", "chat", "chat-all", "texts"}
     circuit_breaker_commands = {"geometry", "rows", "selected-row", "texts"}
@@ -437,6 +489,7 @@ def _swift_ax_runner(script_path: Path) -> list[str]:
             capture_output=True,
             timeout=compile_timeout,
             check=False,
+            env=_swift_ax_env(),
         )
         if proc.returncode == 0 and binary_path.exists():
             return [str(binary_path)]
@@ -448,6 +501,19 @@ def _swift_ax_runner(script_path: Path) -> list[str]:
 def send_via_ax_text_input(text: str, *, submit: bool = True) -> dict:
     """Set the right-side chat input through AXUIElement and optionally submit."""
     command = "send" if submit else "stage"
+    ready_items = _swift_ax("input-ready")
+    ready = ready_items[-1] if ready_items else {"ok": False, "error": "input_ready_unavailable"}
+    _append_event(
+        {
+            "type": "wecom_send_input_preflight",
+            "ok": bool(ready.get("ok")),
+            "error": ready.get("error") or "",
+            "sidebar": ready.get("sidebar") if isinstance(ready.get("sidebar"), dict) else {},
+            "input": ready.get("input") if isinstance(ready.get("input"), dict) else {},
+        }
+    )
+    if not ready.get("ok"):
+        raise RuntimeError(f"AX text input not ready: {ready}")
     items: list[dict] = []
     attempts = max(1, int(os.environ.get("WECOM_GUI_AX_SEND_ATTEMPTS", "2")))
     retry_delay = float(os.environ.get("WECOM_GUI_AX_SEND_RETRY_DELAY", "0.25"))
@@ -486,22 +552,8 @@ def normalize_window(*, mode: str | None = None) -> dict:
 
 
 def _swift_ax_open(title: str) -> bool:
-    if shutil.which("swift") is None:
-        return False
-    script_path = Path(__file__).resolve().parents[1] / "scripts" / "ax_wecom.swift"
-    if not script_path.exists():
-        return False
-    env = os.environ.copy()
-    env.setdefault("WECOM_GUI_BUNDLE_ID", "com.tencent.WeWorkMac")
-    proc = subprocess.run(
-        ["swift", str(script_path), "open", title],
-        text=True,
-        capture_output=True,
-        timeout=30,
-        check=False,
-        env=env,
-    )
-    return proc.returncode == 0
+    items = _swift_ax(["open", title])
+    return bool(items and items[-1].get("ok"))
 
 
 def _adaptive_scroll_point() -> tuple[int, int]:
@@ -589,9 +641,206 @@ def _ax_conversation_rows(limit: int) -> list[dict]:
     return rows
 
 
+def _bounded_scan_enabled() -> bool:
+    return os.environ.get("WECOM_GUI_BOUNDED_SCAN", "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _recent_scan_minutes() -> int:
+    try:
+        return max(1, int(os.environ.get("WECOM_GUI_RECENT_SCAN_MINUTES", "10")))
+    except ValueError:
+        return 10
+
+
+def _time_text_age_minutes(time_text: object, *, now: datetime | None = None) -> float | None:
+    text = str(time_text or "").strip()
+    if not text:
+        return None
+    now = now or datetime.now()
+    if text == "刚刚":
+        return 0.0
+    match = re.search(r"(\d+)\s*分钟前", text)
+    if match:
+        return float(match.group(1))
+    if re.fullmatch(r"\d{1,2}:\d{2}", text):
+        hour, minute = [int(part) for part in text.split(":", 1)]
+        seen = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if seen > now + timedelta(minutes=1):
+            seen -= timedelta(days=1)
+        return max(0.0, (now - seen).total_seconds() / 60.0)
+    if "昨天" in text or "星期" in text or re.fullmatch(r"\d{1,2}/\d{1,2}", text):
+        return 24 * 60.0
+    return None
+
+
+def _row_is_recent_or_actionable(row: dict, *, minutes: int, now: datetime | None = None) -> tuple[bool, bool]:
+    """Return `(keep, stop_scan)` for a visible conversation row."""
+    if int(row.get("unread_count") or 0) > 0 or bool(row.get("unread")):
+        return True, False
+    preview = str(row.get("preview") or "").strip()
+    if "你已添加了" in preview and "现在可以开始聊天了" in preview:
+        return True, False
+    age = _time_text_age_minutes(row.get("time"), now=now)
+    if age is None:
+        return True, False
+    if age <= minutes:
+        return True, False
+    return False, True
+
+
+def _row_from_ax_item(item: dict, *, index: int, source: str) -> dict | None:
+    texts = [
+        str(text).strip()
+        for text in item.get("texts", [])
+        if str(text).strip() and not str(text).strip().startswith(("icon ", "avatar "))
+    ]
+    title = texts[0] if texts else ""
+    if not title:
+        return None
+    x = float(item.get("x") or 0)
+    width = float(item.get("width") or 0)
+    preview = ""
+    time_text = str(item.get("timeText") or "").strip()
+    tags: list[str] = []
+    unread_count = 0
+    for text in texts[1:]:
+        if text.startswith("@") or any(marker in text for marker in tag_markers()):
+            tags.append(text)
+        elif re.search(r"\d+分钟前|刚刚|\d{1,2}:\d{2}|星期|\d+/\d+|昨天", text):
+            if not time_text:
+                time_text = text
+        elif re.fullmatch(r"\d+", text):
+            unread_count += int(text)
+        else:
+            preview = preview or text
+    if bool(item.get("hasUnreadMarker")) and unread_count == 0:
+        unread_count = 1
+    return {
+        "index": index,
+        "title": title,
+        "preview": preview,
+        "time": time_text,
+        "tags": tags,
+        "unread": unread_count > 0,
+        "unread_count": unread_count,
+        "raw": texts,
+        "source": source,
+        "click_x": x + width / 2,
+        "click_y": float(item.get("y") or 0) + float(item.get("height") or 0) / 2,
+        "selected": bool(item.get("selected")),
+    }
+
+
+def _bounded_conversation_rows(limit: int) -> list[dict]:
+    minutes = _recent_scan_minutes()
+    started = time.perf_counter()
+    rows: list[dict] = []
+    ensure = _swift_ax("ensure-single-chat")
+    if ensure and ensure[-1].get("ok") is False:
+        _append_event(
+            {
+                "type": "wecom_bounded_scan_failed",
+                "stage": "ensure_single_chat",
+                "minutes": minutes,
+                "limit": limit,
+                "result": ensure[-1],
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            }
+        )
+        return []
+    items = _swift_ax(["recent-rows", str(minutes), str(limit)])
+    now = datetime.now()
+    stop_reason = ""
+    for item in items:
+        row = _row_from_ax_item(item, index=len(rows) + 1, source="axuielement-bounded")
+        if row is None:
+            continue
+        keep, stop_scan = _row_is_recent_or_actionable(row, minutes=minutes, now=now)
+        if keep:
+            rows.append(row)
+            if len(rows) >= limit:
+                stop_reason = "limit_reached"
+                break
+        if stop_scan:
+            stop_reason = f"older_than_{minutes}m:{row.get('time', '')}"
+            break
+    _append_event(
+        {
+            "type": "wecom_bounded_scan",
+            "minutes": minutes,
+            "limit": limit,
+            "raw_count": len(items),
+            "row_count": len(rows),
+            "stop_reason": stop_reason,
+            "ensure_single_chat": ensure[-1] if ensure else {},
+            "rows": [
+                {
+                    "title": row.get("title", ""),
+                    "preview": row.get("preview", ""),
+                    "time": row.get("time", ""),
+                    "unread": row.get("unread", False),
+                    "unread_count": row.get("unread_count", 0),
+                }
+                for row in rows[:20]
+            ],
+            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+    )
+    return rows
+
+
+def ensure_input_ready(app_name: str | None = None) -> dict:
+    """Ensure the current chat input is usable and the sidebar can be opened."""
+    chosen = resolve_app_name(app_name)
+    if not chosen:
+        raise RuntimeError("WeCom is not running or its app name differs. Start WeCom or set WECOM_GUI_APP_NAME.")
+    if os.environ.get("WECOM_GUI_ACTIVATE_BEFORE_SCAN", "0") == "1":
+        activate_app(chosen)
+    items = _swift_ax("input-ready")
+    result = items[-1] if items else {"ok": False, "error": "input_ready_unavailable"}
+    _append_event({"type": "wecom_input_ready", "result": result})
+    return result
+
+
+def sidebar_identity(app_name: str | None = None) -> dict:
+    """Read the visible right sidebar identity payload when available."""
+    chosen = resolve_app_name(app_name)
+    if not chosen:
+        raise RuntimeError("WeCom is not running or its app name differs. Start WeCom or set WECOM_GUI_APP_NAME.")
+    if os.environ.get("WECOM_GUI_ACTIVATE_BEFORE_SCAN", "0") == "1":
+        activate_app(chosen)
+    items = _swift_ax("sidebar-identity")
+    result = items[-1] if items else {"ok": False, "error": "sidebar_identity_unavailable", "external_user_id": ""}
+    _append_event(
+        {
+            "type": "wecom_sidebar_identity",
+            "ok": bool(result.get("ok")),
+            "external_user_id": result.get("external_user_id") or result.get("external_userid") or "",
+            "error": result.get("error") or "",
+        }
+    )
+    return result
+
+
 def selected_conversation_row(app_name: str | None = None, *, limit: int = 30) -> dict | None:
     """Return the currently selected visible sidebar conversation when AX exposes it."""
+    chosen = resolve_app_name(app_name)
+    if chosen:
+        if os.environ.get("WECOM_GUI_ACTIVATE_BEFORE_SCAN", "0") == "1":
+            activate_app(chosen)
+        items = _swift_ax("selected-row")
+        for item in items:
+            if item.get("ok") is False:
+                continue
+            row = _row_from_ax_item(item, index=1, source="axuielement-selected")
+            if row is not None:
+                if str(row.get("title") or "").strip() in NAVIGATION_ROW_TITLES:
+                    continue
+                row["selected"] = True
+                return row
     for row in conversation_rows(app_name, limit=limit):
+        if str(row.get("title") or "").strip() in NAVIGATION_ROW_TITLES:
+            continue
         if row.get("selected"):
             return row
     return None
@@ -607,6 +856,17 @@ def conversation_rows(app_name: str | None = None, limit: int = 30) -> list[dict
         )
     if os.environ.get("WECOM_GUI_ACTIVATE_BEFORE_SCAN", "0") == "1":
         activate_app(chosen)
+    if _bounded_scan_enabled():
+        bounded_rows = _bounded_conversation_rows(limit)
+        if bounded_rows:
+            return bounded_rows
+        _append_event(
+            {
+                "type": "wecom_bounded_scan_fallback",
+                "reason": "bounded_rows_empty",
+                "limit": limit,
+            }
+        )
     ax_rows = _ax_conversation_rows(limit)
     if ax_rows:
         return ax_rows
@@ -1020,11 +1280,46 @@ def _is_chat_image_rect(rect: dict) -> bool:
     return width >= min_size and height >= min_size and width * height >= min_area
 
 
-def _is_chat_pane_item(item: dict, sidebar_right: float) -> bool:
+def _chat_pane_boundaries(geometry: dict) -> tuple[float, float, str]:
+    """Return chat-left and right-sidebar-left boundaries from AX geometry."""
+    source = "fallback"
+    chat_left = _float_value(geometry.get("chatLeft"))
+    if chat_left > 0:
+        source = "chatLeft"
+    else:
+        conversation_list = geometry.get("conversationList") if isinstance(geometry, dict) else None
+        if isinstance(conversation_list, dict):
+            list_left = _float_value(conversation_list.get("x"))
+            list_width = _float_value(conversation_list.get("width"))
+            if list_left > 0 and list_width > 0:
+                chat_left = list_left + list_width
+                source = "conversationList"
+        if chat_left <= 0:
+            sidebar = geometry.get("sidebar") if isinstance(geometry, dict) else None
+            if isinstance(sidebar, dict):
+                sidebar_left = _float_value(sidebar.get("x"))
+                sidebar_width = _float_value(sidebar.get("width"))
+                if sidebar_left > 0 and sidebar_width > 0:
+                    chat_left = sidebar_left + sidebar_width
+                    source = "sidebar"
+    if chat_left <= 0:
+        chat_left = 300.0
+        source = "default"
+
+    right_sidebar_left = _float_value(geometry.get("rightSidebarLeft"))
+    return chat_left, right_sidebar_left, source
+
+
+def _is_chat_pane_item(item: dict, chat_left: float, right_sidebar_left: float = 0.0) -> bool:
     x = float(item.get("x") or 0)
     width = float(item.get("width") or 0)
+    right = x + width
     tolerance = float(os.environ.get("WECOM_GUI_CHAT_PANE_BOUNDARY_TOLERANCE", "2"))
-    return x >= sidebar_right - tolerance and width >= 250
+    return (
+        x >= chat_left - tolerance
+        and width >= 250
+        and (right_sidebar_left <= 0 or right <= right_sidebar_left + tolerance or x < right_sidebar_left - tolerance)
+    )
 
 
 def _meaningful_chat_texts(item: dict) -> tuple[str, list[str], str]:
@@ -1127,10 +1422,10 @@ def _chat_image_row_rect(item: dict, *, anchor_x: int | None = None) -> dict:
     }
 
 
-def _ax_chat_all_items(sidebar_right: float) -> list[dict]:
+def _ax_chat_all_items(chat_left: float, right_sidebar_left: float = 0.0) -> list[dict]:
     items: list[dict] = []
     for item in _swift_ax("chat-all"):
-        if _is_chat_pane_item(item, sidebar_right):
+        if _is_chat_pane_item(item, chat_left, right_sidebar_left):
             items.append(item)
     return items
 
@@ -1157,10 +1452,16 @@ def _image_row_anchor_x(items: list[dict], index: int) -> int | None:
     return None
 
 
-def _hidden_image_rows(last: int, sidebar_right: float, *, include_media: bool = True) -> list[dict]:
+def _hidden_image_rows(
+    last: int,
+    chat_left: float,
+    *,
+    right_sidebar_left: float = 0.0,
+    include_media: bool = True,
+) -> list[dict]:
     """Return image rows that normal AX chat output omits or exposes as text."""
     candidates: list[dict] = []
-    items = _ax_chat_all_items(sidebar_right)
+    items = _ax_chat_all_items(chat_left, right_sidebar_left)
     for index, item in enumerate(items):
         content, content_parts, _stamp = _meaningful_chat_texts(item)
         media_elements = item.get("mediaElements") if isinstance(item.get("mediaElements"), list) else []
@@ -1389,17 +1690,21 @@ def _ax_chat_messages(
 ) -> list[dict]:
     messages: list[dict] = []
     geometry = window_geometry()
-    sidebar = geometry.get("sidebar") if isinstance(geometry, dict) else None
-    sidebar_right = 300.0
-    if isinstance(sidebar, dict):
-        try:
-            sidebar_right = float(sidebar.get("x") or 0) + float(sidebar.get("width") or 0)
-        except (TypeError, ValueError):
-            sidebar_right = 300.0
+    chat_left, right_sidebar_left, boundary_source = _chat_pane_boundaries(geometry if isinstance(geometry, dict) else {})
+    if boundary_source in {"default", "sidebar"}:
+        _append_event(
+            {
+                "type": "wecom_chat_boundary_fallback",
+                "source": boundary_source,
+                "chat_left": chat_left,
+                "right_sidebar_left": right_sidebar_left,
+                "geometry_ok": bool(isinstance(geometry, dict) and geometry.get("ok")),
+            }
+        )
     for item in _swift_ax("chat"):
         x = float(item.get("x") or 0)
         width = float(item.get("width") or 0)
-        if not _is_chat_pane_item(item, sidebar_right):
+        if not _is_chat_pane_item(item, chat_left, right_sidebar_left):
             continue
         texts = [str(text).strip() for text in item.get("texts", []) if str(text).strip()]
         content, content_parts, stamp = _meaningful_chat_texts(item)
@@ -1465,7 +1770,12 @@ def _ax_chat_messages(
         messages.append(message)
     if include_hidden_images:
         by_row = {int(message.get("row") or 0): message for message in messages}
-        for message in _hidden_image_rows(last, sidebar_right, include_media=include_hidden_image_media):
+        for message in _hidden_image_rows(
+            last,
+            chat_left,
+            right_sidebar_left=right_sidebar_left,
+            include_media=include_hidden_image_media,
+        ):
             row = int(message.get("row") or 0)
             if row and row not in by_row:
                 messages.append(message)
@@ -1745,6 +2055,9 @@ def paste_and_enter(text: str, *, submit: bool) -> dict:
     """Paste text into the focused input and optionally press Return."""
     from .clipboard import set_clipboard
 
+    ready = ensure_input_ready()
+    if not ready.get("ok"):
+        raise RuntimeError(f"chat input not ready for clipboard paste: {ready}")
     set_clipboard(text)
     script = '''
     tell application "System Events"
@@ -1763,6 +2076,9 @@ def paste_file_and_enter(path: str | Path, *, submit: bool) -> dict:
     image_path = Path(path).expanduser()
     if not validate_image_file(image_path):
         raise RuntimeError(f"invalid image file: {image_path}")
+    ready = ensure_input_ready()
+    if not ready.get("ok"):
+        raise RuntimeError(f"chat input not ready for file paste: {ready}")
     safe_path = str(image_path).replace("\\", "\\\\").replace('"', '\\"')
     script = f'''
     set imageFile to POSIX file "{safe_path}"

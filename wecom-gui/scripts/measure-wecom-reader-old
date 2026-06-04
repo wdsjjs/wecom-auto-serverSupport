@@ -1,0 +1,350 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_DIR="$(cd "$ROOT_DIR/.." && pwd)"
+MODE_NAME="old"
+BOUNDED_SCAN="0"
+MODE_LABEL="旧读取链路（关闭有界单聊扫描）"
+
+cd "$ROOT_DIR"
+
+RUN_BASE="$ROOT_DIR/.codex-run/reader-speed"
+STAMP="$(date '+%Y%m%d-%H%M%S')"
+RUN_DIR="$RUN_BASE/$STAMP-$MODE_NAME"
+STATE_DIR="$RUN_DIR/state"
+LOG_FILE="$RUN_DIR/agent.log"
+SUMMARY_FILE="$RUN_DIR/summary.json"
+ENV_FILE="${WECOM_AGENT_ENV:-$ROOT_DIR/.env.local}"
+
+mkdir -p "$RUN_DIR" "$STATE_DIR"
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  source "$ENV_FILE"
+  set +a
+fi
+
+if [[ -z "${SDKROOT:-}" && -d "/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk" ]]; then
+  export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk"
+fi
+
+if [[ -x "$REPO_DIR/.venv/bin/python" ]]; then
+  DEFAULT_PYTHON_BIN="$REPO_DIR/.venv/bin/python"
+else
+  DEFAULT_PYTHON_BIN="python3"
+fi
+
+export WECOM_GUI_PYTHON="${WECOM_GUI_PYTHON:-$DEFAULT_PYTHON_BIN}"
+export WECOM_GUI_STATE_DIR="$STATE_DIR"
+export WECOM_GUI_BOUNDED_SCAN="$BOUNDED_SCAN"
+export WECOM_AGENT_READ_ONLY="1"
+export WECOM_AGENT_LOG_EMPTY_SCANS="1"
+export WECOM_AGENT_READ_CONTEXT_LOG_LIMIT="${WECOM_AGENT_READ_CONTEXT_LOG_LIMIT:-4000}"
+
+if [[ "${WECOM_READER_MEASURE_FORCE:-0}" != "1" ]]; then
+  if command -v screen >/dev/null 2>&1; then
+    ACTIVE_SCREENS="$(screen -ls 2>/dev/null || true)"
+    if print -r -- "$ACTIVE_SCREENS" | grep -Eq "[[:space:]][0-9]+\\.${WECOM_AGENT_SESSION:-wecom-agent}[[:space:]]"; then
+      print -u2 "ERROR: 检测到普通 wecom-agent screen 正在运行。请先执行 ./wecom-gui/scripts/wecom-agent stop，或设置 WECOM_READER_MEASURE_FORCE=1 强制运行。"
+      exit 2
+    fi
+  fi
+  ACTIVE_AGENT="$(pgrep -fl "cli_anything\\.wecom_gui agent" 2>/dev/null || true)"
+  if [[ -n "$ACTIVE_AGENT" ]]; then
+    print -u2 "ERROR: 检测到已有读取 Agent 进程，避免抢同一个企业微信窗口，本次不启动测速。"
+    print -u2 "$ACTIVE_AGENT"
+    print -u2 "如确认要并行测试，设置 WECOM_READER_MEASURE_FORCE=1。"
+    exit 2
+  fi
+fi
+
+"$WECOM_GUI_PYTHON" - "$ROOT_DIR" "$MODE_NAME" "$MODE_LABEL" "$RUN_DIR" "$LOG_FILE" "$SUMMARY_FILE" "${WECOM_READER_MEASURE_SECONDS:-120}" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import threading
+import time
+from collections import defaultdict, deque
+from datetime import datetime
+from pathlib import Path
+
+
+root_dir = Path(sys.argv[1])
+mode_name = sys.argv[2]
+mode_label = sys.argv[3]
+run_dir = Path(sys.argv[4])
+log_file = Path(sys.argv[5])
+summary_file = Path(sys.argv[6])
+duration_seconds = float(sys.argv[7])
+
+python_bin = os.environ.get("WECOM_GUI_PYTHON") or sys.executable
+cmd = [
+    python_bin,
+    "-u",
+    "-m",
+    "cli_anything.wecom_gui",
+    "agent",
+    "--mode",
+    os.environ.get("WECOM_READER_MEASURE_AGENT_MODE", "review"),
+    "--poll",
+    os.environ.get("WECOM_READER_MEASURE_POLL", "0.5"),
+    "--scan-interval",
+    os.environ.get("WECOM_READER_MEASURE_SCAN_INTERVAL", "1"),
+    "--inbox-limit",
+    os.environ.get("WECOM_READER_MEASURE_INBOX_LIMIT", "8"),
+    "--scan-pages",
+    os.environ.get("WECOM_READER_MEASURE_SCAN_PAGES", "1"),
+    "--scroll-ticks",
+    os.environ.get("WECOM_READER_MEASURE_SCROLL_TICKS", "6"),
+    "--deep-scan-interval",
+    os.environ.get("WECOM_READER_MEASURE_DEEP_SCAN_INTERVAL", "30"),
+    "--max-drafts",
+    os.environ.get("WECOM_READER_MEASURE_MAX_DRAFTS", "1"),
+    "--last",
+    os.environ.get("WECOM_READER_MEASURE_LAST", "8"),
+    "--log-interval",
+    os.environ.get("WECOM_READER_MEASURE_LOG_INTERVAL", "5"),
+    "--read-only",
+]
+
+env = os.environ.copy()
+env["PYTHONPATH"] = env.get("WECOM_GUI_PYTHONPATH", "")
+env["WECOM_AGENT_READ_ONLY"] = "1"
+env["WECOM_AGENT_LOG_EMPTY_SCANS"] = "1"
+env["WECOM_AGENT_READ_CONTEXT_LOG_LIMIT"] = env.get("WECOM_AGENT_READ_CONTEXT_LOG_LIMIT", "4000")
+
+scan_re = re.compile(
+    r"扫描左侧会话：模式=(?P<mode>[^，]+)，(?P<label>[^=]+)=(?P<visible>\d+)，页数=(?P<pages>\d+)，"
+    r"未读=(?P<unread>\d+)，新客户=(?P<welcome>\d+)，新入队=(?P<enqueued>\d+)，"
+    r"缓存跳过=(?P<cached>\d+)，忽略=(?P<ignored>\d+)"
+)
+open_re = re.compile(r"打开会话：(?P<title>.+?)，读取最近")
+read_re = re.compile(r"聊天读取结果：(?P<title>.+?)，source=(?P<source>.*?)，消息数=(?P<count>\d+)")
+detail_re = re.compile(r"读取明细：(?P<title>.+?)，hash=(?P<hash>.*?)，消息数=(?P<count>\d+)，媒体数=(?P<media>\d+)｜(?P<body>.*)")
+current_re = re.compile(r"当前会话检测到客户新消息：(?P<title>.+?)｜(?P<preview>.*)")
+queued_re = re.compile(r"已加入处理队列：(?P<title>.*)")
+
+stats: dict[str, object] = {
+    "mode": mode_name,
+    "label": mode_label,
+    "started_at": datetime.now().isoformat(timespec="seconds"),
+    "requested_seconds": duration_seconds,
+    "command": cmd,
+    "log_file": str(log_file),
+    "summary_file": str(summary_file),
+    "state_dir": env.get("WECOM_GUI_STATE_DIR", ""),
+    "bounded_scan": env.get("WECOM_GUI_BOUNDED_SCAN", ""),
+    "scan_count": 0,
+    "read_attempts": 0,
+    "read_results": 0,
+    "empty_reads": 0,
+    "messages_read": 0,
+    "media_read": 0,
+    "current_chat_enqueued": 0,
+    "queue_added": 0,
+    "scan_visible_total": 0,
+    "scan_unread_total": 0,
+    "scan_enqueued_total": 0,
+    "scan_cached_skip_total": 0,
+    "scan_ignored_total": 0,
+    "scan_welcome_total": 0,
+    "read_failures": 0,
+    "scan_failures": 0,
+}
+opened_at: dict[str, deque[float]] = defaultdict(deque)
+open_to_read_latencies: list[float] = []
+read_sources: dict[str, int] = defaultdict(int)
+per_conversation: dict[str, dict[str, object]] = defaultdict(
+    lambda: {"read_results": 0, "messages_read": 0, "last_hash": "", "last_detail": ""}
+)
+lock = threading.Lock()
+
+
+def percentile(values: list[float], ratio: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * ratio)))
+    return ordered[index]
+
+
+def now_prefix() -> tuple[str, float]:
+    now = datetime.now()
+    return now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], time.monotonic()
+
+
+def parse_line(line: str, monotonic_ts: float, emit) -> None:
+    if "左侧会话扫描失败" in line:
+        stats["scan_failures"] = int(stats["scan_failures"]) + 1
+    if "读取失败" in line:
+        stats["read_failures"] = int(stats["read_failures"]) + 1
+
+    match = scan_re.search(line)
+    if match:
+        stats["scan_count"] = int(stats["scan_count"]) + 1
+        stats["scan_visible_total"] = int(stats["scan_visible_total"]) + int(match.group("visible"))
+        stats["scan_unread_total"] = int(stats["scan_unread_total"]) + int(match.group("unread"))
+        stats["scan_enqueued_total"] = int(stats["scan_enqueued_total"]) + int(match.group("enqueued"))
+        stats["scan_cached_skip_total"] = int(stats["scan_cached_skip_total"]) + int(match.group("cached"))
+        stats["scan_ignored_total"] = int(stats["scan_ignored_total"]) + int(match.group("ignored"))
+        stats["scan_welcome_total"] = int(stats["scan_welcome_total"]) + int(match.group("welcome"))
+        return
+
+    match = current_re.search(line)
+    if match:
+        stats["current_chat_enqueued"] = int(stats["current_chat_enqueued"]) + 1
+        return
+
+    match = queued_re.search(line)
+    if match:
+        stats["queue_added"] = int(stats["queue_added"]) + 1
+        return
+
+    match = open_re.search(line)
+    if match:
+        title = match.group("title").strip()
+        opened_at[title].append(monotonic_ts)
+        stats["read_attempts"] = int(stats["read_attempts"]) + 1
+        return
+
+    match = read_re.search(line)
+    if match:
+        title = match.group("title").strip()
+        source = match.group("source").strip()
+        count = int(match.group("count"))
+        stats["read_results"] = int(stats["read_results"]) + 1
+        stats["messages_read"] = int(stats["messages_read"]) + count
+        if count == 0:
+            stats["empty_reads"] = int(stats["empty_reads"]) + 1
+        read_sources[source] += 1
+        convo = per_conversation[title]
+        convo["read_results"] = int(convo["read_results"]) + 1
+        convo["messages_read"] = int(convo["messages_read"]) + count
+        latency = None
+        if opened_at[title]:
+            latency = monotonic_ts - opened_at[title].popleft()
+            open_to_read_latencies.append(latency)
+        latency_text = f"{latency:.2f}s" if latency is not None else "未知"
+        emit(f"[测速] 读完：{title}｜打开到读完={latency_text}｜消息数={count}｜source={source}")
+        return
+
+    match = detail_re.search(line)
+    if match:
+        title = match.group("title").strip()
+        media = int(match.group("media"))
+        body = match.group("body").strip()
+        stats["media_read"] = int(stats["media_read"]) + media
+        convo = per_conversation[title]
+        convo["last_hash"] = match.group("hash").strip()
+        convo["last_detail"] = body
+        emit(f"[测速] 内容：{title}｜媒体数={media}｜{body}")
+
+
+def emit_with_log(log_fh, text: str) -> None:
+    print(text, flush=True)
+    log_fh.write(text + "\n")
+    log_fh.flush()
+
+
+started_monotonic = time.monotonic()
+deadline = started_monotonic + max(0.0, duration_seconds)
+run_dir.mkdir(parents=True, exist_ok=True)
+
+with log_file.open("w", encoding="utf-8") as log_fh:
+    def emit(text: str) -> None:
+        with lock:
+            emit_with_log(log_fh, text)
+
+    emit(f"[测速] 启动 {mode_label}，持续 {duration_seconds:g}s，只读，不调用 AI，不发送消息")
+    emit(f"[测速] 日志：{log_file}")
+    emit(f"[测速] 状态库：{env.get('WECOM_GUI_STATE_DIR', '')}")
+    emit("[测速] 命令：" + " ".join(cmd))
+
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(root_dir),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    def pump_output() -> None:
+        assert process.stdout is not None
+        for raw in process.stdout:
+            prefix, monotonic_ts = now_prefix()
+            line = raw.rstrip("\n")
+            stamped = f"[{prefix}] {line}"
+            emit(stamped)
+            parse_line(line, monotonic_ts, emit)
+
+    thread = threading.Thread(target=pump_output, daemon=True)
+    thread.start()
+
+    exit_code = None
+    try:
+        while time.monotonic() < deadline:
+            exit_code = process.poll()
+            if exit_code is not None:
+                break
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        emit("[测速] 收到中断，正在停止读取 Agent")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        exit_code = process.poll()
+        thread.join(timeout=2)
+
+    actual_seconds = max(0.001, time.monotonic() - started_monotonic)
+    latencies = open_to_read_latencies
+    stats["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    stats["actual_seconds"] = round(actual_seconds, 3)
+    stats["agent_exit_code"] = exit_code
+    stats["scan_per_minute"] = round(int(stats["scan_count"]) / actual_seconds * 60, 2)
+    stats["read_results_per_minute"] = round(int(stats["read_results"]) / actual_seconds * 60, 2)
+    stats["messages_per_minute"] = round(int(stats["messages_read"]) / actual_seconds * 60, 2)
+    stats["average_messages_per_read"] = round(
+        int(stats["messages_read"]) / max(1, int(stats["read_results"])), 2
+    )
+    stats["read_sources"] = dict(read_sources)
+    stats["open_to_read_latency_seconds"] = {
+        "count": len(latencies),
+        "min": round(min(latencies), 3) if latencies else None,
+        "avg": round(statistics.fmean(latencies), 3) if latencies else None,
+        "p50": round(percentile(latencies, 0.50), 3) if latencies else None,
+        "p95": round(percentile(latencies, 0.95), 3) if latencies else None,
+        "max": round(max(latencies), 3) if latencies else None,
+    }
+    stats["per_conversation"] = dict(per_conversation)
+    summary_file.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    emit("[测速] 完成统计：")
+    emit(
+        "[测速] "
+        f"扫描={stats['scan_count']} 次（{stats['scan_per_minute']}/分钟），"
+        f"读取={stats['read_results']} 次（{stats['read_results_per_minute']}/分钟），"
+        f"消息={stats['messages_read']} 条（{stats['messages_per_minute']}/分钟），"
+        f"空读={stats['empty_reads']} 次，入队={stats['scan_enqueued_total']} 次"
+    )
+    emit(
+        "[测速] "
+        f"打开到读完：avg={stats['open_to_read_latency_seconds']['avg']}s，"
+        f"p50={stats['open_to_read_latency_seconds']['p50']}s，"
+        f"p95={stats['open_to_read_latency_seconds']['p95']}s，"
+        f"max={stats['open_to_read_latency_seconds']['max']}s"
+    )
+    emit(f"[测速] 摘要：{summary_file}")
+PY

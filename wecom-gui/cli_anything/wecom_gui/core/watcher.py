@@ -88,7 +88,6 @@ def _conversation_signature(row: dict) -> str:
         [
             str(row.get("title", "")),
             str(row.get("preview", "")),
-            str(row.get("unread_count", 0)),
             ",".join(row.get("tags", []) or []),
         ]
     )

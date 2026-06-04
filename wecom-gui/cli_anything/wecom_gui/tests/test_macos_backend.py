@@ -278,6 +278,162 @@ def test_ax_conversation_rows_keeps_preview_after_wechat_tag(monkeypatch):
     assert rows[0]["preview"] == "你已添加了三水儿，现在可以开始聊天了。"
     assert rows[0]["time"] == "3分钟前"
 
+def test_time_text_age_minutes_parses_recent_values():
+    fixed_now = macos_backend.datetime(2026, 6, 4, 14, 40)
+
+    assert macos_backend._time_text_age_minutes("刚刚", now=fixed_now) == 0
+    assert macos_backend._time_text_age_minutes("9分钟前", now=fixed_now) == 9
+    assert macos_backend._time_text_age_minutes("14:33", now=fixed_now) == 7
+    assert macos_backend._time_text_age_minutes("昨天", now=fixed_now) == 24 * 60
+    assert macos_backend._time_text_age_minutes("星期二", now=fixed_now) == 24 * 60
+
+def test_bounded_conversation_rows_stops_after_old_time(monkeypatch):
+    commands = []
+
+    def fake_swift(command):
+        commands.append(command)
+        if command == "ensure-single-chat":
+            return [{"ok": True}]
+        if isinstance(command, list) and command[0] == "recent-rows":
+            return [
+                {
+                    "texts": ["客户A", "你好", "9分钟前"],
+                    "timeText": "9分钟前",
+                    "x": 100,
+                    "y": 100,
+                    "width": 300,
+                    "height": 64,
+                },
+                {
+                    "texts": ["客户B", "旧消息", "昨天"],
+                    "timeText": "昨天",
+                    "x": 100,
+                    "y": 164,
+                    "width": 300,
+                    "height": 64,
+                },
+                {
+                    "texts": ["客户C", "不应继续读", "刚刚"],
+                    "timeText": "刚刚",
+                    "x": 100,
+                    "y": 228,
+                    "width": 300,
+                    "height": 64,
+                },
+            ]
+        return []
+
+    monkeypatch.setenv("WECOM_GUI_RECENT_SCAN_MINUTES", "10")
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.datetime", mock.Mock(now=lambda: macos_backend.datetime(2026, 6, 4, 14, 40)))
+
+    rows = macos_backend._bounded_conversation_rows(limit=10)
+
+    assert [row["title"] for row in rows] == ["客户A"]
+    assert rows[0]["source"] == "axuielement-bounded"
+    assert commands[0] == "ensure-single-chat"
+
+def test_row_from_ax_item_does_not_double_count_unread_marker():
+    row = macos_backend._row_from_ax_item(
+        {
+            "texts": ["客户A", "1", "刚刚", "@微信"],
+            "timeText": "刚刚",
+            "hasUnreadMarker": True,
+            "x": 100,
+            "y": 100,
+            "width": 300,
+            "height": 64,
+        },
+        index=1,
+        source="axuielement-bounded",
+    )
+
+    assert row["unread_count"] == 1
+    assert row["unread"] is True
+
+def test_swift_ax_sdkroot_ignores_incompatible_default_sdk(monkeypatch):
+    monkeypatch.delenv("WECOM_GUI_AX_SDKROOT", raising=False)
+    monkeypatch.setenv("SDKROOT", "/Library/Developer/CommandLineTools/SDKs/MacOSX26.2.sdk")
+
+    assert not macos_backend._swift_ax_sdkroot().endswith("MacOSX26.2.sdk")
+
+def test_conversation_rows_falls_back_when_bounded_scan_empty(monkeypatch):
+    commands = []
+
+    def fake_swift(command):
+        commands.append(command)
+        if command == "ensure-single-chat":
+            return [{"ok": False, "error": "single_chat_row_not_found"}]
+        if command == "rows":
+            return [
+                {
+                    "texts": ["客户A", "你好", "刚刚", "@微信"],
+                    "x": 60,
+                    "y": 40,
+                    "width": 250,
+                    "height": 64,
+                }
+            ]
+        return []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.resolve_app_name", lambda app_name=None: "企业微信")
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+
+    rows = macos_backend.conversation_rows(limit=10)
+
+    assert rows[0]["title"] == "客户A"
+    assert rows[0]["source"] == "axuielement"
+    assert "rows" in commands
+
+def test_sidebar_identity_returns_swift_uid(monkeypatch):
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.resolve_app_name", lambda app_name=None: "企业微信")
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.utils.macos_backend._swift_ax",
+        lambda command: [{"ok": True, "external_user_id": "wm_123456789"}] if command == "sidebar-identity" else [],
+    )
+
+    assert macos_backend.sidebar_identity()["external_user_id"] == "wm_123456789"
+
+def test_ensure_input_ready_returns_swift_payload(monkeypatch):
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.resolve_app_name", lambda app_name=None: "企业微信")
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.utils.macos_backend._swift_ax",
+        lambda command: [{"ok": True, "input": {"x": 1}, "sidebar": {"ok": True}}] if command == "input-ready" else [],
+    )
+
+    assert macos_backend.ensure_input_ready()["input"]["x"] == 1
+
+
+def test_selected_conversation_row_prefers_swift_selected_row(monkeypatch):
+    commands = []
+
+    def fake_swift(command):
+        commands.append(command)
+        if command == "selected-row":
+            return [
+                {
+                    "texts": ["客户A", "刚刚", "查订单", "@微信"],
+                    "timeText": "刚刚",
+                    "x": 1600,
+                    "y": 200,
+                    "width": 420,
+                    "height": 64,
+                    "selected": True,
+                }
+            ]
+        return []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.resolve_app_name", lambda app_name=None: "企业微信")
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+
+    row = macos_backend.selected_conversation_row(limit=8)
+
+    assert row["title"] == "客户A"
+    assert row["selected"] is True
+    assert row["source"] == "axuielement-selected"
+    assert commands == ["selected-row"]
+
+
 def test_ax_chat_messages_accepts_chat_pane_on_sidebar_boundary(monkeypatch):
     def fake_swift(command):
         if command == "geometry":
@@ -292,6 +448,85 @@ def test_ax_chat_messages_accepts_chat_pane_on_sidebar_boundary(monkeypatch):
     messages = macos_backend._ax_chat_messages(last=10)
 
     assert [message["text"] for message in messages] == ["这是你们的支付宝吗？"]
+
+
+def test_ax_chat_messages_filters_conversation_list_when_chat_left_present(monkeypatch):
+    def fake_swift(command):
+        if command == "geometry":
+            return [
+                {
+                    "ok": True,
+                    "sidebar": {"x": 1470, "width": 160},
+                    "conversationList": {"x": 1630, "width": 455},
+                    "chatLeft": 2085,
+                    "rightSidebarLeft": 3500,
+                }
+            ]
+        if command == "chat":
+            return [
+                {
+                    "index": 1,
+                    "texts": ["iChen", "老师，这里出bug", "昨天", "@微信"],
+                    "x": 1630,
+                    "width": 455,
+                },
+                {
+                    "index": 2,
+                    "texts": ["嗯"],
+                    "x": 2088,
+                    "width": 900,
+                    "bubbleX": 2100,
+                    "bubbleWidth": 80,
+                },
+            ]
+        return []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+
+    messages = macos_backend._ax_chat_messages(last=10)
+
+    assert [message["text"] for message in messages] == ["嗯"]
+    assert messages[0]["x"] == 2100
+
+
+def test_ax_chat_messages_falls_back_to_sidebar_boundary_when_chat_left_missing(monkeypatch):
+    def fake_swift(command):
+        if command == "geometry":
+            return [{"ok": True, "sidebar": {"x": 60, "width": 250}}]
+        if command == "chat":
+            return [
+                {"index": 1, "texts": ["客户A", "预览", "@微信"], "x": 60, "width": 250},
+                {"index": 2, "texts": ["真正消息"], "x": 311, "width": 1159},
+            ]
+        return []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+
+    messages = macos_backend._ax_chat_messages(last=10)
+
+    assert [message["text"] for message in messages] == ["真正消息"]
+
+
+def test_send_via_ax_text_input_preflights_input_ready(monkeypatch):
+    commands = []
+    events = []
+
+    def fake_swift(command):
+        commands.append(command)
+        if command == "input-ready":
+            return [{"ok": True, "input": {"x": 10}, "sidebar": {"ok": True}}]
+        if command == ["send", "hello"]:
+            return [{"ok": True, "submitted": True, "chars": 5}]
+        return []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._append_event", lambda event: events.append(event))
+
+    result = macos_backend.send_via_ax_text_input("hello", submit=True)
+
+    assert result["ok"] is True
+    assert commands == ["input-ready", ["send", "hello"]]
+    assert events[0]["type"] == "wecom_send_input_preflight"
 
 def test_ax_chat_messages_returns_image_placeholder(monkeypatch):
     def fake_swift(command):
@@ -934,7 +1169,13 @@ def test_extract_wecom_external_user_id_from_sidebar_text():
 
 def test_ax_text_input_retries_empty_swift_result(monkeypatch):
     calls = []
-    results = iter([[], [{"ok": True, "submitted": True, "chars": 5, "method": "ax_text_input"}]])
+    results = iter(
+        [
+            [{"ok": True, "input": {"x": 1}, "sidebar": {"ok": True}}],
+            [],
+            [{"ok": True, "submitted": True, "chars": 5, "method": "ax_text_input"}],
+        ]
+    )
 
     def fake_swift_ax(command):
         calls.append(command)
@@ -948,7 +1189,7 @@ def test_ax_text_input_retries_empty_swift_result(monkeypatch):
 
     assert data["ok"] is True
     assert data["method"] == "ax_text_input"
-    assert calls == [["send", "hello"], ["send", "hello"]]
+    assert calls == ["input-ready", ["send", "hello"], ["send", "hello"]]
 
 def test_scroll_sidebar_uses_adaptive_geometry(monkeypatch):
     calls = []

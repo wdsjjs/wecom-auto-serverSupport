@@ -73,11 +73,12 @@ def is_customer_candidate(row: dict) -> bool:
 
     if not title or title in NAVIGATION_NOISE:
         return False
-    require_wechat_tag = os.environ.get("WECOM_GUI_REQUIRE_WECHAT_TAG", "1") != "0"
+    bounded_single_chat = str(row.get("source") or "") == "axuielement-bounded"
+    require_wechat_tag = os.environ.get("WECOM_GUI_REQUIRE_WECHAT_TAG", "0" if bounded_single_chat else "1") != "0"
     if required_tag_keys and not (required_tag_keys & tag_keys):
         if require_wechat_tag:
             return False
-        if tags or os.environ.get("WECOM_GUI_ALLOW_UNTAGGED") != "1":
+        if not bounded_single_chat and (tags or os.environ.get("WECOM_GUI_ALLOW_UNTAGGED") != "1"):
             return False
     if len(title) > MAX_TITLE_LENGTH or len(preview) > MAX_PREVIEW_LENGTH:
         return False
@@ -113,7 +114,8 @@ def open_by_name(name: str, app_name: str | None = None) -> dict:
 
 def open_row(row: dict, app_name: str | None = None) -> dict:
     """Open a visible conversation row, using OCR coordinates when present."""
-    if row.get("source") == "axuielement":
+    source = str(row.get("source") or "")
+    if source.startswith("axuielement"):
         if app_name is None:
             return open_by_name(str(row.get("title") or ""))
         return open_by_name(str(row.get("title") or ""), app_name)

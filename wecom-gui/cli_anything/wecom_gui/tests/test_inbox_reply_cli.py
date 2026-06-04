@@ -72,6 +72,48 @@ def test_inbox_scan_supports_multiple_required_tags(monkeypatch):
 
     assert [row["title"] for row in data["conversations"]] == ["客户A", "客户B"]
 
+def test_inbox_scan_allows_untagged_bounded_single_chat_rows(monkeypatch):
+    monkeypatch.delenv("WECOM_GUI_REQUIRE_WECHAT_TAG", raising=False)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.utils.macos_backend.conversation_rows",
+        lambda app_name=None, limit=30: [
+            {
+                "title": "客户A",
+                "preview": "你好",
+                "time": "刚刚",
+                "tags": [],
+                "raw": [],
+                "source": "axuielement-bounded",
+            },
+            {
+                "title": "客户B",
+                "preview": "旧链路无标签",
+                "time": "刚刚",
+                "tags": [],
+                "raw": [],
+                "source": "axuielement",
+            },
+        ],
+    )
+
+    data = inbox.scan_visible(limit=10)
+
+    assert [row["title"] for row in data["conversations"]] == ["客户A"]
+
+def test_inbox_scan_can_require_tag_for_bounded_rows(monkeypatch):
+    monkeypatch.setenv("WECOM_GUI_REQUIRE_WECHAT_TAG", "1")
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.utils.macos_backend.conversation_rows",
+        lambda app_name=None, limit=30: [
+            {"title": "客户A", "preview": "你好", "time": "刚刚", "tags": [], "raw": [], "source": "axuielement-bounded"},
+            {"title": "客户B", "preview": "你好", "time": "刚刚", "tags": ["@微信"], "raw": [], "source": "axuielement-bounded"},
+        ],
+    )
+
+    data = inbox.scan_visible(limit=10)
+
+    assert [row["title"] for row in data["conversations"]] == ["客户B"]
+
 def test_parse_conversation_parts_uses_configured_tag_marker(monkeypatch):
     monkeypatch.setenv("WECOM_GUI_REQUIRED_TAG", "@重庆邮电大学")
 

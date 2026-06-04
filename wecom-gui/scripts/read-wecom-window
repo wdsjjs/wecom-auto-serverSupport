@@ -1,0 +1,281 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+RUN_DIR="$ROOT_DIR/.codex-run"
+ENV_FILE="${WECOM_AGENT_ENV:-$ROOT_DIR/.env.local}"
+DEFAULT_OUT_DIR="$RUN_DIR/ax-dumps"
+
+cd "$ROOT_DIR"
+mkdir -p "$DEFAULT_OUT_DIR"
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+if [[ -z "${SDKROOT:-}" && -d "/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk" ]]; then
+  export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk"
+fi
+
+if [[ -x "$ROOT_DIR/../.venv/bin/python" ]]; then
+  DEFAULT_PYTHON_BIN="$ROOT_DIR/../.venv/bin/python"
+else
+  DEFAULT_PYTHON_BIN="python3"
+fi
+PYTHON_BIN="${WECOM_GUI_PYTHON:-$DEFAULT_PYTHON_BIN}"
+PYTHONPATH_VALUE="${WECOM_GUI_PYTHONPATH:-}"
+
+timestamp="$(date '+%Y%m%d-%H%M%S')"
+OUT_FILE="${1:-$DEFAULT_OUT_DIR/wecom-window-read-$timestamp.json}"
+mkdir -p "$(dirname "$OUT_FILE")"
+
+PYTHONPATH="$PYTHONPATH_VALUE" "$PYTHON_BIN" - "$ROOT_DIR" "$OUT_FILE" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+root = Path(sys.argv[1])
+out_file = Path(sys.argv[2])
+sys.path.insert(0, str(root))
+
+from cli_anything.wecom_gui.core import chat, inbox, watcher
+from cli_anything.wecom_gui.utils import macos_backend
+
+inbox_limit = int(os.environ.get("WECOM_WINDOW_READ_INBOX_LIMIT", os.environ.get("WECOM_AGENT_INBOX_LIMIT", "8")))
+last_messages = int(os.environ.get("WECOM_WINDOW_READ_LAST", os.environ.get("WECOM_AGENT_LAST", "4")))
+scroll_ticks = int(os.environ.get("WECOM_WINDOW_READ_SCROLL_TICKS", os.environ.get("WECOM_AGENT_SCROLL_TICKS", "6")))
+scroll_pages = max(0, int(os.environ.get("WECOM_WINDOW_READ_SCROLL_PAGES", "0")))
+right_panel_ratio = float(os.environ.get("WECOM_WINDOW_READ_RIGHT_PANEL_RATIO", "0.28"))
+right_panel_scroll_pages = max(0, int(os.environ.get("WECOM_WINDOW_READ_RIGHT_PANEL_SCROLL_PAGES", "1")))
+right_panel_scroll_ticks = int(os.environ.get("WECOM_WINDOW_READ_RIGHT_PANEL_SCROLL_TICKS", str(scroll_ticks)))
+
+payload: dict = {
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "root": str(root),
+    "output": str(out_file),
+    "purpose": "read_current_running_wecom_window_once",
+    "config": {
+        "inbox_limit": inbox_limit,
+        "last_messages": last_messages,
+        "scroll_ticks": scroll_ticks,
+        "scroll_pages": scroll_pages,
+        "right_panel_ratio": right_panel_ratio,
+        "right_panel_scroll_pages": right_panel_scroll_pages,
+        "right_panel_scroll_ticks": right_panel_scroll_ticks,
+        "bundle_id": os.environ.get("WECOM_GUI_BUNDLE_ID", "com.tencent.WeWorkMac"),
+    },
+    "steps": [],
+}
+
+
+def summarize_rows(rows: list[dict]) -> dict:
+    candidates = [row for row in rows if watcher._should_consider(row)]
+    unread = [
+        row
+        for row in candidates
+        if int(row.get("unread_count") or 0) > 0 or bool(row.get("unread"))
+    ]
+    return {
+        "count": len(rows),
+        "candidate_count": len(candidates),
+        "unread_count": len(unread),
+        "titles": [str(row.get("title") or row.get("raw", [""])[0] if row.get("raw") else row.get("title") or "") for row in rows[:12]],
+    }
+
+
+def summarize_raw_sidebar_rows(rows: list[dict]) -> dict:
+    navigation_rows = []
+    conversation_rows = []
+    other_rows = []
+    for row in rows:
+        x = float(row.get("x") or 0)
+        width = float(row.get("width") or 0)
+        texts = [str(text).strip() for text in row.get("texts") or [] if str(text).strip()]
+        item = {
+            "index": row.get("index"),
+            "x": row.get("x"),
+            "y": row.get("y"),
+            "width": row.get("width"),
+            "height": row.get("height"),
+            "selected": row.get("selected"),
+            "texts": texts,
+        }
+        if x < 160 and width <= 220:
+            navigation_rows.append(item)
+        elif x >= 120 and width >= 220:
+            conversation_rows.append(item)
+        else:
+            other_rows.append(item)
+    return {
+        "count": len(rows),
+        "navigation_count": len(navigation_rows),
+        "conversation_count": len(conversation_rows),
+        "other_count": len(other_rows),
+        "navigation_titles": [row["texts"][0] for row in navigation_rows if row["texts"]][:20],
+        "conversation_titles": [row["texts"][0] for row in conversation_rows if row["texts"]][:20],
+    }
+
+
+def raw_sidebar_rows_page(page_index: int) -> dict:
+    rows = macos_backend._swift_ax("rows")
+    return {
+        "page_index": page_index,
+        "rows": rows,
+        "summary": summarize_raw_sidebar_rows(rows),
+        "sections": {
+            "navigation": [
+                row
+                for row in rows
+                if float(row.get("x") or 0) < 160 and float(row.get("width") or 0) <= 220
+            ],
+            "conversations": [
+                row
+                for row in rows
+                if float(row.get("x") or 0) >= 120 and float(row.get("width") or 0) >= 220
+            ],
+            "other": [
+                row
+                for row in rows
+                if not (
+                    float(row.get("x") or 0) < 160 and float(row.get("width") or 0) <= 220
+                )
+                and not (
+                    float(row.get("x") or 0) >= 120 and float(row.get("width") or 0) >= 220
+                )
+            ],
+        },
+    }
+
+
+def right_panel_scroll_point(geometry: dict) -> tuple[int, int]:
+    window = geometry.get("window") or {}
+    win_x = float(window.get("x") or 0)
+    win_y = float(window.get("y") or 0)
+    win_width = float(window.get("width") or 0)
+    win_height = float(window.get("height") or 0)
+    x = int(win_x + win_width * (1.0 - right_panel_ratio / 2.0))
+    y = int(win_y + win_height * 0.55)
+    return x, y
+
+
+def right_chat_panel(page_index: int = 0) -> dict:
+    geometry = macos_backend.window_geometry()
+    window = geometry.get("window") or {}
+    win_x = float(window.get("x") or 0)
+    win_width = float(window.get("width") or 0)
+    cutoff_x = win_x + win_width * (1.0 - right_panel_ratio)
+    scroll_x, scroll_y = right_panel_scroll_point(geometry)
+    elements = macos_backend._swift_ax("elements")
+    right_elements = [
+        item
+        for item in elements
+        if float(item.get("x") or 0) >= cutoff_x
+    ]
+    text_elements = [item for item in right_elements if item.get("kind") == "text"]
+    media_elements = [item for item in right_elements if item.get("kind") == "media"]
+    return {
+        "page_index": page_index,
+        "geometry": geometry,
+        "cutoff_x": cutoff_x,
+        "scroll_point": {"x": scroll_x, "y": scroll_y},
+        "raw_element_count": len(elements),
+        "right_element_count": len(right_elements),
+        "text_elements": text_elements,
+        "media_elements": media_elements,
+        "summary": {
+            "text_count": len(text_elements),
+            "media_count": len(media_elements),
+            "texts": [
+                text
+                for item in text_elements
+                for text in (item.get("texts") or [])
+                if str(text).strip()
+            ][:80],
+        },
+    }
+
+
+def timed_step(name: str, fn):
+    started = time.perf_counter()
+    entry: dict = {"name": name, "started_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        data = fn()
+        entry["ok"] = True
+        entry["data"] = data
+    except Exception as exc:
+        entry["ok"] = False
+        entry["error_type"] = type(exc).__name__
+        entry["error"] = str(exc)
+    entry["duration_ms"] = round((time.perf_counter() - started) * 1000, 2)
+    payload["steps"].append(entry)
+    return entry
+
+
+timed_step("activate_app", lambda: macos_backend.activate_app())
+timed_step("window_geometry", macos_backend.window_geometry)
+
+
+def read_rows_page(page_index: int):
+    rows = macos_backend.conversation_rows(limit=inbox_limit)
+    return {"page_index": page_index, "rows": rows, "summary": summarize_rows(rows)}
+
+
+timed_step("raw_sidebar_rows_page_0", lambda: raw_sidebar_rows_page(0))
+timed_step("sidebar_rows_page_0", lambda: read_rows_page(0))
+timed_step("selected_conversation_row", lambda: macos_backend.selected_conversation_row(limit=inbox_limit))
+timed_step(
+    "current_chat",
+    lambda: {
+        **chat.read_current(last=last_messages, capture_images=False),
+        "raw_ax_chat_sample": macos_backend._swift_ax("chat")[: min(20, max(1, last_messages * 5))],
+    },
+)
+timed_step("right_chat_panel_page_0", lambda: right_chat_panel(0))
+
+for page in range(1, right_panel_scroll_pages + 1):
+    def scroll_right_panel_down():
+        geometry = macos_backend.window_geometry()
+        x, y = right_panel_scroll_point(geometry)
+        return macos_backend.scroll_sidebar("down", ticks=right_panel_scroll_ticks, x=x, y=y)
+
+    timed_step(f"scroll_right_panel_down_before_page_{page}", scroll_right_panel_down)
+    timed_step(f"right_chat_panel_page_{page}", lambda page=page: right_chat_panel(page))
+
+for page in range(right_panel_scroll_pages, 0, -1):
+    def scroll_right_panel_up():
+        geometry = macos_backend.window_geometry()
+        x, y = right_panel_scroll_point(geometry)
+        return macos_backend.scroll_sidebar("up", ticks=right_panel_scroll_ticks, x=x, y=y)
+
+    timed_step(f"scroll_right_panel_up_restore_{page}", scroll_right_panel_up)
+
+for page in range(1, scroll_pages + 1):
+    timed_step(f"scroll_down_before_page_{page}", lambda: macos_backend.scroll_sidebar("down", ticks=scroll_ticks))
+    timed_step(f"raw_sidebar_rows_page_{page}", lambda page=page: raw_sidebar_rows_page(page))
+    timed_step(f"sidebar_rows_page_{page}", lambda page=page: read_rows_page(page))
+
+for page in range(scroll_pages, 0, -1):
+    timed_step(f"scroll_up_restore_{page}", lambda: macos_backend.scroll_sidebar("up", ticks=scroll_ticks))
+
+payload["summary"] = {
+    "total_duration_ms": round(sum(float(step.get("duration_ms") or 0) for step in payload["steps"]), 2),
+    "step_durations_ms": {step["name"]: step.get("duration_ms") for step in payload["steps"]},
+    "failed_steps": [
+        {"name": step["name"], "error_type": step.get("error_type"), "error": step.get("error")}
+        for step in payload["steps"]
+        if not step.get("ok")
+    ],
+}
+
+out_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+print(out_file)
+print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
+PY

@@ -62,6 +62,41 @@ def test_agent_send_recheck_allows_same_latest_text_with_misread_role(monkeypatc
     assert state.list_queue(status="done")[0]["title"] == "刘裕鑫"
 
 
+def test_agent_send_preflights_input_and_sidebar(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "preview": "鱼油怎么吃？", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    latest = {"role": "用户", "text": "鱼油怎么吃？", "content": "鱼油怎么吃？"}
+    state.mark_drafting(item["id"], message_hash="hash1", messages=[latest], latest=latest)
+    state.mark_ready(item["id"], reply_text="随餐服用。")
+
+    preflight: list[str] = []
+    reads = iter(
+        [
+            {"hash": "hash1", "messages": [latest]},
+            {"hash": "after", "messages": [latest, {"role": "客服", "content": "随餐服用。", "text": "随餐服用。"}]},
+        ]
+    )
+    sent: list[str] = []
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.agent._ensure_chat_input_ready_for_job",
+        lambda job, stage: preflight.append(stage) or {"ok": True, "input": {"x": 1}, "sidebar": {"ok": True}},
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(text) or {"ok": True},
+    )
+
+    result = agent._send_one_ready(last=12, mode="auto")
+
+    assert result["sent"] == 1
+    assert preflight == ["send"]
+    assert sent == ["随餐服用。"]
+
+
 def test_agent_marks_welcome_sent_only_after_successful_send(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "三水儿", "preview": "你已添加了 三水儿，现在可以开始聊天了。", "time": "刚刚", "tags": ["@微信"], "raw": []}

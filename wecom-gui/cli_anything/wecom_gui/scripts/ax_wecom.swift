@@ -223,6 +223,112 @@ func rowPayload(_ row: AXUIElement, index: Int) -> [String: Any] {
     ]
 }
 
+func isLikelyTimeText(_ value: String) -> Bool {
+    let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if text == "刚刚" || text.contains("分钟前") || text.contains("昨天") || text.contains("星期") {
+        return true
+    }
+    if text.range(of: #"^\d{1,2}:\d{2}$"#, options: .regularExpression) != nil {
+        return true
+    }
+    if text.range(of: #"^\d{1,2}/\d{1,2}$"#, options: .regularExpression) != nil {
+        return true
+    }
+    return false
+}
+
+func rowTimeText(_ row: AXUIElement) -> String {
+    let texts = collectText(row).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    for text in texts.reversed() where isLikelyTimeText(text) {
+        return text
+    }
+    return ""
+}
+
+func rowHasUnreadMarker(_ row: AXUIElement) -> Bool {
+    let texts = collectText(row)
+    if texts.contains(where: { value in
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.range(of: #"^\d+$"#, options: .regularExpression) != nil
+    }) {
+        return true
+    }
+    var stack = children(row)
+    while !stack.isEmpty {
+        let item = stack.removeFirst()
+        let itemRole = role(item)
+        let values = textValues(item).map { $0.lowercased() }
+        if itemRole == "AXImage" && values.contains(where: { value in
+            value.contains("badge") || value.contains("unread") || value.contains("未读")
+        }) {
+            return true
+        }
+        stack.append(contentsOf: children(item))
+    }
+    return false
+}
+
+func looksLikeNavigationTable(_ table: AXUIElement) -> Bool {
+    let texts = collectText(table, maxDepth: 5)
+    return texts.contains("单聊") && (texts.contains("群聊") || texts.contains("@我") || texts.contains("未读"))
+}
+
+func navigationTables(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
+    var tables: [AXUIElement] = []
+    if let window = window {
+        collectTables(window, tables: &tables, maxDepth: 12)
+    }
+    if tables.isEmpty {
+        collectTables(root, tables: &tables, maxDepth: 12)
+    }
+    return tables.filter { looksLikeNavigationTable($0) }
+}
+
+func singleChatRow(root: AXUIElement, window: AXUIElement?) -> AXUIElement? {
+    for table in navigationTables(root: root, window: window) {
+        for row in children(table) where role(row) == "AXRow" {
+            let texts = collectText(row).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            if texts.contains("单聊") {
+                return row
+            }
+        }
+    }
+    var rows: [AXUIElement] = []
+    if let window = window {
+        collectRows(window, rows: &rows, maxDepth: 14)
+    }
+    if rows.isEmpty {
+        collectRows(root, rows: &rows, maxDepth: 14)
+    }
+    return rows.first { row in
+        collectText(row, maxDepth: 4).contains("单聊")
+    }
+}
+
+func ensureSingleChat(root: AXUIElement, window: AXUIElement?) -> [String: Any] {
+    guard let row = singleChatRow(root: root, window: window) else {
+        return ["ok": false, "error": "single_chat_row_not_found"]
+    }
+    let payload = rowPayload(row, index: 1)
+    let selected = payload["selected"] as? Bool ?? false
+    if !selected {
+        AXUIElementSetAttributeValue(row, kAXSelectedAttribute as CFString, boolValue(true))
+        let press = AXUIElementPerformAction(row, kAXPressAction as CFString)
+        if press != .success, let rect = rectPayload(row) {
+            clickAt(
+                x: rect["x", default: 0] + rect["width", default: 0] * 0.5,
+                y: rect["y", default: 0] + rect["height", default: 0] * 0.5
+            )
+        }
+        Thread.sleep(forTimeInterval: 0.18)
+    }
+    return [
+        "ok": true,
+        "selectedBefore": selected,
+        "row": payload
+    ]
+}
+
 func collectTextElements(_ element: AXUIElement, out: inout [[String: Any]], maxDepth: Int = 10, depth: Int = 0) {
     if depth > maxDepth {
         return
@@ -716,6 +822,46 @@ func conversationTables(root: AXUIElement, window: AXUIElement?) -> [AXUIElement
     }
 }
 
+func conversationListTables(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
+    var tables: [AXUIElement] = []
+    if let window = window {
+        collectTables(window, tables: &tables, maxDepth: 12)
+    }
+    if tables.isEmpty {
+        collectTables(root, tables: &tables, maxDepth: 12)
+    }
+    let navRects = navigationTables(root: root, window: window).compactMap { rectPayload($0) }
+    let navRight = navRects.map { $0["x", default: 0] + $0["width", default: 0] }.max() ?? 0
+    let windowRect = window.flatMap { rectPayload($0) }
+    let maxConversationRight = windowRect.map { rect in
+        rect["x", default: 0] + min(rect["width", default: 0] * 0.46, 760)
+    } ?? 0
+    return tables.filter { table in
+        if looksLikeNavigationTable(table) {
+            return false
+        }
+        guard let rect = rectPayload(table) else {
+            return false
+        }
+        let tableTexts = collectText(table, maxDepth: 4)
+        if tableTexts.contains("单聊") || tableTexts.contains("群聊") || tableTexts.contains("内部聊天") {
+            return false
+        }
+        let rowCount = children(table).filter { role($0) == "AXRow" }.count
+        let x = rect["x", default: 0]
+        let width = rect["width", default: 0]
+        return rowCount > 0
+            && width >= 220
+            && width <= 680
+            && (navRight <= 0 || x >= navRight - 8)
+            && (maxConversationRight <= 0 || x + width <= maxConversationRight)
+    }.sorted { lhs, rhs in
+        let lr = rectPayload(lhs) ?? [:]
+        let rr = rectPayload(rhs) ?? [:]
+        return lr["x", default: 0] < rr["x", default: 0]
+    }
+}
+
 func conversationRows(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
     var seen: Set<String> = []
     var out: [AXUIElement] = []
@@ -744,6 +890,72 @@ func conversationRows(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] 
     return rows
 }
 
+func recentConversationRows(root: AXUIElement, window: AXUIElement?, limit: Int) -> [AXUIElement] {
+    var seen: Set<String> = []
+    var out: [AXUIElement] = []
+    for table in conversationListTables(root: root, window: window) {
+        for row in children(table) where role(row) == "AXRow" {
+            let payload = rowPayload(row, index: out.count + 1)
+            let texts = payload["texts"] as? [String] ?? []
+            let width = payload["width"] as? Double ?? 0
+            let height = payload["height"] as? Double ?? 0
+            if texts.count < 2 || width < 220 || height < 20 {
+                continue
+            }
+            let key = "\(payload["x"] ?? 0)|\(payload["y"] ?? 0)|\(texts.joined(separator: "|"))"
+            if seen.contains(key) {
+                continue
+            }
+            seen.insert(key)
+            out.append(row)
+            if out.count >= limit {
+                return out
+            }
+        }
+    }
+    return out
+}
+
+func recentRowPayload(_ row: AXUIElement, index: Int, minutes: Int) -> [String: Any] {
+    var payload = rowPayload(row, index: index)
+    payload["timeText"] = rowTimeText(row)
+    payload["hasUnreadMarker"] = rowHasUnreadMarker(row)
+    payload["recentWindowMinutes"] = minutes
+    payload["source"] = "axuielement-recent-rows"
+    return payload
+}
+
+func selectedConversationRow(root: AXUIElement, window: AXUIElement?) -> AXUIElement? {
+    func isNavigationRow(_ row: AXUIElement) -> Bool {
+        let texts = collectText(row, maxDepth: 4).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard let first = texts.first else {
+            return false
+        }
+        return first == "单聊" || first == "群聊" || first == "@我" || first == "未读" || first == "内部聊天"
+    }
+    for table in conversationListTables(root: root, window: window) {
+        for row in children(table) where role(row) == "AXRow" {
+            if isNavigationRow(row) {
+                continue
+            }
+            let payload = rowPayload(row, index: 1)
+            if payload["selected"] as? Bool ?? false {
+                return row
+            }
+        }
+    }
+    for row in conversationRows(root: root, window: window) {
+        if isNavigationRow(row) {
+            continue
+        }
+        let payload = rowPayload(row, index: 1)
+        if payload["selected"] as? Bool ?? false {
+            return row
+        }
+    }
+    return nil
+}
+
 func allRows(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
     var rows: [AXUIElement] = []
     if let window = window {
@@ -753,6 +965,52 @@ func allRows(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
         collectRows(root, rows: &rows, maxDepth: 14)
     }
     return rows
+}
+
+func chatPaneLeftBoundary(root: AXUIElement, window: AXUIElement?) -> Double? {
+    let listRects = conversationListTables(root: root, window: window).compactMap { rectPayload($0) }
+    if let right = listRects.map({ $0["x", default: 0] + $0["width", default: 0] }).max(), right > 0 {
+        return right
+    }
+    let navRects = navigationTables(root: root, window: window).compactMap { rectPayload($0) }
+    if let navRight = navRects.map({ $0["x", default: 0] + $0["width", default: 0] }).max(), navRight > 0 {
+        return navRight
+    }
+    return nil
+}
+
+func rightSidebarLeftBoundary(root: AXUIElement, window: AXUIElement?) -> Double? {
+    var webAreas: [AXUIElement] = []
+    let target = window ?? root
+    collectWebAreas(target, out: &webAreas, maxDepth: 14)
+    let rects = webAreas.compactMap { rectPayload($0) }
+    if rects.isEmpty {
+        return nil
+    }
+    let leftMostSidebarX = rects.map { $0["x", default: 0] }.min() ?? 0
+    return leftMostSidebarX > 0 ? leftMostSidebarX : nil
+}
+
+func chatRows(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
+    let rows = allRows(root: root, window: window)
+    guard let chatLeft = chatPaneLeftBoundary(root: root, window: window) else {
+        return rows
+    }
+    let windowRect = window.flatMap { rectPayload($0) } ?? [:]
+    let fallbackRight = windowRect["x", default: 0] + max(windowRect["width", default: 0] - 240, 0)
+    let sidebarLeft = rightSidebarLeftBoundary(root: root, window: window) ?? fallbackRight
+    let tolerance = 4.0
+    return rows.filter { row in
+        guard let rect = rectPayload(row) else {
+            return false
+        }
+        let x = rect["x", default: 0]
+        let width = rect["width", default: 0]
+        let right = x + width
+        return width >= 240
+            && x >= chatLeft - tolerance
+            && (sidebarLeft <= 0 || right <= sidebarLeft + tolerance || x < sidebarLeft - tolerance)
+    }
 }
 
 func setWindowFrame(_ window: AXUIElement, frame: NSRect) -> Bool {
@@ -800,6 +1058,164 @@ func inputScore(_ element: AXUIElement) -> Double {
     return score
 }
 
+func sidebarRightBoundary(root: AXUIElement, window: AXUIElement?) -> Double? {
+    return rightSidebarLeftBoundary(root: root, window: window)
+}
+
+func bestTextInput(root: AXUIElement, window: AXUIElement?) -> AXUIElement? {
+    var inputs: [AXUIElement] = []
+    if let window = window {
+        settableTextInputs(window, inputs: &inputs)
+    }
+    if inputs.isEmpty {
+        settableTextInputs(root, inputs: &inputs)
+    }
+    let windowRect = window.flatMap { rectPayload($0) } ?? [:]
+    let winX = windowRect["x", default: 0]
+    let winY = windowRect["y", default: 0]
+    let winWidth = windowRect["width", default: 0]
+    let winHeight = windowRect["height", default: 0]
+    let sidebarLeft = sidebarRightBoundary(root: root, window: window) ?? (winWidth > 0 ? winX + winWidth * 0.82 : 0)
+    let chatInputs = inputs.filter { input in
+        guard let pos = pointAttr(input, kAXPositionAttribute as CFString),
+              let size = sizeAttr(input) else {
+            return false
+        }
+        let centerX = pos.x + size.width / 2
+        let centerY = pos.y + size.height / 2
+        let bottomMin = winHeight > 0 ? winY + winHeight * 0.72 : 0
+        return size.width >= 260
+            && size.height >= 40
+            && (sidebarLeft <= 0 || centerX < sidebarLeft - 12)
+            && (bottomMin <= 0 || centerY >= bottomMin)
+    }
+    if let input = chatInputs.max(by: { inputScore($0) < inputScore($1) }) {
+        return input
+    }
+    return inputs.max(by: { inputScore($0) < inputScore($1) })
+}
+
+func ensureSidebarOpen(root: AXUIElement, window: AXUIElement?) -> [String: Any] {
+    var textElements: [[String: Any]] = []
+    let target = window ?? root
+    collectTextElements(target, out: &textElements, maxDepth: 14)
+    let hasSidebarText = textElements.contains { item in
+        let texts = item["texts"] as? [String] ?? []
+        return texts.contains { text in
+            text.contains("工单工作台")
+                || text.contains("AI客服")
+                || text.contains("企微侧边栏")
+                || text.contains("今日AI")
+        }
+    }
+    if hasSidebarText {
+        return ["ok": true, "alreadyOpen": true]
+    }
+    var buttons: [AXUIElement] = []
+    if let window = window {
+        collectButtons(window, buttons: &buttons)
+    }
+    if buttons.isEmpty {
+        collectButtons(root, buttons: &buttons)
+    }
+    let openButton = buttons.first { button in
+        let texts = textValues(button)
+        return texts.contains { text in
+            text.contains("打开侧边栏")
+                || text.contains("展开")
+                || text.contains("智能助手")
+                || text.contains("AI客服")
+                || text.contains("外部工具")
+        }
+    }
+    guard let button = openButton else {
+        return ["ok": false, "error": "sidebar_open_button_not_found", "alreadyOpen": false]
+    }
+    let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
+    if result != .success, let center = buttonCenter(button) {
+        clickAt(x: Double(center.x), y: Double(center.y))
+    }
+    Thread.sleep(forTimeInterval: 0.25)
+    return ["ok": true, "alreadyOpen": false, "code": result.rawValue]
+}
+
+func inputReadyPayload(root: AXUIElement, window: AXUIElement?) -> [String: Any] {
+    let sidebar = ensureSidebarOpen(root: root, window: window)
+    guard let input = bestTextInput(root: root, window: window) else {
+        return ["ok": false, "error": "chat_input_not_found", "sidebar": sidebar]
+    }
+    activateRunningApp(bundleID: bundleID)
+    AXUIElementSetAttributeValue(root, kAXFocusedUIElementAttribute as CFString, input)
+    AXUIElementSetAttributeValue(input, kAXFocusedAttribute as CFString, boolValue(true))
+    if let pos = pointAttr(input, kAXPositionAttribute as CFString),
+       let size = sizeAttr(input) {
+        clickAt(x: Double(pos.x + min(max(size.width - 16, 10), size.width / 2)), y: Double(pos.y + size.height / 2))
+    }
+    Thread.sleep(forTimeInterval: 0.08)
+    let pos = pointAttr(input, kAXPositionAttribute as CFString) ?? .zero
+    let size = sizeAttr(input) ?? .zero
+    return [
+        "ok": true,
+        "sidebar": sidebar,
+        "input": [
+            "x": Double(pos.x),
+            "y": Double(pos.y),
+            "width": Double(size.width),
+            "height": Double(size.height),
+            "valueLength": (stringAttr(input, kAXValueAttribute as CFString) ?? "").count
+        ]
+    ]
+}
+
+func collectWebAreas(_ element: AXUIElement, out: inout [AXUIElement], maxDepth: Int = 14, depth: Int = 0) {
+    if depth > maxDepth {
+        return
+    }
+    if role(element) == "AXWebArea" {
+        out.append(element)
+    }
+    for child in children(element) {
+        collectWebAreas(child, out: &out, maxDepth: maxDepth, depth: depth + 1)
+    }
+}
+
+func sidebarIdentityPayload(root: AXUIElement, window: AXUIElement?) -> [String: Any] {
+    var webAreas: [AXUIElement] = []
+    let target = window ?? root
+    collectWebAreas(target, out: &webAreas, maxDepth: 14)
+    if webAreas.isEmpty {
+        return ["ok": false, "error": "sidebar_webarea_not_found", "external_user_id": ""]
+    }
+    let sorted = webAreas.sorted { lhs, rhs in
+        let lr = rectPayload(lhs) ?? [:]
+        let rr = rectPayload(rhs) ?? [:]
+        return lr["x", default: 0] > rr["x", default: 0]
+    }
+    guard let sidebar = sorted.first else {
+        return ["ok": false, "error": "sidebar_webarea_not_found", "external_user_id": ""]
+    }
+    let texts = collectText(sidebar, maxDepth: 10)
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    let uidRegex = try? NSRegularExpression(pattern: #"\b(w[mo][A-Za-z0-9_-]{8,})\b"#)
+    var uid = ""
+    for text in texts {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        if let match = uidRegex?.firstMatch(in: text, range: range),
+           let swiftRange = Range(match.range(at: 1), in: text) {
+            uid = String(text[swiftRange])
+            break
+        }
+    }
+    return [
+        "ok": true,
+        "external_user_id": uid,
+        "texts": Array(texts.prefix(120)),
+        "textCount": texts.count,
+        "webArea": rectPayload(sidebar) ?? [:]
+    ]
+}
+
 func intArg(_ index: Int, defaultValue: Int) -> Int {
     if CommandLine.arguments.count > index, let value = Int(CommandLine.arguments[index]) {
         return value
@@ -816,9 +1232,9 @@ guard let root = appElement(bundleID: bundleID) else {
 }
 
 let window = mainWindow(root)
-let rows = conversationRows(root: root, window: window)
 
 if command == "rows" {
+    let rows = conversationRows(root: root, window: window)
     for (index, row) in rows.enumerated() {
         let payload = rowPayload(row, index: index + 1)
         let texts = payload["texts"] as? [String] ?? []
@@ -826,9 +1242,37 @@ if command == "rows" {
             jsonLine(payload)
         }
     }
+} else if command == "ensure-single-chat" {
+    jsonLine(ensureSingleChat(root: root, window: window))
+} else if command == "recent-rows" {
+    let minutes = max(1, intArg(2, defaultValue: 10))
+    let limit = max(1, intArg(3, defaultValue: 12))
+    _ = ensureSingleChat(root: root, window: window)
+    let recentRows = recentConversationRows(root: root, window: window, limit: limit)
+    for (index, row) in recentRows.enumerated() {
+        let payload = recentRowPayload(row, index: index + 1, minutes: minutes)
+        let texts = payload["texts"] as? [String] ?? []
+        if texts.count >= 2 {
+            jsonLine(payload)
+        }
+    }
+} else if command == "selected-row" {
+    if let row = selectedConversationRow(root: root, window: window) {
+        var payload = rowPayload(row, index: 1)
+        payload["timeText"] = rowTimeText(row)
+        payload["hasUnreadMarker"] = rowHasUnreadMarker(row)
+        payload["source"] = "axuielement-selected-row"
+        jsonLine(payload)
+    } else {
+        jsonLine(["ok": false, "error": "selected_conversation_not_found", "source": "axuielement-selected-row"])
+    }
+} else if command == "input-ready" {
+    jsonLine(inputReadyPayload(root: root, window: window))
+} else if command == "sidebar-identity" {
+    jsonLine(sidebarIdentityPayload(root: root, window: window))
 } else if command == "chat" || command == "chat-all" {
-    let chatRows = allRows(root: root, window: window)
-    for (index, row) in chatRows.enumerated() {
+    let rows = chatRows(root: root, window: window)
+    for (index, row) in rows.enumerated() {
         let payload = chatPayload(row, index: index + 1)
         let texts = payload["texts"] as? [String] ?? []
         let containsMessageLikeText = texts.contains { text in
@@ -844,9 +1288,28 @@ if command == "rows" {
     for text in collectText(root, maxDepth: 14) {
         jsonLine(["text": text])
     }
+} else if command == "elements" {
+    let target = window ?? root
+    var textElements: [[String: Any]] = []
+    collectTextElements(target, out: &textElements, maxDepth: 14)
+    var mediaElements: [[String: Any]] = []
+    collectMediaElements(target, out: &mediaElements, maxDepth: 14)
+    for item in textElements {
+        var payload = item
+        payload["kind"] = "text"
+        jsonLine(payload)
+    }
+    for item in mediaElements {
+        var payload = item
+        payload["kind"] = "media"
+        jsonLine(payload)
+    }
 } else if command == "geometry" {
+    let rows = conversationRows(root: root, window: window)
     let tables = conversationTables(root: root, window: window)
+    let listTables = conversationListTables(root: root, window: window)
     var sidebar = tables.compactMap { rectPayload($0) }.first ?? [:]
+    let conversationList = listTables.compactMap { rectPayload($0) }.first ?? [:]
     if sidebar.isEmpty, let firstRow = rows.first, let firstRect = rectPayload(firstRow) {
         let rowHeight = firstRect["height", default: 56]
         let rowCount = max(1, min(rows.count, 12))
@@ -864,6 +1327,9 @@ if command == "rows" {
         "screen": screenPayload(),
         "window": window.flatMap { rectPayload($0) } ?? [:],
         "sidebar": sidebar,
+        "conversationList": conversationList,
+        "chatLeft": chatPaneLeftBoundary(root: root, window: window) ?? 0,
+        "rightSidebarLeft": rightSidebarLeftBoundary(root: root, window: window) ?? 0,
         "scrollPoint": ["x": scrollX, "y": scrollY],
         "rowCount": rows.count,
         "source": sidebar.isEmpty ? "ax-rows" : "ax-table"
@@ -903,6 +1369,7 @@ if command == "rows" {
         "screen": screenPayload()
     ])
 } else if command == "open" {
+    let rows = conversationRows(root: root, window: window)
     let target = args.dropFirst(2).joined(separator: " ")
     if target.isEmpty {
         fputs("missing target\n", stderr)
@@ -921,6 +1388,7 @@ if command == "rows" {
     fputs("row not found: \(target)\n", stderr)
     exit(1)
 } else if command == "scroll" {
+    let rows = conversationRows(root: root, window: window)
     let direction = args.count > 2 ? args[2] : "down"
     let ticks = max(1, intArg(3, defaultValue: 6))
     var x = Double(intArg(4, defaultValue: -1))
@@ -965,9 +1433,7 @@ if command == "rows" {
         jsonLine(["ok": false, "error": "missing_text"])
         exit(0)
     }
-    var inputs: [AXUIElement] = []
-    settableTextInputs(root, inputs: &inputs)
-    guard let input = inputs.max(by: { inputScore($0) < inputScore($1) }) else {
+    guard let input = bestTextInput(root: root, window: window) else {
         jsonLine(["ok": false, "error": "chat_input_not_found"])
         exit(0)
     }

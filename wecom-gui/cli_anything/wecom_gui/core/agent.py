@@ -946,6 +946,10 @@ def _reason_text(reason: str) -> str:
 def _log_read_context(title: str, job: dict, current: dict) -> None:
     messages = current.get("messages", [])
     media_count = sum(len(message.get("media") or []) for message in messages if isinstance(message, dict))
+    try:
+        log_limit = int(os.environ.get("WECOM_AGENT_READ_CONTEXT_LOG_LIMIT", "220") or "220")
+    except ValueError:
+        log_limit = 220
     state.append_event(
         {
             "type": "agent_read_context",
@@ -963,8 +967,93 @@ def _log_read_context(title: str, job: dict, current: dict) -> None:
     _log(
         f"[AI客服] 读取明细：{title}，hash={_short(str(current.get('hash') or ''), 16)}，"
         f"消息数={len(messages)}，媒体数={media_count}｜"
-        f"{_short(json.dumps(messages, ensure_ascii=False), 220)}"
+        f"{_short(json.dumps(messages, ensure_ascii=False), max(80, log_limit))}"
     )
+
+
+def _selected_conversation_after_open(limit: int = 30) -> dict | None:
+    try:
+        return macos_backend.selected_conversation_row(limit=limit)
+    except TypeError:
+        return macos_backend.selected_conversation_row()
+    except Exception as exc:
+        state.append_event({"type": "agent_selected_conversation_check_failed", "error": str(exc)})
+        _log(f"[AI客服] 当前选中会话校验失败：{exc}")
+        return None
+
+
+def _conversation_title_matches(expected: str | None, actual: str | None) -> bool:
+    left = str(expected or "").strip()
+    right = str(actual or "").strip()
+    return bool(left and right and (left == right or left.startswith(right) or right.startswith(left)))
+
+
+def _ensure_opened_conversation_matches(job: dict, *, stage: str) -> bool:
+    expected = str(job.get("title") or "").strip()
+    if not expected:
+        return True
+    selected = _selected_conversation_after_open()
+    if not selected:
+        state.append_event(
+            {
+                "type": "agent_selected_conversation_unavailable",
+                "job_id": job.get("id"),
+                "conversation": expected,
+                "stage": stage,
+            }
+        )
+        _log(f"[AI客服] 打开后未能确认当前选中会话，继续读取：{expected}")
+        return True
+    actual = str(selected.get("title") or "").strip()
+    if _conversation_title_matches(expected, actual):
+        state.append_event(
+            {
+                "type": "agent_selected_conversation_confirmed",
+                "job_id": job.get("id"),
+                "conversation": expected,
+                "selected": actual,
+                "stage": stage,
+            }
+        )
+        _log(f"[AI客服] 已确认打开目标会话：{expected}")
+        return True
+    state.append_event(
+        {
+            "type": "agent_selected_conversation_mismatch",
+            "job_id": job.get("id"),
+            "conversation": expected,
+            "selected": actual,
+            "stage": stage,
+            "selected_preview": selected.get("preview", ""),
+        }
+    )
+    _log(f"[AI客服] 打开会话不一致，暂停读取：目标={expected}，当前={actual or '未知'}")
+    return False
+
+
+def _ensure_chat_input_ready_for_job(job: dict, *, stage: str) -> dict:
+    title = str(job.get("title") or "").strip()
+    result = macos_backend.ensure_input_ready()
+    ok = bool(result.get("ok"))
+    state.append_event(
+        {
+            "type": "agent_input_ready",
+            "job_id": job.get("id"),
+            "conversation": title,
+            "stage": stage,
+            "ok": ok,
+            "error": result.get("error") or "",
+            "sidebar": result.get("sidebar") if isinstance(result.get("sidebar"), dict) else {},
+            "input": result.get("input") if isinstance(result.get("input"), dict) else {},
+        }
+    )
+    _log(
+        f"[AI客服] 输入框/侧边栏检查：{title or '当前会话'}，"
+        f"阶段={stage}，结果={'ok' if ok else result.get('error') or '失败'}"
+    )
+    if not ok:
+        raise RuntimeError(f"chat input not ready: {result}")
+    return result
 
 
 def _mode_text(mode: str) -> str:
@@ -1006,14 +1095,23 @@ def _log_scan(scan: dict) -> None:
     unread = scan.get("unread", 0)
     enqueued = scan.get("enqueued", 0)
     ignored = scan.get("ignored", 0)
+    cached = scan.get("ignored_cached_preview", 0)
     welcome_count = len(scan.get("welcome_items", []) or [])
-    if not unread and not enqueued and not welcome_count:
+    bounded = bool(scan.get("bounded_scan"))
+    log_empty = str(os.environ.get("WECOM_AGENT_LOG_EMPTY_SCANS", "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not unread and not enqueued and not welcome_count and not cached and not bounded and not log_empty:
         return
 
     _log(
         "[AI客服] 扫描左侧会话："
+        f"模式={'有界单聊' if bounded else '旧链路'}，"
         f"{_required_tag_text()}={visible}，页数={pages}，未读={unread}，"
-        f"新客户={welcome_count}，新入队={enqueued}，忽略={ignored}"
+        f"新客户={welcome_count}，新入队={enqueued}，缓存跳过={cached}，忽略={ignored}"
     )
     for row in scan.get("unread_items", [])[:5]:
         unread_count = int(row.get("unread_count") or 0)
@@ -1444,6 +1542,16 @@ def _read_one_pending(
         with state.gui_lock():
             inbox.open_row(job)
             time.sleep(float(os.environ.get("WECOM_AGENT_OPEN_READ_DELAY", "0.45")))
+            if not _ensure_opened_conversation_matches(job, stage="read"):
+                state.mark_pending(job["id"], "opened_conversation_mismatch", preserve_context=True)
+                return {
+                    "ok": True,
+                    "read": 0,
+                    "retry": 1,
+                    "conversation": title,
+                    "reason": "opened_conversation_mismatch",
+                }
+            _ensure_chat_input_ready_for_job(job, stage="read")
             current = _read_current_with_retry(
                 last=last,
                 expected_visible_text=job.get("preview", ""),
@@ -2032,6 +2140,16 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
         with state.gui_lock():
             inbox.open_row(job)
             time.sleep(0.25)
+            if not _ensure_opened_conversation_matches(job, stage="send"):
+                state.mark_pending(job["id"], "send_opened_conversation_mismatch", preserve_context=True)
+                return {
+                    "ok": True,
+                    "sent": 0,
+                    "retry": 1,
+                    "conversation": title,
+                    "reason": "send_opened_conversation_mismatch",
+                }
+            _ensure_chat_input_ready_for_job(job, stage="send")
             current = _read_current_with_retry(
                 last=last,
                 expected_visible_text=expected_latest_text,
@@ -2543,12 +2661,13 @@ def agent_loop(
                 _log_scan(scan)
                 next_scan_at = now + scan_interval
 
-            _drop_superseded_drafts(futures)
-            finished = _finish_drafts(futures)
-            ready += finished["ready"]
+            if not read_only_mode:
+                _drop_superseded_drafts(futures)
+                finished = _finish_drafts(futures)
+                ready += finished["ready"]
 
-            send_result = _send_one_ready(last=last, mode=mode)
-            sent += send_result.get("sent", 0)
+                send_result = _send_one_ready(last=last, mode=mode)
+                sent += send_result.get("sent", 0)
 
             while len(futures) < max_drafts:
                 intake = _read_one_pending(

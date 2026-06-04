@@ -112,6 +112,28 @@ ensure_wecom_running() {
   done
 }
 
+select_inbox_scope() {
+  local scope="${WECOM_GUI_INBOX_SCOPE:-}"
+  local label="${WECOM_GUI_INBOX_SCOPE_LABEL:-单聊}"
+  if [[ "$scope" != "single" && "$scope" != "single-chat" && "$scope" != "single_chat" && "$scope" != "singlechat" && "$scope" != "单聊" ]]; then
+    return 0
+  fi
+  PYTHONPATH="$PYTHONPATH_VALUE" "$PYTHON_BIN" - "$label" <<'PY'
+import sys
+
+label = sys.argv[1]
+try:
+    from cli_anything.wecom_gui.utils import macos_backend
+
+    result = (macos_backend._swift_ax("ensure-single-chat") or [{}])[-1]
+    if not result.get("ok"):
+        raise RuntimeError(f"ensure-single-chat failed: {result}")
+    print(f"WeCom inbox scope selected: {label} result={result}")
+except Exception as exc:
+    print(f"WARNING: failed to select WeCom inbox scope {label}: {type(exc).__name__}: {exc}", file=sys.stderr)
+PY
+}
+
 preflight_agent() {
   local failed=0
 
@@ -442,6 +464,7 @@ start_agent() {
     return 1
   fi
   knowledge_sync_if_stale 2>&1 | tee -a "$LOG_FILE" || true
+  select_inbox_scope 2>&1 | tee -a "$LOG_FILE" || true
 
   local command
   command="cd '$ROOT_DIR' && PYTHONPATH='$PYTHONPATH_VALUE' '$PYTHON_BIN' -u -m cli_anything.wecom_gui agent --mode '$MODE' --poll '$POLL' --scan-interval '$SCAN_INTERVAL' --inbox-limit '$INBOX_LIMIT' --scan-pages '$SCAN_PAGES' --scroll-ticks '$SCROLL_TICKS' --deep-scan-interval '$DEEP_SCAN_INTERVAL' --max-drafts '$MAX_DRAFTS' --last '$LAST_MESSAGES' --log-interval '$LOG_INTERVAL' >> '$LOG_FILE' 2>&1"

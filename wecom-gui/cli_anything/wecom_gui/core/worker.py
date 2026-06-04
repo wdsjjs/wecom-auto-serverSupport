@@ -79,6 +79,15 @@ def _has_unread(row: dict) -> bool:
     return int(row.get("unread_count") or 0) > 0 or bool(row.get("unread"))
 
 
+def _can_skip_open_for_cached_preview(row: dict) -> bool:
+    if welcome.is_new_customer_row(row):
+        return False
+    try:
+        return bool(state.cached_read_reason_for_row(row))
+    except Exception:
+        return False
+
+
 def _same_current_message(existing: dict | None, *, signature: str, message_hash: str) -> bool:
     if not existing:
         return False
@@ -148,9 +157,24 @@ def scan_once(*, inbox_limit: int, process_existing: bool = True, scan_pages: in
     enqueued = 0
     ignored_no_unread = len(candidates) - len(unread_rows) - len(welcome_rows) if require_unread else 0
     ignored_existing = 0
+    ignored_cached_preview = 0
     items: list[dict] = []
     welcome_items: list[dict] = []
     for row in rows:
+        if _can_skip_open_for_cached_preview(row):
+            ignored_cached_preview += 1
+            try:
+                reason = state.cached_read_reason_for_row(row)
+            except Exception:
+                reason = "cached_read"
+            state.append_event(
+                {
+                    "type": "queue_skip_cached_preview",
+                    "conversation": row,
+                    "reason": reason or "cached_read",
+                }
+            )
+            continue
         signature = watcher._conversation_signature(row)
         changed, item = state.enqueue_conversation(row, signature)
         if changed:
@@ -171,14 +195,17 @@ def scan_once(*, inbox_limit: int, process_existing: bool = True, scan_pages: in
         "unread": len(unread_rows),
         "scanned": len(rows),
         "enqueued": enqueued,
-        "ignored": ignored_no_unread + ignored_existing,
+        "ignored": ignored_no_unread + ignored_existing + ignored_cached_preview,
         "ignored_no_unread": ignored_no_unread,
         "ignored_existing": ignored_existing,
+        "ignored_cached_preview": ignored_cached_preview,
         "items": items,
         "candidates": candidates,
         "unread_items": unread_rows,
         "welcome_items": welcome_items,
         "pages_scanned": scan.get("pages_scanned", 1),
+        "scan_source": scan.get("source", ""),
+        "bounded_scan": any(str(row.get("source") or "") == "axuielement-bounded" for row in scan.get("conversations", [])),
     }
 
 

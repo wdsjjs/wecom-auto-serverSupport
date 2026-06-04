@@ -1,0 +1,131 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+RUN_DIR="$ROOT_DIR/.codex-run"
+ENV_FILE="${WECOM_AGENT_ENV:-$ROOT_DIR/.env.local}"
+SOURCE="$ROOT_DIR/cli_anything/wecom_gui/scripts/ax_wecom.swift"
+DEFAULT_OUT_DIR="$RUN_DIR/ax-dumps"
+
+cd "$ROOT_DIR"
+mkdir -p "$DEFAULT_OUT_DIR"
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+if [[ -z "${SDKROOT:-}" && -d "/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk" ]]; then
+  export SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk"
+fi
+
+timestamp="$(date '+%Y%m%d-%H%M%S')"
+OUT_FILE="${1:-$DEFAULT_OUT_DIR/wecom-ax-dump-$timestamp.txt}"
+mkdir -p "$(dirname "$OUT_FILE")"
+
+HELPER="${WECOM_GUI_AX_HELPER:-}"
+if [[ -z "$HELPER" && -x "$RUN_DIR/ax_wecom" ]]; then
+  HELPER="$RUN_DIR/ax_wecom"
+fi
+if [[ -z "$HELPER" ]]; then
+  if ! command -v swift >/dev/null 2>&1; then
+    echo "ERROR: neither compiled helper nor swift is available" >&2
+    exit 1
+  fi
+  HELPER="swift $SOURCE"
+fi
+
+COMMANDS=()
+if [[ -n "${WECOM_AX_DUMP_COMMANDS:-}" ]]; then
+  IFS=' ' read -rA COMMANDS <<< "$WECOM_AX_DUMP_COMMANDS"
+else
+  COMMANDS=(geometry rows chat chat-all texts)
+fi
+
+run_section() {
+  local title="$1"
+  shift
+  local stderr_file stdout_file
+  stderr_file="$(mktemp)"
+  stdout_file="$(mktemp)"
+  local start end duration exit_code pid deadline timed_out timeout_seconds
+  timeout_seconds="${WECOM_AX_DUMP_SECTION_TIMEOUT:-35}"
+  if [[ "$title" == system-events* ]]; then
+    timeout_seconds="${WECOM_AX_DUMP_SYSTEM_TIMEOUT:-8}"
+  fi
+  start="$(date '+%s')"
+  {
+    printf '\n===== %s =====\n' "$title"
+    printf 'started_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'timeout_seconds=%s\n' "$timeout_seconds"
+    printf 'command=%s\n\n' "$*"
+  } >> "$OUT_FILE"
+  set +e
+  "$@" >"$stdout_file" 2>"$stderr_file" &
+  pid=$!
+  deadline=$((start + timeout_seconds))
+  timed_out=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( $(date '+%s') >= deadline )); then
+      timed_out=1
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 0.2
+  done
+  wait "$pid" 2>/dev/null
+  exit_code=$?
+  set -e
+  end="$(date '+%s')"
+  duration=$((end - start))
+  {
+    cat "$stdout_file"
+    printf '\nexit_code=%s duration_seconds=%s\n' "$exit_code" "$duration"
+    if [[ "$timed_out" == "1" ]]; then
+      printf 'timed_out=true\n'
+    fi
+    if [[ -s "$stderr_file" ]]; then
+      printf -- '--- stderr ---\n'
+      cat "$stderr_file"
+      printf '\n'
+    fi
+  } >> "$OUT_FILE"
+  rm -f "$stderr_file" "$stdout_file"
+}
+
+{
+  printf 'WECOM_AX_DUMP\n'
+  printf 'created_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf 'root=%s\n' "$ROOT_DIR"
+  printf 'output=%s\n' "$OUT_FILE"
+  printf 'helper=%s\n' "$HELPER"
+  printf 'bundle_id=%s\n' "${WECOM_GUI_BUNDLE_ID:-com.tencent.WeWorkMac}"
+  printf 'required_tags=%s\n' "${WECOM_GUI_REQUIRED_TAGS:-${WECOM_GUI_REQUIRED_TAG:-}}"
+  printf 'commands=%s\n' "${COMMANDS[*]}"
+  printf 'sdkroot=%s\n' "${SDKROOT:-}"
+} > "$OUT_FILE"
+
+if command -v osascript >/dev/null 2>&1; then
+  run_section "system-events-windows" osascript \
+    -e 'tell application "System Events"' \
+    -e 'if exists process "企业微信" then' \
+    -e 'tell process "企业微信" to get {name, position, size, value of attribute "AXMain", value of attribute "AXMinimized"} of every window' \
+    -e 'else' \
+    -e 'return "process_not_found"' \
+    -e 'end if' \
+    -e 'end tell'
+fi
+
+for command_name in "${COMMANDS[@]}"; do
+  if [[ "$HELPER" == swift\ * ]]; then
+    run_section "ax-$command_name" swift "$SOURCE" "$command_name"
+  else
+    run_section "ax-$command_name" "$HELPER" "$command_name"
+  fi
+done
+
+printf '%s\n' "$OUT_FILE"
