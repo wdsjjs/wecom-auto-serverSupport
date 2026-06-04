@@ -228,6 +228,80 @@ def test_ax_chat_messages_marks_animated_sticker_media(monkeypatch):
     assert messages[0]["media"][0]["skip_capture"] is True
 
 
+def test_ax_chat_messages_marks_mini_program_card_media(monkeypatch):
+    def fake_swift(command):
+        if command == "geometry":
+            return [{"ok": True, "sidebar": {"x": 60, "width": 250}}]
+        return [
+            {
+                "index": 20,
+                "texts": [
+                    "21:19",
+                    "UndoAge 营养工厂",
+                    "营养工厂幸运大抽奖｜免单、NMN、鱼油…",
+                    "WXMsg WeAppLogo",
+                    "小程序",
+                ],
+                "x": 314,
+                "y": 208,
+                "width": 649,
+                "height": 361,
+                "bubbleX": 343,
+                "bubbleY": 291,
+                "bubbleWidth": 181,
+                "bubbleHeight": 38,
+                "bubbleTexts": ["营养工厂幸运大抽奖｜免单、NMN、鱼油…"],
+            },
+        ]
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+
+    messages = macos_backend._ax_chat_messages(last=10)
+
+    assert messages[0]["text"] == "UndoAge 营养工厂 营养工厂幸运大抽奖｜免单、NMN、鱼油… WXMsg WeAppLogo 小程序"
+    assert messages[0]["media"][0]["type"] == "mini_program"
+    assert messages[0]["media"][0]["source"] == "axuielement-chat-mini-program-card"
+    assert messages[0]["media"][0]["rect"]["width"] >= 260
+    assert messages[0]["media"][0]["rect"]["height"] >= 220
+
+
+def test_capture_chat_images_screenshots_mini_program_card(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_screenshot(rect, output_path):
+        captured.append((rect, output_path))
+        output_path.write_bytes(b"\x89PNG\r\n\x1a\nmini")
+        return {"ok": True, "path": str(output_path), "rect": rect}
+
+    def fail_preview(_rect):
+        raise AssertionError("mini-program cards should be captured by rect screenshot")
+
+    monkeypatch.setenv("WECOM_GUI_CAPTURE_IMAGE_DIR", str(tmp_path))
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._screenshot_rect", fake_screenshot)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._click_image_and_capture", fail_preview)
+
+    messages = macos_backend.capture_chat_images(
+        [
+            {
+                "role": "用户",
+                "text": "小程序",
+                "media": [
+                    {
+                        "type": "mini_program",
+                        "rect": {"x": 320, "y": 250, "width": 300, "height": 390},
+                    }
+                ],
+            }
+        ]
+    )
+
+    media = messages[0]["media"][0]
+    assert captured
+    assert media["capture_ok"] is True
+    assert media["capture_mode"] == "mini_program_card"
+    assert media["capture_path"].endswith(".png")
+
+
 def test_hidden_image_row_rect_keeps_short_preview_bubbles(monkeypatch):
     monkeypatch.setenv("WECOM_GUI_MIN_IMAGE_BUBBLE_SIZE", "64")
 

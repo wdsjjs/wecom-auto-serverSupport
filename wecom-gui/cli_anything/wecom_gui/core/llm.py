@@ -168,7 +168,7 @@ def _message_has_image(message: dict) -> bool:
         if not isinstance(media, dict):
             continue
         media_type = str(media.get("type") or "image").strip()
-        if media_type == "image" and not media.get("skip_capture"):
+        if media_type in {"image", "mini_program"} and not media.get("skip_capture"):
             return True
     return False
 

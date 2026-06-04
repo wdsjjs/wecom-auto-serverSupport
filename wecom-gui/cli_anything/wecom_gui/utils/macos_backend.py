@@ -1242,6 +1242,7 @@ CHAT_NOISE_TEXTS = {
 }
 
 IMAGE_PLACEHOLDER_TEXTS = {"[图片]", "图片"}
+MINI_PROGRAM_HINTS = ("小程序", "WXMsg", "WeAppLogo")
 ANIMATED_STICKER_HINTS = (
     "动画表情",
     "表情",
@@ -1344,6 +1345,45 @@ def _is_image_placeholder_content(content: str, content_parts: list[str]) -> boo
     if normalized in IMAGE_PLACEHOLDER_TEXTS:
         return True
     return bool(content_parts) and all("".join(part.split()) in IMAGE_PLACEHOLDER_TEXTS for part in content_parts)
+
+
+def _is_mini_program_card(content: str, content_parts: list[str]) -> bool:
+    haystack = " ".join([str(content or ""), *[str(part or "") for part in content_parts]])
+    return bool(haystack.strip()) and any(hint in haystack for hint in MINI_PROGRAM_HINTS)
+
+
+def _mini_program_card_rect(item: dict) -> dict:
+    """Return a screenshot rect for a visible WeCom mini-program card row."""
+    row_x = int(_float_value(item.get("x")))
+    row_y = int(_float_value(item.get("y")))
+    row_width = int(_float_value(item.get("width")))
+    row_height = int(_float_value(item.get("height")))
+    if row_width <= 0 or row_height <= 0:
+        return {}
+
+    bubble_x = int(_float_value(item.get("bubbleX"), row_x))
+    bubble_y = int(_float_value(item.get("bubbleY"), row_y))
+    bubble_width = int(_float_value(item.get("bubbleWidth"), min(row_width, 360)))
+    bubble_height = int(_float_value(item.get("bubbleHeight"), 0))
+    if bubble_width <= 0:
+        return {}
+
+    padding_x = int(os.environ.get("WECOM_GUI_MINI_PROGRAM_CAPTURE_PADDING_X", "28"))
+    padding_top = int(os.environ.get("WECOM_GUI_MINI_PROGRAM_CAPTURE_PADDING_TOP", "72"))
+    padding_bottom = int(os.environ.get("WECOM_GUI_MINI_PROGRAM_CAPTURE_PADDING_BOTTOM", "330"))
+    max_width = int(os.environ.get("WECOM_GUI_MINI_PROGRAM_CAPTURE_MAX_WIDTH", "520"))
+    min_height = int(os.environ.get("WECOM_GUI_MINI_PROGRAM_CAPTURE_MIN_HEIGHT", "220"))
+
+    x = max(row_x, bubble_x - padding_x)
+    y = max(0, bubble_y - padding_top)
+    width = min(max_width, max(bubble_width + padding_x * 2, 260))
+    width = min(width, max(1, row_x + row_width - x))
+    target_bottom = bubble_y + max(bubble_height, 1) + padding_bottom
+    height = max(min_height, target_bottom - y)
+    height = min(height, max(1, row_y + row_height - y))
+    if width <= 0 or height <= 0:
+        return {}
+    return {"x": x, "y": y, "width": width, "height": height}
 
 
 def _media_texts(media: dict) -> list[str]:
@@ -1633,6 +1673,21 @@ def _capture_image_bubble(rect: dict) -> dict:
     return captured
 
 
+def _capture_mini_program_card(rect: dict) -> dict:
+    output_path = _image_capture_dir() / f"wecom-mini-program-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.png"
+    captured = _screenshot_rect(rect, output_path)
+    captured["capture_mode"] = "mini_program_card"
+    _append_event(
+        {
+            "type": "mini_program_capture_result",
+            "mode": "mini_program_card",
+            "rect": rect,
+            "capture": captured,
+        }
+    )
+    return captured
+
+
 def capture_chat_images(messages: list[dict]) -> list[dict]:
     """Capture image bubbles only during formal queue processing."""
     if os.environ.get("WECOM_GUI_CAPTURE_IMAGES", "1") == "0":
@@ -1646,6 +1701,23 @@ def capture_chat_images(messages: list[dict]) -> list[dict]:
             media_copy = {**media}
             rect = media_copy.get("rect") if isinstance(media_copy.get("rect"), dict) else {}
             media_type = str(media_copy.get("type") or "image").strip().lower()
+            if media_type == "mini_program":
+                if mode == "off":
+                    media_copy["capture_ok"] = False
+                    media_copy["capture_mode"] = "off"
+                    media_copy["error"] = "media_capture_disabled"
+                    media_items.append(media_copy)
+                    continue
+                result = _capture_mini_program_card(rect)
+                media_copy["capture_ok"] = bool(result.get("ok"))
+                media_copy["capture_mode"] = result.get("capture_mode") or "mini_program_card"
+                if result.get("ok"):
+                    media_copy["capture_path"] = result.get("path", "")
+                    media_copy["capture_rect"] = result.get("rect", {})
+                else:
+                    media_copy["error"] = result.get("error") or "capture_failed"
+                media_items.append(media_copy)
+                continue
             if (
                 media_type in {"sticker", "emoji", "animated_sticker"}
                 or media_copy.get("skip_capture")
@@ -1709,6 +1781,7 @@ def _ax_chat_messages(
         texts = [str(text).strip() for text in item.get("texts", []) if str(text).strip()]
         content, content_parts, stamp = _meaningful_chat_texts(item)
         media_elements = item.get("mediaElements") if isinstance(item.get("mediaElements"), list) else []
+        is_mini_program = _is_mini_program_card(content, content_parts)
         if not texts and not media_elements:
             continue
         has_media = bool(media_elements)
@@ -1766,6 +1839,20 @@ def _ax_chat_messages(
                     message["text"] = "[动画表情]" if _is_image_placeholder_content(content, content_parts) else content
                 else:
                     message["text"] = content or "[图片]"
+                message["content"] = message["text"]
+        if is_mini_program and include_hidden_image_media:
+            rect = _mini_program_card_rect(item)
+            if rect:
+                message["media"] = [
+                    *(message.get("media") or []),
+                    {
+                        "type": "mini_program",
+                        "rect": rect,
+                        "source": "axuielement-chat-mini-program-card",
+                        "row": int(item.get("index") or len(messages) + 1),
+                        "texts": content_parts,
+                    },
+                ]
                 message["content"] = message["text"]
         messages.append(message)
     if include_hidden_images:
