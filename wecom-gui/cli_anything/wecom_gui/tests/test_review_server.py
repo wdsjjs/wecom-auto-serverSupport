@@ -201,11 +201,8 @@ def test_supplement_test_new_user_gets_fixed_welcome_followup(monkeypatch, tmp_p
     assert result["ok"] is True
     assert result["reply_text"].startswith("您好~可以简单介绍下您的基本信息")
     assert result["state"]["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
-    assert [message["message_type"] for message in result["messages"]] == ["reply", "reply"]
-    assert result["messages"][0]["text"].startswith("您好，新客户A")
-    assert "营养工厂健康顾问" in result["messages"][0]["text"]
-    assert "领产品说明书 https://docs.qq.com/s/tHMpjD9S811JnjY369QC2G" in result["messages"][0]["text"]
-    assert result["messages"][1]["text"].startswith("您好~可以简单介绍下您的基本信息")
+    assert [message["message_type"] for message in result["messages"]] == ["reply"]
+    assert result["messages"][0]["text"].startswith("您好~可以简单介绍下您的基本信息")
     assert result["logs"][0]["event_type"] == "supplement_route_evaluated"
     assert result["logs"][0]["details"]["trigger_source"] == "new_user_welcome"
     assert not [item for item in result["logs"] if item["event_type"] == "supplement_backend_agent_started"]
@@ -228,7 +225,6 @@ def test_supplement_test_new_user_restart_does_not_call_backend_agent(monkeypatc
     assert second["reply_text"] == "您好，我继续帮您处理。"
     assert second["state"]["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
     assert second["state"]["digging_count"] == 0
-    assert not second["messages"][-2]["text"].startswith("您好，新客户B")
     assert second["messages"][-1]["text"] == "您好，我继续帮您处理。"
     assert not [item for item in second["logs"] if item["event_type"] == "supplement_backend_agent_started"]
 
@@ -1072,7 +1068,11 @@ def test_review_mode_skips_stale_context_before_send(monkeypatch, tmp_path):
     assert item["title"] == "客户A"
     assert result["reason"] == "stale_context"
     assert sent == []
-    assert state.list_queue(status="skipped")[0]["error"] == "stale_context"
+    pending = state.list_queue(status="pending")[0]
+    assert pending["error"] == "stale_context"
+    assert pending["preview"] == "新问题"
+    stored = state.list_conversation_messages(conversation_key=pending["conversation_key"])
+    assert stored[-1]["text"] == "新问题"
 
 def test_handoff_reply_stays_in_handoff_queue_until_finished(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)

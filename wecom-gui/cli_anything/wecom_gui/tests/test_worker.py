@@ -94,6 +94,36 @@ def test_scan_once_enqueues_new_customer_without_unread(monkeypatch, tmp_path):
     item = state.list_queue(status="pending")[0]
     assert item["preview"] == "你已添加了三水儿，现在可以开始聊天了。"
 
+
+def test_enqueue_current_chat_uses_customer_message_when_wecom_auto_greeting_tails(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    selected = {
+        "title": "三水儿",
+        "preview": "你好",
+        "time": "8分钟前",
+        "tags": ["@微信"],
+        "raw": ["三水儿", "你好", "@微信"],
+        "unread": False,
+        "unread_count": 0,
+    }
+    messages = [
+        {"role": "用户", "content": "我是三水儿", "text": "我是三水儿"},
+        {"role": "客服", "content": "你已添加了三水儿，现在可以开始聊天了。", "text": "你已添加了三水儿，现在可以开始聊天了。"},
+        {"role": "客服", "content": "你好", "text": "你好"},
+    ]
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=False: {"hash": "current-hash", "messages": messages},
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row", lambda limit=30: selected)
+
+    result = worker.enqueue_current_chat_if_changed(last=12, inbox_limit=30)
+
+    assert result["enqueued"] == 1
+    assert result["latest"] == "我是三水儿"
+    item = state.list_queue(status="pending")[0]
+    assert item["preview"] == "我是三水儿"
+
 def test_superseded_draft_is_untracked_before_pool_capacity_check(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {"title": "客户A", "preview": "旧问题", "time": "刚刚", "tags": ["@微信"], "raw": [], "unread": True, "unread_count": 1}
@@ -331,7 +361,11 @@ def test_fast_agent_skips_stale_context_before_send(monkeypatch, tmp_path):
     assert item["title"] == "客户A"
     assert result["reason"] == "stale_context"
     assert sent == []
-    assert state.list_queue(status="skipped")[0]["error"] == "stale_context"
+    pending = state.list_queue(status="pending")[0]
+    assert pending["error"] == "stale_context"
+    assert pending["preview"] == "新问题"
+    stored = state.list_conversation_messages(conversation_key=pending["conversation_key"])
+    assert stored[-1]["text"] == "新问题"
 
 def test_fast_agent_read_failure_does_not_raise(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)

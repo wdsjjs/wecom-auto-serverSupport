@@ -17,8 +17,8 @@ import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from cli_anything.wecom_gui.core import chat, handoff, inbox, llm, message_config, reply, state, watcher, worker, welcome
-from cli_anything.wecom_gui.core.text import clean_customer_reply_text
+from cli_anything.wecom_gui.core import chat, fixed_agent, handoff, inbox, llm, reply, state, watcher, worker, welcome
+from cli_anything.wecom_gui.core.text import clean_customer_reply_text, clean_history_message_text
 from cli_anything.wecom_gui.utils import macos_backend
 
 
@@ -28,11 +28,9 @@ _DRAFT_MESSAGE_HASH: dict[int, str] = {}
 _DRAFT_AGENT_MODE: dict[int, str] = {}
 _DRAFT_TRACE_ID: dict[int, str] = {}
 _DRAFT_CUSTOMER_KEY: dict[int, str] = {}
-WELCOME_MESSAGE = "{WELCOME_MESSAGE}"
-WELCOME_REPLY_SOURCE = "welcome"
-WELCOME_ADDED_PATTERN = re.compile(r"你已添加了\s*(?P<nickname>.+?)\s*，现在可以开始聊天了。")
-WELCOME_GREETING_SYSTEM_TEXT = "以上是打招呼内容"
-SUPPLEMENT_REPLY_SOURCE = "supplement"
+WELCOME_MESSAGE = fixed_agent.WELCOME_MESSAGE
+WELCOME_REPLY_SOURCE = fixed_agent.WELCOME_REPLY_SOURCE
+SUPPLEMENT_REPLY_SOURCE = fixed_agent.SUPPLEMENT_REPLY_SOURCE
 SUPPLEMENT_TRIGGER_TERMS = (
     "补剂推荐",
     "推荐补剂",
@@ -47,11 +45,6 @@ SUPPLEMENT_TRIGGER_TERMS = (
     "吃什么补剂",
     "适合什么补剂",
 )
-SUPPLEMENT_NEED_CHOICES_TEXT = message_config.supplement_need_choices_text()
-SUPPLEMENT_PROFILE_PROMPT = message_config.supplement_profile_prompt()
-SUPPLEMENT_FIRST_REPLY_WITH_PROFILE = message_config.supplement_first_reply_with_profile()
-SUPPLEMENT_FIRST_REPLY_CHOICES_ONLY = message_config.supplement_first_reply_choices_only()
-SUPPLEMENT_SELECTION_ACK = message_config.fixed_message("supplement", "selection_ack")
 SUPPLEMENT_PROFILE_OPT_OUT_TERMS = (
     "不想提供",
     "不愿意提供",
@@ -104,6 +97,21 @@ SUPPLEMENT_SKIP_TERMS = (
     "退款",
     "投诉",
 )
+SHORT_CONFIRMATION_TERMS = {
+    "ok",
+    "okay",
+    "嗯",
+    "嗯嗯",
+    "好",
+    "好的",
+    "可以",
+    "行",
+    "收到",
+    "明白",
+    "了解",
+    "谢谢",
+}
+AUTO_GREETING_TEXTS = {"你好", "您好", "在吗", "在不在", "hi", "hello"}
 
 
 def _message_image_paths(messages: list[dict]) -> list[str]:
@@ -123,7 +131,7 @@ def _message_has_image(message: dict) -> bool:
         if not isinstance(media, dict):
             continue
         media_type = str(media.get("type") or "image").strip()
-        if media_type == "image" and not media.get("skip_capture"):
+        if media_type in {"image", "mini_program"} and not media.get("skip_capture"):
             return True
     return False
 
@@ -151,11 +159,14 @@ def _latest_user_turn_messages(messages: list[dict]) -> list[dict]:
         has_media = bool(message.get("media"))
         if not text and not has_media:
             continue
+        if _is_tail_ignorable_message(message):
+            continue
         if message.get("role") == "用户" or (turn and has_media):
             turn.append(message)
             continue
         if turn:
             break
+        break
     turn.reverse()
     return turn
 
@@ -230,30 +241,93 @@ def _short(text: str | None, limit: int = 90) -> str:
 
 
 def _message_text(message: dict | None) -> str:
-    if not message:
-        return ""
-    return str(message.get("content") or message.get("text") or "")
+    return fixed_agent.message_text(message)
 
 
 def _is_welcome_added_system_text(text: str | None) -> bool:
-    return bool(WELCOME_ADDED_PATTERN.search(str(text or "").strip()))
+    return fixed_agent.is_welcome_added_system_text(text)
 
 
 def _is_greeting_system_text(text: str | None) -> bool:
-    return WELCOME_GREETING_SYSTEM_TEXT in str(text or "").strip()
+    return fixed_agent.is_greeting_system_text(text)
 
 
 def _is_system_notice_message(message: dict | None) -> bool:
+    return fixed_agent.is_system_notice_message(message)
+
+
+def _fixed_message_texts_for_matching() -> tuple[str, ...]:
+    return fixed_agent.fixed_message_texts_for_matching()
+
+
+def _is_card_or_link_message(text: str) -> bool:
+    return fixed_agent.is_card_or_link_message(text)
+
+
+def _is_fixed_service_text(text: str | None) -> bool:
+    return fixed_agent.is_fixed_service_text(text)
+
+
+def _is_auto_service_greeting_message(message: dict | None) -> bool:
     if not message:
         return False
+    role = str(message.get("role") or "").strip()
+    if role not in {"客服", "assistant", "service"}:
+        return False
+    return _match_text(_message_text(message).lower()) in {_match_text(term.lower()) for term in AUTO_GREETING_TEXTS}
+
+
+def _is_tail_ignorable_message(message: dict | None) -> bool:
+    if not message:
+        return True
     text = _message_text(message).strip()
-    return _is_welcome_added_system_text(text) or _is_greeting_system_text(text)
+    role = str(message.get("role") or "").strip()
+    role_confidence = str(message.get("role_confidence") or "").strip()
+    if _is_card_or_link_message(text):
+        return not (role == "用户" or bool(message.get("media")) or role_confidence in {"preview_fallback", "selected_preview_fallback", "unread_preview_after_image"})
+    if _is_fixed_service_text(text):
+        return True
+    if _is_auto_service_greeting_message(message):
+        return True
+    message_type = str(message.get("message_type") or "").strip().lower()
+    return role in {"系统", "system"} or message_type == "system"
+
+
+def _is_real_customer_message(message: dict | None) -> bool:
+    if not message:
+        return False
+    role = str(message.get("role") or "").strip()
+    role_confidence = str(message.get("role_confidence") or "").strip()
+    if role != "用户" and role_confidence not in {"preview_fallback", "selected_preview_fallback", "unread_preview_after_image"}:
+        return False
+    text = _message_text(message).strip()
+    has_customer_media = bool(message.get("media")) or text in {"[图片]", "[动画表情]"}
+    if not text and not has_customer_media:
+        return False
+    if _is_card_or_link_message(text):
+        return role == "用户" or has_customer_media or role_confidence in {"preview_fallback", "selected_preview_fallback", "unread_preview_after_image"}
+    return not _is_fixed_service_text(text)
+
+
+def _latest_real_customer_message(messages: list[dict]) -> dict | None:
+    for message in reversed(messages):
+        if _is_tail_ignorable_message(message):
+            continue
+        if _is_real_customer_message(message):
+            return message
+        return None
+    return None
 
 
 def _welcome_trigger_message(messages: list[dict]) -> dict | None:
     for message in reversed(messages):
         if _is_welcome_added_system_text(_message_text(message)):
-            return message
+            return {
+                **message,
+                "role": "系统",
+                "message_type": "system",
+                "role_confidence": "welcome_system_text",
+            }
     return None
 
 
@@ -339,47 +413,31 @@ def _is_supplement_need_selection(text: str) -> bool:
 
 
 def supplement_first_reply_with_profile() -> str:
-    return message_config.supplement_first_reply_with_profile()
+    return fixed_agent.supplement_first_reply_with_profile()
 
 
 def supplement_first_reply_choices_only() -> str:
-    return message_config.supplement_first_reply_choices_only()
+    return fixed_agent.supplement_first_reply_choices_only()
 
 
 def supplement_selection_ack() -> str:
-    return message_config.fixed_message("supplement", "selection_ack")
+    return fixed_agent.supplement_selection_ack()
 
 
 def _supplement_wecom_welcome_text(customer_name: str) -> str:
-    title = str(customer_name or "客户").strip() or "客户"
-    template = message_config.fixed_message("welcome", "supplement_web_welcome_template")
-    return clean_customer_reply_text(template.replace("{用户名}", title))
+    return fixed_agent.supplement_wecom_welcome_text(customer_name)
 
 
 def _supplement_welcome_send_parts(final_reply: str, context: dict) -> list[str]:
-    """Return separate WeCom messages for the welcome follow-up flow."""
-    body = clean_customer_reply_text(final_reply)
-    if not body:
-        return []
-    welcome_text = clean_customer_reply_text(context.get("supplement_welcome_text") or "")
-    followup_text = clean_customer_reply_text(context.get("supplement_followup_text") or "")
-    if not welcome_text or not followup_text:
-        return [body]
-    if body == clean_customer_reply_text(f"{welcome_text}\n\n{followup_text}"):
-        return [welcome_text, followup_text]
-    if body.startswith(welcome_text):
-        remainder = clean_customer_reply_text(body[len(welcome_text):])
-        if remainder:
-            return [welcome_text, remainder]
-    return [body]
+    return fixed_agent.supplement_welcome_send_parts(final_reply, context)
 
 
 def _supplement_first_reply_text(*, has_profile: bool, customer_name: str = "", from_welcome: bool = False) -> str:
-    first_reply = supplement_first_reply_choices_only() if has_profile else supplement_first_reply_with_profile()
-    if not from_welcome:
-        return first_reply
-    welcome_text = _supplement_wecom_welcome_text(customer_name)
-    return clean_customer_reply_text(f"{welcome_text}\n\n{first_reply}" if welcome_text else first_reply)
+    return fixed_agent.supplement_first_reply_text(
+        has_profile=has_profile,
+        customer_name=customer_name,
+        from_welcome=from_welcome,
+    )
 
 
 def _has_explicit_supplement_recommendation_intent(text: str) -> bool:
@@ -674,11 +732,14 @@ def _latest_user_turn_texts(messages: list[dict]) -> list[str]:
         text = _message_text(message).strip()
         if not text:
             continue
+        if _is_tail_ignorable_message(message):
+            continue
         if message.get("role") == "用户":
             texts.append(text)
             continue
         if texts:
             break
+        break
     texts.reverse()
     return texts
 
@@ -717,11 +778,79 @@ def _latest_non_welcome_customer_message(messages: list[dict]) -> dict | None:
         text = _message_text(message).strip()
         if not text:
             continue
-        if welcome.is_new_customer_text(text) or text == "以上是打招呼内容":
+        if _is_tail_ignorable_message(message):
             continue
-        if message.get("role") == "用户":
+        if _is_real_customer_message(message):
             return message
+        return None
     return None
+
+
+def _is_short_confirmation_text(text: str | None) -> bool:
+    body = clean_history_message_text(text or "").lower()
+    if not body:
+        return False
+    normalized = _match_text(body)
+    return normalized in {_match_text(term.lower()) for term in SHORT_CONFIRMATION_TERMS}
+
+
+def _should_send_despite_new_customer_message(latest: dict | None) -> bool:
+    if latest is None:
+        return False
+    if _message_has_image(latest):
+        return False
+    text = _message_text(latest).strip()
+    if handoff.classify_handoff(text).get("type"):
+        return False
+    return _is_short_confirmation_text(text)
+
+
+def _should_reprocess_after_supplement_first_prompt(job: dict, context: dict) -> bool:
+    if str(job.get("reply_source") or "") != SUPPLEMENT_REPLY_SOURCE:
+        return False
+    customer_key = str(context.get("supplement_customer_key") or job.get("conversation_key") or "").strip()
+    supplement_state = state.get_supplement_state(customer_key) if customer_key else None
+    context_stage = str(context.get("supplement_stage") or "").strip()
+    current_stage = str((supplement_state or {}).get("stage") or "").strip()
+    if context_stage != state.SUPPLEMENT_COLLECTING_PROFILE and current_stage != state.SUPPLEMENT_COLLECTING_PROFILE:
+        return False
+    messages = state.list_conversation_messages(
+        conversation_key=str(job.get("conversation_key") or ""),
+        limit=50,
+    )
+    for message in messages:
+        if _is_tail_ignorable_message(message):
+            continue
+        if _is_real_customer_message(message):
+            return True
+    return False
+
+
+def _has_visible_supplement_first_prompt(messages: list[dict]) -> bool:
+    fixed_texts = (
+        supplement_first_reply_with_profile(),
+        supplement_first_reply_choices_only(),
+    )
+    for message in messages:
+        text = _message_text(message).strip()
+        if not text:
+            continue
+        if any(_texts_match(text, fixed_text) for fixed_text in fixed_texts):
+            return True
+    return False
+
+
+def _should_send_new_customer_fixed_reply(
+    *,
+    current: dict,
+    supplement_state: dict | None,
+) -> bool:
+    if _welcome_trigger_message(current.get("messages", [])) is None:
+        return False
+    if _has_visible_supplement_first_prompt(current.get("messages", [])):
+        return False
+    existing_stage = str((supplement_state or {}).get("stage") or "")
+    return existing_stage not in state.SUPPLEMENT_ACTIVE_STAGES | {state.SUPPLEMENT_RECOMMENDED}
 
 
 def _handoff_waiting_same_hash(job: dict, current: dict) -> bool:
@@ -789,7 +918,7 @@ def _read_current_with_retry(
             if appended is not None:
                 current = {**current, "messages": messages}
         messages = current.get("messages", [])
-        latest = watcher.latest_user_message(messages)
+        latest = _latest_real_customer_message(messages)
         if latest is not None or _last_visible_text_matches(messages, expected_visible_text) or _welcome_trigger_message(messages):
             return current
         if index < max_attempts - 1:
@@ -801,10 +930,18 @@ def _new_message_debounce_seconds() -> float:
     return max(0.0, float(os.environ.get("WECOM_AGENT_NEW_MESSAGE_DEBOUNCE_SECONDS", "3")))
 
 
+def _read_last_for_job(job: dict, default_last: int) -> tuple[int, str]:
+    title = str(job.get("title") or "").strip()
+    if not title:
+        return default_last, "default"
+    if not state.is_new_customer_name(title):
+        return default_last, "cached_customer"
+    configured = int(os.environ.get("WECOM_AGENT_NEW_CUSTOMER_READ_LAST", "12") or "12")
+    return max(default_last, configured), "new_customer_name"
+
+
 def _resolve_latest_for_job(title: str, job: dict, current: dict) -> tuple[dict, dict | None, str | None]:
-    latest = watcher.latest_user_message(current.get("messages", []))
-    if latest is not None and _is_system_notice_message(latest):
-        latest = None
+    latest = _latest_real_customer_message(current.get("messages", []))
     if latest is not None:
         return current, latest, None
 
@@ -819,6 +956,8 @@ def _resolve_latest_for_job(title: str, job: dict, current: dict) -> tuple[dict,
             current.get("messages", []),
             job.get("preview", ""),
         )
+    if preview_latest is not None and not _is_real_customer_message(preview_latest):
+        preview_latest = None
     if preview_latest is not None:
         current = {**current, "messages": patched_messages}
         state.append_event(
@@ -1346,39 +1485,7 @@ def _mark_welcome_ready_if_needed(job: dict, current: dict, trigger: dict, *, vi
             "reason": reason,
         }
 
-    welcome_text = clean_customer_reply_text(os.environ.get("WECOM_WELCOME_MESSAGE") or WELCOME_MESSAGE)
-    trigger_context = {
-        **trigger,
-        "role": "系统",
-        "message_type": "system",
-        "role_confidence": str(trigger.get("role_confidence") or "system_notice"),
-    }
-    state.mark_drafting(
-        job["id"],
-        message_hash=str(current.get("hash") or ""),
-        messages=current.get("messages", []),
-        latest=trigger_context,
-    )
-    state.mark_welcome_status(
-        customer_key,
-        state.WELCOME_PENDING,
-        conversation_key=str(job.get("conversation_key") or ""),
-        conversation=str(job.get("title") or ""),
-        job_id=job["id"],
-        reason="welcome_draft_ready",
-    )
-    state.mark_ready(job["id"], reply_text=welcome_text, reply_source=WELCOME_REPLY_SOURCE)
-    state.append_event(
-        {
-            "type": "agent_welcome_ready",
-            "job_id": job["id"],
-            "conversation": job.get("title") or "",
-            "customer_key": customer_key,
-            "trigger": _message_text(trigger),
-        }
-    )
-    _log(f"[AI客服] 新用户欢迎草稿已生成：{job.get('title') or ''}｜customer_key={customer_key}")
-    return {"ok": True, "read": 1, "drafting": 0, "welcome": 1, "conversation": job.get("title") or ""}
+    return fixed_agent.mark_welcome_ready(job, current, trigger, customer_key=customer_key, log=_log)
 
 
 def _mark_supplement_first_reply_ready(
@@ -1392,94 +1499,21 @@ def _mark_supplement_first_reply_ready(
     route: dict,
     from_welcome: bool = False,
 ) -> dict:
-    stage = state.SUPPLEMENT_COLLECTING_PROFILE
     latest_text = _message_text(latest)
-    first_reply = supplement_first_reply_choices_only() if has_profile else supplement_first_reply_with_profile()
-    welcome_text = _supplement_wecom_welcome_text(str(job.get("title") or "")) if from_welcome else ""
-    reply_text = _supplement_first_reply_text(
-        has_profile=has_profile,
-        customer_name=str(job.get("title") or ""),
-        from_welcome=from_welcome,
-    )
-    extra_context = {
-        "agent_mode": SUPPLEMENT_REPLY_SOURCE,
-        "supplement_trace_id": trace_id,
-        "supplement_customer_key": customer_key,
-        "supplement_stage": stage,
-        "supplement_from_welcome": from_welcome,
-    }
-    if from_welcome:
-        extra_context.update(
-            {
-                "supplement_welcome_text": welcome_text,
-                "supplement_followup_text": first_reply,
-            }
-        )
-    state.mark_drafting(
-        job["id"],
-        message_hash=str(current.get("hash") or ""),
-        messages=current.get("messages", []),
-        latest=latest,
-        extra_context=extra_context,
-    )
-    if from_welcome:
-        state.mark_welcome_status(
-            customer_key,
-            state.WELCOME_PENDING,
-            conversation_key=str(job.get("conversation_key") or ""),
-            conversation=str(job.get("title") or ""),
-            job_id=job["id"],
-            reason="supplement_welcome_ready",
-        )
-    state.mark_supplement_state(
-        customer_key,
-        stage,
-        conversation_key=str(job.get("conversation_key") or ""),
-        conversation=str(job.get("title") or ""),
-        job_id=job["id"],
-        trace_id=trace_id,
-        digging_count=0,
-        selected_needs=_supplement_selected_needs(latest_text),
-        known_profile=_merge_supplement_known_profile({"has_basic_profile": has_profile}, latest_text),
-        message_hash=str(current.get("hash") or ""),
-        pending_next_stage=state.SUPPLEMENT_DIGGING_NEED,
-        reason="first_prompt_ready",
-    )
-    _log_supplement(
-        "supplement_route_evaluated",
-        job=job,
+    return fixed_agent.mark_supplement_first_reply_ready(
+        job,
+        current,
+        latest,
         customer_key=customer_key,
         trace_id=trace_id,
-        stage=stage,
-        message_hash=str(current.get("hash") or ""),
-        latest_text=latest_text,
-        details={
-            "triggered": True,
-            "matched_terms": route.get("matched_terms") or [],
-            "active_state_exists": bool(route.get("active_state_exists")),
-            "detected_intent": route.get("detected_intent") or "",
-            "has_profile": has_profile,
-            "trigger_source": "welcome" if from_welcome else "customer",
-        },
+        has_profile=has_profile,
+        route=route,
+        selected_needs=_supplement_selected_needs(latest_text),
+        known_profile=_merge_supplement_known_profile({"has_basic_profile": has_profile}, latest_text),
+        log_supplement=_log_supplement,
+        log=_log,
+        from_welcome=from_welcome,
     )
-    state.mark_ready(
-        job["id"],
-        reply_text=reply_text,
-        reply_source=SUPPLEMENT_REPLY_SOURCE,
-        action="clarify",
-    )
-    state.append_event(
-        {
-            "type": "agent_supplement_first_prompt_ready",
-            "job_id": job["id"],
-            "conversation": job.get("title") or "",
-            "customer_key": customer_key,
-            "trace_id": trace_id,
-            "has_profile": has_profile,
-        }
-    )
-    _log(f"[AI客服] 补剂首轮话术已生成：{job.get('title') or ''}｜customer_key={customer_key}")
-    return {"ok": True, "read": 1, "drafting": 0, "supplement": 1, "conversation": job.get("title") or ""}
 
 
 def _mark_supplement_selection_ack_ready(
@@ -1493,56 +1527,20 @@ def _mark_supplement_selection_ack_ready(
     selected_needs: list[str],
 ) -> dict:
     latest_text = _message_text(latest)
-    state.mark_drafting(
-        job["id"],
-        message_hash=str(current.get("hash") or ""),
-        messages=current.get("messages", []),
-        latest=latest,
-        extra_context={
-            "agent_mode": SUPPLEMENT_REPLY_SOURCE,
-            "supplement_trace_id": trace_id,
-            "supplement_customer_key": customer_key,
-            "supplement_stage": state.SUPPLEMENT_DIGGING_NEED,
-            "supplement_next_action": "wait_for_digging_detail",
-        },
-    )
-    state.mark_supplement_state(
-        customer_key,
-        state.SUPPLEMENT_DIGGING_NEED,
-        conversation_key=str(job.get("conversation_key") or ""),
-        conversation=str(job.get("title") or ""),
-        job_id=job["id"],
-        trace_id=trace_id,
-        digging_count=int(state_row.get("digging_count") or 0),
-        selected_needs=selected_needs or state_row.get("selected_needs") or [],
-        known_profile=_merge_supplement_known_profile(state_row.get("known_profile") or {}, latest_text),
-        message_hash=str(current.get("hash") or ""),
-        pending_next_stage=state.SUPPLEMENT_DIGGING_NEED,
-        reason="need_selection_ack",
-    )
-    _log_supplement(
-        "supplement_need_parsed",
-        job=job,
+    return fixed_agent.mark_supplement_selection_ack_ready(
+        job,
+        current,
+        latest,
         customer_key=customer_key,
         trace_id=trace_id,
-        stage=state.SUPPLEMENT_DIGGING_NEED,
-        message_hash=str(current.get("hash") or ""),
-        latest_text=latest_text,
-        details={
-            "need_numbers": _selected_supplement_need_numbers(latest_text),
-            "need_texts": selected_needs,
-            "profile_fields_detected": ["basic_profile"] if _has_supplement_profile(latest_text) else [],
-            "profile_opt_out": _declines_supplement_profile(latest_text),
-        },
+        state_row=state_row,
+        selected_needs=selected_needs,
+        need_numbers=_selected_supplement_need_numbers(latest_text),
+        known_profile=_merge_supplement_known_profile(state_row.get("known_profile") or {}, latest_text),
+        profile_opt_out=_declines_supplement_profile(latest_text),
+        log_supplement=_log_supplement,
+        log=_log,
     )
-    state.mark_ready(
-        job["id"],
-        reply_text=supplement_selection_ack(),
-        reply_source=SUPPLEMENT_REPLY_SOURCE,
-        action="clarify",
-    )
-    _log(f"[AI客服] 补剂需求选择已确认：{job.get('title') or ''}｜{selected_needs or _short(latest_text)}")
-    return {"ok": True, "read": 1, "drafting": 0, "supplement": 1, "conversation": job.get("title") or ""}
 
 
 def _read_one_pending(
@@ -1559,8 +1557,10 @@ def _read_one_pending(
 
     title = job["title"]
     visible_uid = ""
+    read_last, read_reason = _read_last_for_job(job, last)
+    is_first_local_read = read_reason == "new_customer_name"
     try:
-        _log(f"[AI客服] 打开会话：{title}，读取最近 {last} 条聊天记录")
+        _log(f"[AI客服] 打开会话：{title}，读取最近 {read_last} 条聊天记录（{read_reason}）")
         with state.gui_lock():
             inbox.open_row(job)
             time.sleep(float(os.environ.get("WECOM_AGENT_OPEN_READ_DELAY", "0.45")))
@@ -1575,10 +1575,15 @@ def _read_one_pending(
                 }
             _ensure_chat_input_ready_for_job(job, stage="read")
             current = _read_current_with_retry(
-                last=last,
+                last=read_last,
                 expected_visible_text=job.get("preview", ""),
                 existing_reply_text=job.get("reply_text"),
                 capture_images=True,
+            )
+            state.note_customer_read(
+                title,
+                message_hash=str(current.get("hash") or ""),
+                preview=str(job.get("preview") or ""),
             )
             visible_uid = _bind_visible_uid(title)
             if visible_uid:
@@ -1672,7 +1677,7 @@ def _read_one_pending(
                             "active_state_exists": False,
                             "detected_intent": "welcome_followup",
                         },
-                        from_welcome=True,
+                        from_welcome=False,
                     )
                 welcome_result = _mark_welcome_ready_if_needed(job, current, welcome_trigger, visible_uid=visible_uid)
                 if welcome_result is not None:
@@ -1772,6 +1777,32 @@ def _read_one_pending(
 
         customer_key = _supplement_customer_key(job, visible_uid)
         supplement_state = state.get_supplement_state(customer_key) if customer_key else None
+        first_read_welcome_trigger = _welcome_trigger_message(current.get("messages", []))
+        if (
+            customer_key
+            and not _has_visible_supplement_first_prompt(current.get("messages", []))
+            and _should_send_new_customer_fixed_reply(current=current, supplement_state=supplement_state)
+        ):
+            trace_id = str((supplement_state or {}).get("trace_id") or "") or _new_trace_id(job["id"], customer_key)
+            _log(
+                f"[AI客服] 识别新用户系统提示，优先生成补剂首轮话术：{title}｜"
+                f"first_read={is_first_local_read}｜latest={_short(latest_turn_text)}"
+            )
+            return _mark_supplement_first_reply_ready(
+                job,
+                current,
+                latest,
+                customer_key=customer_key,
+                trace_id=trace_id,
+                has_profile=_has_supplement_profile(latest_turn_text),
+                route={
+                    "triggered": True,
+                    "matched_terms": [],
+                    "active_state_exists": False,
+                    "detected_intent": "new_customer_first_contact",
+                },
+                from_welcome=False,
+            )
         supplement_route = _supplement_route(latest_turn_text, active_state=supplement_state)
         if supplement_route.get("triggered") and customer_key:
             trace_id = str((supplement_state or {}).get("trace_id") or "") or _new_trace_id(job["id"], customer_key)
@@ -2216,7 +2247,7 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                     "conversation": title,
                     "reason": "handoff_reply_already_visible",
                 }
-            latest = watcher.latest_user_message(current["messages"])
+            latest = _latest_real_customer_message(current["messages"])
             latest_text = (latest or {}).get("content") or (latest or {}).get("text") or ""
 
             if is_welcome_reply:
@@ -2228,7 +2259,12 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 )
                 if context_changed and customer_latest is not None:
                     reason = "welcome_context_changed"
-                    state.mark_skipped(job["id"], reason)
+                    state.requeue_job_with_preview_message(
+                        job["id"],
+                        current=current,
+                        latest=customer_latest,
+                        reason=reason,
+                    )
                     state.mark_welcome_status(
                         str(job.get("conversation_key") or ""),
                         state.WELCOME_SKIPPED,
@@ -2249,7 +2285,7 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                         f"[AI客服] 跳过欢迎发送：{title}，原因=客户已发新消息；"
                         f"最新消息：{_short(_message_text(customer_latest))}"
                     )
-                    return {"ok": True, "sent": 0, "skipped": 1, "conversation": title, "reason": reason}
+                    return {"ok": True, "sent": 0, "retry": 1, "conversation": title, "reason": reason}
                 _log(f"[AI客服] 发送前复核：{title}，新客户欢迎场景仍有效，准备发送")
 
             role_misread_but_same_text = (
@@ -2287,84 +2323,19 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 )
                 _log(f"[AI客服] 发送前复核暂未读到聊天记录：{title}，延后重试发送")
                 return {"ok": True, "sent": 0, "retry": 1, "conversation": title, "reason": reason}
-            if (
-                not is_welcome_reply
-                and
-                (not latest or latest_text != expected_latest_text)
-                and not role_misread_but_same_text
-                and not same_turn_contains_expected
-                and not welcome_context_ok
-                and not supplement_welcome_context_ok
-            ):
-                reason = "stale_context"
-                state.mark_skipped(job["id"], reason)
-                if is_welcome_reply:
-                    state.mark_welcome_status(
-                        str(job.get("conversation_key") or ""),
-                        state.WELCOME_SKIPPED,
-                        conversation_key=str(job.get("conversation_key") or ""),
-                        conversation=title,
-                        job_id=job["id"],
-                        reason=reason,
-                    )
-                if is_supplement_reply and supplement_customer_key:
-                    _log_supplement(
-                        "supplement_send_recheck_stale",
-                        job=job,
-                        customer_key=supplement_customer_key,
-                        trace_id=supplement_trace_id,
-                        stage=state.SUPPLEMENT_SKIPPED,
-                        message_hash=str(job.get("last_message_hash") or ""),
-                        latest_text=latest_text,
-                        details={"expected": expected_latest_text, "actual": latest_text},
-                    )
-                    state.mark_supplement_state(
-                        supplement_customer_key,
-                        state.SUPPLEMENT_SKIPPED,
-                        conversation_key=str(job.get("conversation_key") or ""),
-                        conversation=title,
-                        job_id=job["id"],
-                        trace_id=supplement_trace_id,
-                        message_hash=str(job.get("last_message_hash") or ""),
-                        reason=reason,
-                    )
-                state.append_event(
-                    {
-                        "type": "agent_stale",
-                        "conversation": title,
-                        "expected": expected_latest_text,
-                        "actual": latest_text,
-                    }
-                )
-                state.record_metric(
-                    "stale_context_skipped",
-                    conversation_key=str(job.get("conversation_key") or ""),
-                    conversation=title,
-                    job_id=job["id"],
-                    reply_source=str(job.get("reply_source") or ""),
-                    details={"expected": expected_latest_text, "actual": latest_text},
-                )
-                _log(
-                    f"[AI客服] 跳过发送：{title}，原因：{_reason_text(reason)}；"
-                    f"最新消息：{_short(latest_text)}"
-                )
-                return {"ok": True, "sent": 0, "skipped": 1, "conversation": title, "reason": reason}
-
-            if role_misread_but_same_text:
-                _log(f"[AI客服] 发送前复核：{title}，最新文本未变化但角色误判，准备发送")
-            elif same_turn_contains_expected and latest_text != expected_latest_text:
-                _log(f"[AI客服] 发送前复核：{title}，同一轮客户消息仍包含原问题，准备发送")
-            elif welcome_context_ok:
-                _log(f"[AI客服] 发送前复核：{title}，欢迎系统文案仍在当前会话，准备发送")
-            elif supplement_welcome_context_ok:
-                _log(f"[AI客服] 发送前复核：{title}，欢迎后补剂首段话术仍在当前会话，准备发送")
-
             send_parts = _supplement_welcome_send_parts(final_reply, context) if supplement_from_welcome else [final_reply]
             text_send_parts = [part for part in send_parts if clean_customer_reply_text(part)]
             visible_parts = [
                 part for part in send_parts if part and _reply_visible_enough(current.get("messages", []), part)
             ]
             if text_send_parts and len(visible_parts) == len(text_send_parts):
+                if len(text_send_parts) == 1:
+                    state.record_conversation_messages(
+                        conversation_key=str(job.get("conversation_key") or ""),
+                        job_id=job["id"],
+                        message_hash=str(current.get("hash") or ""),
+                        messages=current.get("messages", []),
+                    )
                 state.mark_done(
                     job["id"],
                     message_hash=current["hash"],
@@ -2420,6 +2391,106 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                     )
                 _log(f"[AI客服] 回复已在会话中可见，记录完成并跳过重复发送：{title}｜{_short(final_reply, 140)}")
                 return {"ok": True, "sent": 0, "already_visible": 1, "conversation": title}
+            if (
+                not is_welcome_reply
+                and not is_handoff
+                and
+                (not latest or latest_text != expected_latest_text)
+                and not role_misread_but_same_text
+                and not same_turn_contains_expected
+                and not welcome_context_ok
+                and not supplement_welcome_context_ok
+            ):
+                reason = "stale_context"
+                if latest is not None and not _should_send_despite_new_customer_message(latest):
+                    state.requeue_job_with_preview_message(
+                        job["id"],
+                        current=current,
+                        latest=latest,
+                        reason=reason,
+                    )
+                    if is_supplement_reply and supplement_customer_key:
+                        _log_supplement(
+                            "supplement_send_recheck_stale",
+                            job=job,
+                            customer_key=supplement_customer_key,
+                            trace_id=supplement_trace_id,
+                            stage=state.SUPPLEMENT_SKIPPED,
+                            message_hash=str(job.get("last_message_hash") or ""),
+                            latest_text=latest_text,
+                            details={"expected": expected_latest_text, "actual": latest_text, "requeued": True},
+                        )
+                    state.append_event(
+                        {
+                            "type": "agent_stale_requeued",
+                            "conversation": title,
+                            "expected": expected_latest_text,
+                            "actual": latest_text,
+                        }
+                    )
+                    state.record_metric(
+                        "stale_context_requeued",
+                        conversation_key=str(job.get("conversation_key") or ""),
+                        conversation=title,
+                        job_id=job["id"],
+                        reply_source=str(job.get("reply_source") or ""),
+                        details={"expected": expected_latest_text, "actual": latest_text},
+                    )
+                    _log(
+                        f"[AI客服] 发送前发现客户新消息，已重新入队并跳过旧回复：{title}｜"
+                        f"新消息={_short(latest_text)}"
+                    )
+                    return {"ok": True, "sent": 0, "retry": 1, "conversation": title, "reason": reason}
+                if latest is not None and _should_send_despite_new_customer_message(latest):
+                    state.record_conversation_messages(
+                        conversation_key=str(job.get("conversation_key") or ""),
+                        job_id=job["id"],
+                        message_hash=str(current.get("hash") or ""),
+                        messages=current.get("messages", []),
+                    )
+                    state.append_event(
+                        {
+                            "type": "agent_send_recheck_short_confirmation_allowed",
+                            "conversation": title,
+                            "expected": expected_latest_text,
+                            "actual": latest_text,
+                        }
+                    )
+                    _log(
+                        f"[AI客服] 发送前复核：{title}，客户补充短确认，继续发送旧回复｜"
+                        f"{_short(latest_text)}"
+                    )
+                else:
+                    state.mark_skipped(job["id"], reason)
+                    state.append_event(
+                        {
+                            "type": "agent_stale",
+                            "conversation": title,
+                            "expected": expected_latest_text,
+                            "actual": latest_text,
+                        }
+                    )
+                    state.record_metric(
+                        "stale_context_skipped",
+                        conversation_key=str(job.get("conversation_key") or ""),
+                        conversation=title,
+                        job_id=job["id"],
+                        reply_source=str(job.get("reply_source") or ""),
+                        details={"expected": expected_latest_text, "actual": latest_text},
+                    )
+                    _log(
+                        f"[AI客服] 跳过发送：{title}，原因：{_reason_text(reason)}；"
+                        f"最新消息：{_short(latest_text)}"
+                    )
+                    return {"ok": True, "sent": 0, "skipped": 1, "conversation": title, "reason": reason}
+            if role_misread_but_same_text:
+                _log(f"[AI客服] 发送前复核：{title}，最新文本未变化但角色误判，准备发送")
+            elif same_turn_contains_expected and latest_text != expected_latest_text:
+                _log(f"[AI客服] 发送前复核：{title}，同一轮客户消息仍包含原问题，准备发送")
+            elif welcome_context_ok:
+                _log(f"[AI客服] 发送前复核：{title}，欢迎系统文案仍在当前会话，准备发送")
+            elif supplement_welcome_context_ok:
+                _log(f"[AI客服] 发送前复核：{title}，欢迎后补剂首段话术仍在当前会话，准备发送")
 
             if mode == "dry-run":
                 state.mark_done(
@@ -2495,14 +2566,26 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                         "conversation": title,
                         "error": "sent_reply_not_visible",
                     }
-            state.mark_done(
-                job["id"],
-                message_hash=after_send["hash"],
-                reply_text=final_reply,
-                reply_source=str(job.get("reply_source") or "") or None,
-                attachments=job.get("reply_attachments") or [],
-                reply_parts=send_parts,
-            )
+            reprocess_after_fixed_reply = is_supplement_reply and _should_reprocess_after_supplement_first_prompt(job, context)
+            if reprocess_after_fixed_reply:
+                state.mark_pending_after_fixed_reply(
+                    job["id"],
+                    reason="supplement_first_prompt_sent_reprocess_customer_message",
+                    message_hash=after_send["hash"],
+                    reply_text=final_reply,
+                    reply_source=str(job.get("reply_source") or "") or None,
+                    attachments=job.get("reply_attachments") or [],
+                    reply_parts=send_parts,
+                )
+            else:
+                state.mark_done(
+                    job["id"],
+                    message_hash=after_send["hash"],
+                    reply_text=final_reply,
+                    reply_source=str(job.get("reply_source") or "") or None,
+                    attachments=job.get("reply_attachments") or [],
+                    reply_parts=send_parts,
+                )
             if is_welcome_reply:
                 state.mark_welcome_status(
                     str(job.get("conversation_key") or ""),
@@ -2556,6 +2639,8 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
                 ):
                     state.mark_pending(job["id"], "supplement_continue_after_ack", preserve_context=True)
                     _log(f"[AI客服] 补剂稍等话术已发送，继续进入补剂追问：{title}")
+                elif reprocess_after_fixed_reply:
+                    _log(f"[AI客服] 补剂首轮话术已发送，继续处理已收到的客户消息：{title}")
             if str(job.get("handoff_type") or "").strip():
                 state.mark_handoff_waiting(
                     job["id"],
@@ -2685,7 +2770,7 @@ def agent_loop(
                 last_scan = scan
                 scanned += scan["enqueued"] + current_result.get("enqueued", 0)
                 _log_scan(scan)
-                next_scan_at = now + scan_interval
+                next_scan_at = time.time() + scan_interval
 
             if not read_only_mode:
                 _drop_superseded_drafts(futures)

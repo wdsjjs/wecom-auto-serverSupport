@@ -719,11 +719,18 @@ def _supplement_commit_test_reply(
     reason: str,
 ) -> list[dict]:
     final_reply = clean_customer_reply_text(reply_text)
+    latest = messages[-1] if messages else {
+        "role": "系统",
+        "content": "新用户进线",
+        "text": "新用户进线",
+        "source": "web-wechat",
+        "message_type": "system",
+    }
     state.mark_drafting(
         int(job["id"]),
         message_hash=message_hash,
         messages=messages,
-        latest=messages[-1],
+        latest=latest,
         extra_context={
             "agent_mode": agent.SUPPLEMENT_REPLY_SOURCE,
             "supplement_trace_id": trace_id,
@@ -865,8 +872,6 @@ def supplement_test_send(customer: str, text: str, *, full_flow: bool = False, n
     ]
     supplement_state = state.get_supplement_state(customer_key)
     is_new_user_start = bool(new_user) and not bool(supplement_state)
-    if is_new_user_start:
-        messages.append(_supplement_web_welcome_message(customer_name))
     if body:
         messages.append({"role": "用户", "content": body, "text": body, "source": "web-wechat", "message_type": "customer"})
     message_hash = _supplement_test_message_hash(messages)

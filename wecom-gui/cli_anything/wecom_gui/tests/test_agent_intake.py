@@ -90,6 +90,44 @@ def test_agent_binds_visible_sidebar_uid_before_drafting(monkeypatch, tmp_path):
     assert state.lookup_wecom_customer(customer_name="客户A")["uid"] == "wm-visible"
 
 
+def test_agent_uses_customer_name_cache_for_read_depth(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "新客户A", "preview": "你好", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, watcher._conversation_signature(row))
+
+    read_lasts: list[int] = []
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+
+    def fake_read_current(last=12, capture_images=True, media_preview=None):
+        read_lasts.append(last)
+        return {"hash": f"hash-{len(read_lasts)}", "messages": [{"role": "用户", "content": "你好", "text": "你好"}]}
+
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", fake_read_current)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.llm.draft_reply",
+        lambda messages, **kwargs: {"ok": True, "text": "您好", "message": "您好"},
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=12, executor=executor, futures=futures, max_drafts=1)
+        assert result["drafting"] == 1
+        next(iter(futures.values())).result()
+
+    assert read_lasts[0] == 12
+    assert state.is_new_customer_name("新客户A") is False
+    state.mark_pending(next(iter(futures)), "second_read")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=12, executor=executor, futures=futures, max_drafts=1)
+        assert result["drafting"] == 1
+        next(iter(futures.values())).result()
+
+    assert read_lasts[-1] == 12
+
+
 def test_agent_upgrades_visible_queue_key_to_sidebar_uid(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {
@@ -193,15 +231,13 @@ def test_agent_creates_welcome_ready_draft_from_system_text(monkeypatch, tmp_pat
 
     assert result["supplement"] == 1
     assert futures == {}
-    ready = state.list_queue(status="ready")[0]
-    assert ready["reply_text"].startswith("您好，三水儿")
-    assert "营养工厂健康顾问" in ready["reply_text"]
+    ready = state.list_queue(status="approved")[0]
     assert "您好~可以简单介绍下您的基本信息" in ready["reply_text"]
     assert "20.儿童成长" in ready["reply_text"]
     assert ready["reply_source"] == "supplement"
     assert json.loads(ready["context_json"])["latest"]["role"] == "系统"
-    assert json.loads(ready["context_json"])["supplement_from_welcome"] is True
-    assert state.get_welcome_state(ready["conversation_key"])["status"] == state.WELCOME_PENDING
+    assert json.loads(ready["context_json"])["supplement_from_welcome"] is False
+    assert state.get_welcome_state(ready["conversation_key"])["status"] == state.WELCOME_SKIPPED
     supplement = state.get_supplement_state(ready["conversation_key"])
     assert supplement["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
     assert supplement["pending_next_stage"] == state.SUPPLEMENT_DIGGING_NEED
@@ -240,6 +276,84 @@ def test_agent_creates_supplement_first_prompt_from_recommendation_intent(monkey
     assert state.get_supplement_state(ready["conversation_key"])["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
     logs = state.list_supplement_logs()
     assert logs[-1]["event_type"] == "supplement_route_evaluated"
+
+
+def test_agent_routes_first_local_read_to_supplement_even_with_customer_message(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "三水儿", "preview": "[小程序] 营养工厂幸运大抽奖", "time": "刚刚", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, watcher._conversation_signature(row))
+
+    messages = [
+        {"role": "系统", "content": "你已添加了三水儿，现在可以开始聊天了。", "text": "你已添加了三水儿，现在可以开始聊天了。"},
+        {
+            "role": "用户",
+            "content": "UndoAge 营养工厂 营养工厂幸运大抽奖｜免单、NMN、鱼油… WXMsg WeAppLogo 小程序",
+            "text": "UndoAge 营养工厂 营养工厂幸运大抽奖｜免单、NMN、鱼油… WXMsg WeAppLogo 小程序",
+            "media": [{"type": "mini_program", "capture_ok": True, "capture_path": "/tmp/card.png"}],
+        },
+        {"role": "用户", "content": "我是三水儿", "text": "我是三水儿"},
+    ]
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {"hash": "first-read-hash", "messages": messages},
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.llm.draft_reply",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("new customer first read should not call AI")),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=4, executor=executor, futures=futures, max_drafts=1)
+
+    assert result["supplement"] == 1
+    assert futures == {}
+    ready = state.list_queue(status="approved")[0]
+    assert ready["reply_source"] == "supplement"
+    assert ready["reply_text"] == agent.supplement_first_reply_with_profile()
+    context = json.loads(ready["context_json"])
+    assert context["latest"]["text"] == "我是三水儿"
+    assert context["supplement_from_welcome"] is False
+    assert state.get_welcome_state(ready["conversation_key"])["status"] == state.WELCOME_SKIPPED
+    assert state.get_supplement_state(ready["conversation_key"])["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
+
+
+def test_agent_marks_new_user_when_wecom_auto_greeting_tails_customer_message(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "三水儿", "preview": "你好", "time": "8分钟前", "tags": ["@微信"], "raw": []}
+    state.enqueue_conversation(row, watcher._conversation_signature(row))
+
+    messages = [
+        {"role": "用户", "content": "我是三水儿", "text": "我是三水儿"},
+        {"role": "客服", "content": "你已添加了三水儿，现在可以开始聊天了。", "text": "你已添加了三水儿，现在可以开始聊天了。"},
+        {"role": "客服", "content": "你好", "text": "你好"},
+    ]
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=12, capture_images=True: {"hash": "auto-greeting-hash", "messages": messages},
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.llm.draft_reply",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("new customer fixed prompt should not call AI")),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=4, executor=executor, futures=futures, max_drafts=1)
+
+    assert result["supplement"] == 1
+    assert futures == {}
+    ready = state.list_queue(status="approved")[0]
+    assert ready["reply_source"] == "supplement"
+    assert ready["reply_text"] == agent.supplement_first_reply_with_profile()
+    context = json.loads(ready["context_json"])
+    assert context["latest"]["text"] == "我是三水儿"
+    assert context["latest"]["role"] == "用户"
+    assert state.get_welcome_state(ready["conversation_key"])["status"] == state.WELCOME_SKIPPED
 
 
 def test_agent_supplement_active_flow_passes_agent_mode(monkeypatch, tmp_path):
@@ -567,10 +681,8 @@ def test_agent_builds_supplement_prompt_for_new_customer_system_message(monkeypa
 
     assert result["supplement"] == 1
     assert futures == {}
-    ready = state.list_queue(status="ready")[0]
-    assert ready["reply_text"].startswith("您好，三水儿")
-    assert "营养工厂健康顾问" in ready["reply_text"]
-    assert agent.supplement_first_reply_with_profile() in ready["reply_text"]
+    ready = state.list_queue(status="approved")[0]
+    assert ready["reply_text"] == agent.supplement_first_reply_with_profile()
     assert ready["reply_source"] == "supplement"
     assert state.get_supplement_state(ready["conversation_key"])["stage"] == state.SUPPLEMENT_COLLECTING_PROFILE
 

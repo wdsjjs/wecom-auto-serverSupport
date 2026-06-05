@@ -60,6 +60,21 @@ def _latest_message_matching_preview(messages: list[dict], preview: str) -> dict
     return None
 
 
+def _latest_customer_message_before_service_tail(messages: list[dict]) -> dict | None:
+    for message in reversed(messages):
+        text = _message_text(message)
+        if not text:
+            continue
+        if welcome.is_new_customer_text(text) or text == "以上是打招呼内容":
+            continue
+        if str(message.get("role") or "").strip() == "用户":
+            return message
+        if text in {"你好", "您好"} and str(message.get("role") or "").strip() == "客服":
+            continue
+        return None
+    return None
+
+
 def _latest_reply_for_row(row: dict) -> str:
     conversation_key = state.conversation_key_for_row(row)
     if not conversation_key:
@@ -83,9 +98,17 @@ def _can_skip_open_for_cached_preview(row: dict) -> bool:
     if welcome.is_new_customer_row(row):
         return False
     try:
-        return bool(state.cached_read_reason_for_row(row))
+        reason = state.cached_read_reason_for_row(row)
     except Exception:
         return False
+    if not reason:
+        return False
+    if _has_unread(row):
+        return reason in {
+            "preview_matches_last_read_customer_message",
+            "empty_preview_unchanged_after_read",
+        }
+    return True
 
 
 def _same_current_message(existing: dict | None, *, signature: str, message_hash: str) -> bool:
@@ -223,6 +246,8 @@ def enqueue_current_chat_if_changed(*, last: int, inbox_limit: int = 30) -> dict
     if not watcher._should_consider(selected):
         return {"ok": True, "enqueued": 0, "reason": "selected_conversation_not_customer"}
     is_welcome = welcome.is_new_customer_context(selected, current.get("messages", []))
+    if latest is None and is_welcome:
+        latest = _latest_customer_message_before_service_tail(current.get("messages", []))
     if latest is None:
         latest = _latest_message_matching_preview(current.get("messages", []), str(selected.get("preview") or ""))
     if latest is None and not is_welcome:

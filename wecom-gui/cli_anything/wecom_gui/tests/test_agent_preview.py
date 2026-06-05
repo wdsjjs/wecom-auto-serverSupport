@@ -99,6 +99,38 @@ def test_agent_does_not_reclassify_service_preview_as_user(monkeypatch, tmp_path
     assert futures == {}
     assert state.list_queue(status="skipped")[0]["error"] == "latest_message_not_user:客服"
 
+
+def test_agent_uses_customer_message_before_fixed_service_tail(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    preview = "我想做补剂推荐"
+    row = {"title": "三水儿", "preview": preview, "time": "刚刚", "tags": ["@微信"], "unread": True, "raw": []}
+    state.enqueue_conversation(row, watcher._conversation_signature(row))
+
+    fixed_tail = agent.supplement_first_reply_with_profile()
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda last=6, capture_images=True: {
+            "hash": "mixed-tail",
+            "source": "accessibility-chat-table",
+            "messages": [
+                {"role": "系统", "content": "你已添加了三水儿，现在可以开始聊天了。", "text": "你已添加了三水儿，现在可以开始聊天了。"},
+                {"role": "用户", "content": preview, "text": preview},
+                {"role": "客服", "content": fixed_tail, "text": fixed_tail},
+            ],
+        },
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        futures = {}
+        result = agent._read_one_pending(last=6, executor=executor, futures=futures, max_drafts=1)
+
+    assert result["supplement"] == 1
+    ready = state.list_queue(status="ready")[0]
+    context = json.loads(ready["context_json"])
+    assert context["latest"]["text"] == preview
+
 def test_agent_reclassifies_matching_customer_preview_even_if_role_is_service(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     preview = "这3个东西可以和你们的鱼油一起吃吗？"

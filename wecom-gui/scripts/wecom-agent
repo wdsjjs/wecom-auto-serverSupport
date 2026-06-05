@@ -120,14 +120,22 @@ select_inbox_scope() {
   fi
   PYTHONPATH="$PYTHONPATH_VALUE" "$PYTHON_BIN" - "$label" <<'PY'
 import sys
+import time
 
 label = sys.argv[1]
 try:
     from cli_anything.wecom_gui.utils import macos_backend
 
-    result = (macos_backend._swift_ax("ensure-single-chat") or [{}])[-1]
+    result = {}
+    attempts = 8
+    for index in range(attempts):
+        result = (macos_backend._swift_ax("ensure-single-chat") or [{}])[-1]
+        if result.get("ok"):
+            break
+        if index < attempts - 1:
+            time.sleep(1)
     if not result.get("ok"):
-        raise RuntimeError(f"ensure-single-chat failed: {result}")
+        raise RuntimeError(f"ensure-single-chat failed after {attempts} attempts: {result}")
     print(f"WeCom inbox scope selected: {label} result={result}")
 except Exception as exc:
     print(f"WARNING: failed to select WeCom inbox scope {label}: {type(exc).__name__}: {exc}", file=sys.stderr)

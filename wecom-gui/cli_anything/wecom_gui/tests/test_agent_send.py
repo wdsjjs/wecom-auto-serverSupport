@@ -220,7 +220,7 @@ def test_agent_marks_supplement_recommended_after_successful_send(monkeypatch, t
     assert state.list_supplement_logs(event_type="supplement_sent")[-1]["trace_id"] == "trace-1"
 
 
-def test_agent_sends_new_user_supplement_welcome_in_two_messages(monkeypatch, tmp_path):
+def test_agent_sends_new_user_supplement_prompt_only(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     row = {
         "title": "三水儿",
@@ -231,9 +231,7 @@ def test_agent_sends_new_user_supplement_welcome_in_two_messages(monkeypatch, tm
     }
     _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
     trigger = {"role": "系统", "text": row["preview"], "content": row["preview"], "message_type": "system"}
-    welcome_text = agent._supplement_wecom_welcome_text("三水儿")
     followup_text = agent.supplement_first_reply_with_profile()
-    final_reply = f"{welcome_text}\n\n{followup_text}"
     state.mark_drafting(
         item["id"],
         message_hash="welcome-hash",
@@ -243,8 +241,7 @@ def test_agent_sends_new_user_supplement_welcome_in_two_messages(monkeypatch, tm
             "agent_mode": "supplement",
             "supplement_trace_id": "trace-welcome",
             "supplement_customer_key": item["conversation_key"],
-            "supplement_from_welcome": True,
-            "supplement_welcome_text": welcome_text,
+            "supplement_from_welcome": False,
             "supplement_followup_text": followup_text,
         },
     )
@@ -266,7 +263,7 @@ def test_agent_sends_new_user_supplement_welcome_in_two_messages(monkeypatch, tm
         pending_next_stage=state.SUPPLEMENT_DIGGING_NEED,
         reason="supplement_welcome_ready",
     )
-    state.mark_ready(item["id"], reply_text=final_reply, reply_source="supplement")
+    state.mark_ready(item["id"], reply_text=followup_text, reply_source="supplement")
     assert state.mark_approved(item["id"]) is True
 
     reads = iter(
@@ -276,7 +273,6 @@ def test_agent_sends_new_user_supplement_welcome_in_two_messages(monkeypatch, tm
                 "hash": "after-send",
                 "messages": [
                     trigger,
-                    {"role": "客服", "content": welcome_text, "text": welcome_text},
                     {"role": "客服", "content": followup_text, "text": followup_text},
                 ],
             },
@@ -294,10 +290,85 @@ def test_agent_sends_new_user_supplement_welcome_in_two_messages(monkeypatch, tm
     result = agent._send_one_ready(last=12, mode="review")
 
     assert result["sent"] == 1
-    assert sent == [welcome_text, followup_text]
+    assert sent == [followup_text]
     stored = state.list_conversation_messages(conversation_key=item["conversation_key"])
-    assert [message["text"] for message in stored[-2:]] == [welcome_text, followup_text]
-    assert state.get_welcome_state(item["conversation_key"])["status"] == state.WELCOME_SENT
+    assert stored[-1]["text"] == followup_text
+
+
+def test_agent_requeues_customer_card_after_new_user_supplement_prompt(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {
+        "title": "三水儿",
+        "preview": "[小程序] 营养工厂幸运大抽奖",
+        "time": "刚刚",
+        "tags": ["@微信"],
+        "raw": [],
+    }
+    _changed, item = state.enqueue_conversation(row, watcher._conversation_signature(row))
+    trigger = {"role": "系统", "text": "你已添加了三水儿，现在可以开始聊天了。", "content": "你已添加了三水儿，现在可以开始聊天了。", "message_type": "system"}
+    card = {
+        "role": "用户",
+        "text": "UndoAge 营养工厂 营养工厂幸运大抽奖｜免单、NMN、鱼油… WXMsg WeAppLogo 小程序",
+        "content": "UndoAge 营养工厂 营养工厂幸运大抽奖｜免单、NMN、鱼油… WXMsg WeAppLogo 小程序",
+        "media": [{"type": "mini_program", "capture_ok": True, "capture_path": "/tmp/card.png"}],
+    }
+    followup_text = agent.supplement_first_reply_with_profile()
+    state.mark_drafting(
+        item["id"],
+        message_hash="first-hash",
+        messages=[trigger, card],
+        latest=card,
+        extra_context={
+            "agent_mode": "supplement",
+            "supplement_trace_id": "trace-card",
+            "supplement_customer_key": item["conversation_key"],
+            "supplement_stage": state.SUPPLEMENT_COLLECTING_PROFILE,
+            "supplement_from_welcome": False,
+        },
+    )
+    state.mark_supplement_state(
+        item["conversation_key"],
+        state.SUPPLEMENT_COLLECTING_PROFILE,
+        conversation_key=item["conversation_key"],
+        conversation="三水儿",
+        job_id=item["id"],
+        trace_id="trace-card",
+        pending_next_stage=state.SUPPLEMENT_DIGGING_NEED,
+        reason="first_prompt_ready",
+    )
+    state.mark_ready(item["id"], reply_text=followup_text, reply_source="supplement")
+    assert state.mark_approved(item["id"]) is True
+
+    reads = iter(
+        [
+            {"hash": "precheck", "messages": [trigger, card]},
+            {
+                "hash": "after-send",
+                "messages": [
+                    trigger,
+                    card,
+                    {"role": "客服", "content": followup_text, "text": followup_text},
+                ],
+            },
+        ]
+    )
+    sent = []
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda job: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda last=12, capture_images=False: next(reads))
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda text, attachments=None, dry_run=False, submit=True: sent.append(text) or {"ok": True},
+    )
+
+    result = agent._send_one_ready(last=12, mode="review")
+
+    assert result["sent"] == 1
+    assert sent == [followup_text]
+    pending = state.get_job(item["id"])
+    assert pending["status"] == "pending"
+    assert pending["error"] == "supplement_first_prompt_sent_reprocess_customer_message"
+    stored = state.list_conversation_messages(conversation_key=item["conversation_key"])
+    assert stored[-1]["text"] == followup_text
 
 
 def test_agent_marks_review_edited_welcome_sent(monkeypatch, tmp_path):
@@ -382,10 +453,12 @@ def test_agent_skips_welcome_when_customer_message_arrives_before_send(monkeypat
 
     result = agent._send_one_ready(last=12, mode="review")
 
-    assert result["skipped"] == 1
+    assert result["retry"] == 1
     assert sent == []
     assert state.get_welcome_state(item["conversation_key"])["status"] == state.WELCOME_SKIPPED
-    assert state.get_job(item["id"])["status"] == "skipped"
+    pending = state.get_job(item["id"])
+    assert pending["status"] == "pending"
+    assert pending["preview"] == "你好，我想咨询产品"
 
 
 def test_agent_send_recheck_retries_empty_live_read(monkeypatch, tmp_path):

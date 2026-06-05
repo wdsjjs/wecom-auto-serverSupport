@@ -268,6 +268,18 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS customer_read_cache (
+            customer_name TEXT PRIMARY KEY,
+            first_seen_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL,
+            last_message_hash TEXT NOT NULL DEFAULT '',
+            last_preview TEXT NOT NULL DEFAULT '',
+            read_count INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS reply_issue_tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id INTEGER,
@@ -1041,6 +1053,89 @@ def _append_preview_customer_message(
             now,
         ),
     )
+
+
+def is_new_customer_name(customer_name: object) -> bool:
+    """Return whether the visible customer name has not been read before."""
+    name = _clean_key_part(customer_name)
+    if not name:
+        return False
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM customer_read_cache WHERE customer_name = ?",
+            (name,),
+        ).fetchone()
+    return row is None
+
+
+def note_customer_read(
+    customer_name: object,
+    *,
+    message_hash: str = "",
+    preview: str = "",
+) -> None:
+    """Record that a visible customer name has been opened and read."""
+    name = _clean_key_part(customer_name)
+    if not name:
+        return
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO customer_read_cache
+                (customer_name, first_seen_at, last_seen_at, last_message_hash, last_preview, read_count)
+            VALUES (?, ?, ?, ?, ?, 1)
+            ON CONFLICT(customer_name) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at,
+                last_message_hash = excluded.last_message_hash,
+                last_preview = excluded.last_preview,
+                read_count = customer_read_cache.read_count + 1
+            """,
+            (name, now, now, str(message_hash or ""), str(preview or "")),
+        )
+
+
+def requeue_job_with_preview_message(job_id: int, *, current: dict, latest: dict | None, reason: str) -> None:
+    """Keep a newly observed customer message queued when a prepared reply goes stale."""
+    now = time.time()
+    latest_text = clean_history_message_text(
+        (latest or {}).get("content") or (latest or {}).get("text") or ""
+    )
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM reply_queue WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            return
+        conversation_key = str(row["conversation_key"] or "")
+        if latest_text:
+            _append_preview_customer_message(
+                conn,
+                row={
+                    "title": row["title"],
+                    "preview": latest_text,
+                    "time": (latest or {}).get("time") or "",
+                    "source": (latest or {}).get("source") or "send-recheck",
+                    "unread": True,
+                    "unread_count": 1,
+                    "raw": [latest or {}],
+                },
+                conversation_key=conversation_key,
+                job_id=job_id,
+                message_hash=str(current.get("hash") or row["last_message_hash"] or ""),
+                now=now,
+            )
+        conn.execute(
+            """
+            UPDATE reply_queue
+            SET status = 'pending', preview = COALESCE(NULLIF(?, ''), preview),
+                error = ?, context_json = NULL, last_message_hash = NULL,
+                reply_text = NULL, reply_source = '',
+                reply_attachments_json = '[]',
+                handoff_type = '', handoff_reason = '',
+                locked_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (latest_text, reason or None, now, job_id),
+        )
 
 
 def _move_conversation_related_records(
@@ -3285,6 +3380,58 @@ def mark_pending(job_id: int, reason: str = "", *, preserve_context: bool = Fals
                 WHERE id = ?
                 """,
                 (reason or None, now, job_id),
+            )
+
+
+def mark_pending_after_fixed_reply(
+    job_id: int,
+    *,
+    reason: str,
+    message_hash: str | None = None,
+    reply_text: str | None = None,
+    reply_source: str | None = None,
+    attachments: list[dict] | None = None,
+    reply_parts: list[str] | None = None,
+) -> None:
+    """Record a fixed reply as sent, then keep the same conversation queued."""
+    final_reply = clean_customer_reply_text(reply_text) if reply_text is not None else None
+    now = time.time()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT conversation_key, title, reply_source FROM reply_queue WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        final_reply_source = str(reply_source or (row["reply_source"] if row else "") or "ai").strip()
+        conn.execute(
+            """
+            UPDATE reply_queue
+            SET status = 'pending', last_message_hash = ?, reply_text = ?,
+                reply_source = ?, error = ?, locked_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (message_hash, final_reply, final_reply_source, reason or None, now, job_id),
+        )
+        if row is not None:
+            parts = [clean_customer_reply_text(part) for part in (reply_parts or [])]
+            parts = [part for part in parts if part]
+            if not parts:
+                parts = [final_reply or ""]
+            for index, part in enumerate(parts):
+                _append_conversation_reply(
+                    conn,
+                    conversation_key=str(row["conversation_key"] or ""),
+                    job_id=job_id,
+                    message_hash=message_hash or "",
+                    reply_text=part,
+                    attachments=attachments if index == len(parts) - 1 else [],
+                    now=now,
+                )
+            _set_last_reply_source(
+                conn,
+                conversation_key=str(row["conversation_key"] or ""),
+                conversation=str(row["title"] or ""),
+                reply_source=final_reply_source,
+                now=now,
             )
 
 
