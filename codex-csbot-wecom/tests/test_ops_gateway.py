@@ -5,10 +5,17 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 from csbot.cli import main
-from csbot.ops_gateway import handoff_notify, logistics_query, order_query, ticket_draft, wecom_user_lookup
+from csbot.ops_gateway import ClickHouseConfig, handoff_notify, logistics_query, order_query, ticket_draft, wecom_user_lookup
 
 
 class OpsGatewayTest(unittest.TestCase):
+    def test_clickhouse_defaults_to_internal_http_endpoint(self) -> None:
+        config = ClickHouseConfig()
+
+        self.assertEqual(config.host, "10.36.55.235")
+        self.assertEqual(config.port, 8124)
+        self.assertEqual(config.url, "http://10.36.55.235:8124/")
+
     def test_order_query_uses_local_clickhouse_query(self) -> None:
         rows = [
             {"order_id": "E202601010001", "order_status": "已支付", "delivery_status": "已发货", "pay_price": 99}

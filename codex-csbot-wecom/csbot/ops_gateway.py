@@ -16,8 +16,8 @@ TRACKING_RE = re.compile(r"^[A-Za-z0-9]{8,32}$")
 
 @dataclass(frozen=True)
 class ClickHouseConfig:
-    host: str = os.environ.get("CH_HOST", "jixusadjiwnnas.uda.cn")
-    port: int = int(os.environ.get("CH_PORT", "80"))
+    host: str = os.environ.get("CH_HOST", "10.36.55.235")
+    port: int = int(os.environ.get("CH_PORT", "8124"))
     database: str = os.environ.get("CH_DATABASE", "uda")
     user: str = os.environ.get("CH_USER", "query_uda")
     password: str = os.environ.get("CH_PASS", "")
