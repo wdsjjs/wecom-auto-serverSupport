@@ -212,7 +212,6 @@ def test_channel_config_rejects_non_https(monkeypatch):
     monkeypatch.setenv("WECOM_CHANNEL_BASE_URL", "http://localhost:3000")
     monkeypatch.setenv("WECOM_CHANNEL_DEVICE_ID", "mac-1")
     monkeypatch.setenv("WECOM_CHANNEL_DEVICE_TOKEN", "token")
-    monkeypatch.setenv("WECOM_CHANNEL_ACCOUNT_ID", "account-1")
 
     with pytest.raises(edge_channel.ChannelError, match="https"):
         edge_channel.ChannelConfig.from_env()

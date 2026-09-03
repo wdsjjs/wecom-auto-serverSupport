@@ -193,8 +193,10 @@ python -m cli_anything.wecom_gui edge-channel run --once
 python -m cli_anything.wecom_gui edge-channel run
 ```
 
-Set `WECOM_CHANNEL_BASE_URL` (HTTPS only), `WECOM_CHANNEL_DEVICE_ID`,
-`WECOM_CHANNEL_DEVICE_TOKEN`, and `WECOM_CHANNEL_ACCOUNT_ID` in `.env.local`.
+Set `WECOM_CHANNEL_BASE_URL` (HTTPS only), `WECOM_CHANNEL_DEVICE_ID`, and
+`WECOM_CHANNEL_DEVICE_TOKEN` in `.env.local`. Current single-device mode does
+not bind the Mac to a WeCom account; tenant and channel-account isolation must
+be introduced before multi-tenant use.
 The client records command ids before GUI execution and reports an unconfirmed
 post-click state as `needs_reconciliation`; it never blindly sends it again.
 

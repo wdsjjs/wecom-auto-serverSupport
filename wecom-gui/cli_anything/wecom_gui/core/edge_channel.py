@@ -20,7 +20,6 @@ class ChannelConfig:
     base_url: str
     device_id: str
     device_token: str
-    account_id: str
     timeout_seconds: float
 
     @classmethod
@@ -28,11 +27,10 @@ class ChannelConfig:
         base_url = os.environ.get("WECOM_CHANNEL_BASE_URL", "").strip().rstrip("/")
         device_id = os.environ.get("WECOM_CHANNEL_DEVICE_ID", "").strip()
         device_token = os.environ.get("WECOM_CHANNEL_DEVICE_TOKEN", "").strip()
-        account_id = os.environ.get("WECOM_CHANNEL_ACCOUNT_ID", "").strip()
-        if not base_url or not device_id or not device_token or not account_id:
+        if not base_url or not device_id or not device_token:
             raise ChannelError(
                 "WECOM_CHANNEL_BASE_URL, WECOM_CHANNEL_DEVICE_ID, "
-                "WECOM_CHANNEL_DEVICE_TOKEN and WECOM_CHANNEL_ACCOUNT_ID are required"
+                "and WECOM_CHANNEL_DEVICE_TOKEN are required"
             )
         if not base_url.startswith("https://"):
             raise ChannelError("WECOM_CHANNEL_BASE_URL must use https://")
@@ -40,7 +38,6 @@ class ChannelConfig:
             base_url=base_url,
             device_id=device_id,
             device_token=device_token,
-            account_id=account_id,
             timeout_seconds=max(1.0, float(os.environ.get("WECOM_CHANNEL_TIMEOUT_SECONDS", "10"))),
         )
 
@@ -59,7 +56,6 @@ class ChannelClient:
         return {
             "Authorization": f"Bearer {self.config.device_token}",
             "X-Wecom-Channel-Device-Id": self.config.device_id,
-            "X-Wecom-Channel-Account-Id": self.config.account_id,
             "Accept": "application/json",
         }
 
@@ -90,7 +86,7 @@ class ChannelClient:
         return self._json_request(
             "POST",
             _path("WECOM_CHANNEL_HEARTBEAT_PATH", "/api/wecom-channel/edge/heartbeat"),
-            json={"device_id": self.config.device_id, "account_id": self.config.account_id},
+            json={"device_id": self.config.device_id},
         )
 
     def post_inbound(self, event: dict, media: list[dict]) -> dict:
