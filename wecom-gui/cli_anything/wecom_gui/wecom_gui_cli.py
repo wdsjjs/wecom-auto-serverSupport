@@ -13,6 +13,8 @@ from cli_anything.wecom_gui.core import agent as agent_core
 from cli_anything.wecom_gui.core import agent_input as agent_input_core
 from cli_anything.wecom_gui.core import app as app_core
 from cli_anything.wecom_gui.core import chat as chat_core
+from cli_anything.wecom_gui.core import edge_state as edge_state_core
+from cli_anything.wecom_gui.core import edge_worker as edge_worker_core
 from cli_anything.wecom_gui.core import inbox as inbox_core
 from cli_anything.wecom_gui.core import llm as llm_core
 from cli_anything.wecom_gui.core import reply as reply_core
@@ -360,6 +362,30 @@ def agent_cmd(
         once=once,
         read_only=read_only,
     )
+
+
+@cli.group("edge-channel")
+def edge_channel_group() -> None:
+    """Run the unattended central-channel client on this Mac."""
+
+
+@edge_channel_group.command("status")
+def edge_channel_status() -> None:
+    """Show the local durable spool; this never contacts the central service."""
+    _emit_or_fail(edge_state_core.edge_status)
+
+
+@edge_channel_group.command("run")
+@click.option("--once", is_flag=True, help="Run one capture/upload/pull/send tick and exit.")
+@click.option("--poll", default=1.0, show_default=True, type=click.FloatRange(min=0.1))
+@click.option("--inbox-limit", default=30, show_default=True, type=click.IntRange(min=1, max=100))
+@click.option("--last", default=20, show_default=True, type=click.IntRange(min=1, max=100))
+def edge_channel_run(once: bool, poll: float, inbox_limit: int, last: int) -> None:
+    """Capture external direct chats and execute centrally issued commands."""
+    if once:
+        _emit_or_fail(edge_worker_core.tick, inbox_limit=inbox_limit, last=last)
+        return
+    edge_worker_core.run_forever(poll_seconds=poll, inbox_limit=inbox_limit, last=last)
 
 
 @cli.command()

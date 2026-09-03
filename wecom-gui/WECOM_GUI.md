@@ -180,6 +180,24 @@ POST /api/review/items/{id}/reject
 The review page reads live queue items from
 `~/.cli-anything-wecom-gui/state.sqlite`; it does not serve mock items.
 
+## Central Channel Edge Client
+
+`edge-channel` is independent from the AI/review queue. It is the unattended
+Mac executor for the central customer-service channel: unread external direct
+messages are first spooled in SQLite, then uploaded; centrally issued text or
+image commands are re-read against the current customer message before send.
+
+```bash
+python -m cli_anything.wecom_gui edge-channel status
+python -m cli_anything.wecom_gui edge-channel run --once
+python -m cli_anything.wecom_gui edge-channel run
+```
+
+Set `WECOM_CHANNEL_BASE_URL` (HTTPS only), `WECOM_CHANNEL_DEVICE_ID`,
+`WECOM_CHANNEL_DEVICE_TOKEN`, and `WECOM_CHANNEL_ACCOUNT_ID` in `.env.local`.
+The client records command ids before GUI execution and reports an unconfirmed
+post-click state as `needs_reconciliation`; it never blindly sends it again.
+
 SQLite schema notes:
 
 - `reply_queue` includes `handoff_type` and `handoff_reason` for direct/AI
