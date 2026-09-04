@@ -20,6 +20,7 @@ class ChannelConfig:
     base_url: str
     device_id: str
     device_token: str
+    local_test_mode: bool
     timeout_seconds: float
 
     @classmethod
@@ -27,17 +28,19 @@ class ChannelConfig:
         base_url = os.environ.get("WECOM_CHANNEL_BASE_URL", "").strip().rstrip("/")
         device_id = os.environ.get("WECOM_CHANNEL_DEVICE_ID", "").strip()
         device_token = os.environ.get("WECOM_CHANNEL_DEVICE_TOKEN", "").strip()
-        if not base_url or not device_id or not device_token:
+        local_test_mode = os.environ.get("WECOM_CHANNEL_LOCAL_TEST_MODE", "").strip().lower() == "true"
+        if not base_url or (not local_test_mode and (not device_id or not device_token)):
             raise ChannelError(
-                "WECOM_CHANNEL_BASE_URL, WECOM_CHANNEL_DEVICE_ID, "
-                "and WECOM_CHANNEL_DEVICE_TOKEN are required"
+                "WECOM_CHANNEL_BASE_URL is required; WECOM_CHANNEL_DEVICE_ID and "
+                "WECOM_CHANNEL_DEVICE_TOKEN are required unless WECOM_CHANNEL_LOCAL_TEST_MODE=true"
             )
-        if not base_url.startswith("https://"):
-            raise ChannelError("WECOM_CHANNEL_BASE_URL must use https://")
+        if not base_url.startswith("https://") and not (local_test_mode and base_url.startswith("http://")):
+            raise ChannelError("WECOM_CHANNEL_BASE_URL must use https:// unless local test mode is enabled")
         return cls(
             base_url=base_url,
             device_id=device_id,
             device_token=device_token,
+            local_test_mode=local_test_mode,
             timeout_seconds=max(1.0, float(os.environ.get("WECOM_CHANNEL_TIMEOUT_SECONDS", "10"))),
         )
 
@@ -53,11 +56,11 @@ class ChannelClient:
         self.session = session or requests.Session()
 
     def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.config.device_token}",
-            "X-Wecom-Channel-Device-Id": self.config.device_id,
-            "Accept": "application/json",
-        }
+        headers = {"Accept": "application/json"}
+        if not self.config.local_test_mode:
+            headers["Authorization"] = f"Bearer {self.config.device_token}"
+            headers["X-Wecom-Channel-Device-Id"] = self.config.device_id
+        return headers
 
     def _url(self, path: str) -> str:
         return f"{self.config.base_url}{path}"
@@ -86,7 +89,7 @@ class ChannelClient:
         return self._json_request(
             "POST",
             _path("WECOM_CHANNEL_HEARTBEAT_PATH", "/api/wecom-channel/edge/heartbeat"),
-            json={"device_id": self.config.device_id},
+            json={} if self.config.local_test_mode else {"device_id": self.config.device_id},
         )
 
     def post_inbound(self, event: dict, media: list[dict]) -> dict:

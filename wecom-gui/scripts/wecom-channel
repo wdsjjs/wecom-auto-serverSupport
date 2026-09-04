@@ -1,0 +1,128 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+RUN_DIR="$ROOT_DIR/.codex-run"
+ENV_FILE="${WECOM_CHANNEL_ENV:-$ROOT_DIR/.env.local}"
+SESSION_NAME="${WECOM_EDGE_CHANNEL_SESSION:-wecom-edge-channel}"
+LOG_FILE="${WECOM_EDGE_CHANNEL_LOG:-$RUN_DIR/wecom-edge-channel.log}"
+POLL="${WECOM_EDGE_CHANNEL_POLL:-1}"
+INBOX_LIMIT="${WECOM_EDGE_CHANNEL_INBOX_LIMIT:-8}"
+LAST_MESSAGES="${WECOM_EDGE_CHANNEL_LAST:-20}"
+
+mkdir -p "$RUN_DIR"
+cd "$ROOT_DIR"
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  source "$ENV_FILE"
+  set +a
+fi
+
+PYTHON_BIN="${WECOM_GUI_PYTHON:-/Users/uyuc/miniconda3/bin/python}"
+PYTHONPATH_VALUE="${WECOM_GUI_PYTHONPATH:-}"
+
+is_running() {
+  local listing
+  listing="$(screen -ls 2>&1 || true)"
+  grep -q "[.]${SESSION_NAME}[[:space:]]" <<<"$listing"
+}
+
+ensure_wecom_running() {
+  if [[ "${WECOM_GUI_AUTO_LAUNCH_WECOM:-1}" == "0" ]]; then
+    return
+  fi
+
+  local app_name="${WECOM_GUI_APP_NAME:-企业微信}"
+  if ! open -a "$app_name" >/dev/null 2>&1; then
+    echo "ERROR: cannot start or find WeCom app: $app_name" >&2
+    return 1
+  fi
+}
+
+preflight() {
+  [[ -f "$ENV_FILE" ]] || { echo "ERROR: missing env file: $ENV_FILE" >&2; return 1; }
+  command -v screen >/dev/null || { echo "ERROR: screen is required" >&2; return 1; }
+  command -v "$PYTHON_BIN" >/dev/null || { echo "ERROR: Python not executable: $PYTHON_BIN" >&2; return 1; }
+  ensure_wecom_running
+
+  PYTHONPATH="$PYTHONPATH_VALUE" "$PYTHON_BIN" - <<'PY'
+from cli_anything.wecom_gui.core.edge_channel import ChannelConfig
+
+config = ChannelConfig.from_env()
+print(
+    "Preflight OK: "
+    f"base_url={config.base_url} local_test_mode={config.local_test_mode} "
+    f"timeout_seconds={config.timeout_seconds}"
+)
+PY
+}
+
+start_channel() {
+  if is_running; then
+    echo "already running: $SESSION_NAME"
+    return
+  fi
+
+  : > "$LOG_FILE"
+  if ! preflight 2>&1 | tee -a "$LOG_FILE"; then
+    echo "preflight failed; see log: $LOG_FILE" >&2
+    return 1
+  fi
+
+  local command
+  command="cd '$ROOT_DIR' && PYTHONPATH='$PYTHONPATH_VALUE' '$PYTHON_BIN' -u -m cli_anything.wecom_gui edge-channel run --poll '$POLL' --inbox-limit '$INBOX_LIMIT' --last '$LAST_MESSAGES' >> '$LOG_FILE' 2>&1"
+  screen -dmS "$SESSION_NAME" zsh -lc "$command"
+  sleep 1
+  echo "started: $SESSION_NAME"
+  tail -n 20 "$LOG_FILE"
+}
+
+stop_channel() {
+  if is_running; then
+    screen -S "$SESSION_NAME" -X quit
+    echo "stopped: $SESSION_NAME"
+  else
+    echo "not running: $SESSION_NAME"
+  fi
+
+  local worker_pids
+  worker_pids="$(pgrep -f 'cli_anything[.]wecom_gui edge-channel run' 2>/dev/null || true)"
+  if [[ -n "$worker_pids" ]]; then
+    printf '%s\n' "$worker_pids" | xargs kill 2>/dev/null || true
+    sleep 1
+    worker_pids="$(pgrep -f 'cli_anything[.]wecom_gui edge-channel run' 2>/dev/null || true)"
+    if [[ -n "$worker_pids" ]]; then
+      printf '%s\n' "$worker_pids" | xargs kill -9 2>/dev/null || true
+    fi
+    echo "stopped edge worker process(es)"
+  fi
+}
+
+status_channel() {
+  if is_running; then
+    echo "running: $SESSION_NAME"
+    screen -ls | grep "[.]${SESSION_NAME}[[:space:]]" || true
+  else
+    echo "stopped: $SESSION_NAME"
+  fi
+  [[ -f "$LOG_FILE" ]] && echo "log: $LOG_FILE"
+}
+
+logs_channel() {
+  touch "$LOG_FILE"
+  tail -f "$LOG_FILE"
+}
+
+case "${1:-start}" in
+  preflight) preflight ;;
+  start) start_channel ;;
+  stop) stop_channel ;;
+  restart) stop_channel; sleep 1; start_channel ;;
+  status) status_channel ;;
+  logs) logs_channel ;;
+  *)
+    echo "usage: $0 {preflight|start|stop|restart|status|logs}" >&2
+    exit 2
+    ;;
+esac
