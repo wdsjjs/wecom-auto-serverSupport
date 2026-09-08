@@ -2,17 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SUPERVISOR="$ROOT_DIR/wecom-gui/scripts/wecom-supervisor"
+APP_PID="$(pgrep -x UDAWeComAgent || true)"
 
-cd "$ROOT_DIR/wecom-gui"
-./scripts/wecom-agent stop
-./scripts/wecom-agent review-stop
-
-pkill -f 'cli_anything\.wecom_gui agent' 2>/dev/null || true
-pkill -f 'cli_anything\.wecom_gui review' 2>/dev/null || true
-pkill -f 'SCREEN -dmS wecom-agent' 2>/dev/null || true
-pkill -f 'SCREEN -dmS wecom-review' 2>/dev/null || true
-
-echo
-echo "已停止。"
-echo
-read -r -p "按回车关闭窗口..."
+[[ -x "$SUPERVISOR" ]] || { echo "ERROR: missing supervisor: $SUPERVISOR" >&2; exit 1; }
+"$SUPERVISOR" stop edge
+if [[ -n "$APP_PID" ]]; then
+  kill "$APP_PID" 2>/dev/null || true
+fi
+"$SUPERVISOR" status

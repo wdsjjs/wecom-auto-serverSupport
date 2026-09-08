@@ -1,0 +1,15 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+ROOT_DIR="${SCRIPT_DIR:h}"
+APP="$HOME/Applications/UDA WeCom Agent.app"
+
+command -v swiftc >/dev/null 2>&1 || { print -u2 'ERROR: swiftc is required'; exit 1; }
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+swiftc -framework AppKit -framework Foundation "$ROOT_DIR/desktop-client/UDAWeComAgent.swift" -o "$APP/Contents/MacOS/UDAWeComAgent"
+cp "$ROOT_DIR/desktop-client/Info.plist" "$APP/Contents/Info.plist"
+print -r -- "$ROOT_DIR" > "$APP/Contents/Resources/wecom-gui-root.txt"
+print "Installed $APP"
+open "$APP"
+print 'Started the UDA WeCom Agent desktop client. It does not start the edge channel automatically.'

@@ -92,6 +92,14 @@ class ChannelClient:
             json={} if self.config.local_test_mode else {"device_id": self.config.device_id},
         )
 
+    def post_runtime(self, payload: dict) -> dict:
+        return self._json_request(
+            "POST",
+            _path("WECOM_CHANNEL_RUNTIME_PATH", "/api/wecom-channel/edge/runtime"),
+            json=payload,
+            timeout=min(self.config.timeout_seconds, 2.0),
+        )
+
     def post_inbound(self, event: dict, media: list[dict]) -> dict:
         path = _path("WECOM_CHANNEL_INBOUND_PATH", "/api/wecom-channel/edge/inbound-events")
         upload_event = json.loads(json.dumps(event, ensure_ascii=False))

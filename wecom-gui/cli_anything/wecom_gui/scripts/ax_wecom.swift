@@ -565,92 +565,23 @@ func waitUntilInputChanges(_ input: AXUIElement, text: String, attempts: Int = 8
     return !inputStillContains(input, text: text)
 }
 
-func pressReturnKey() {
-    let source = CGEventSource(stateID: .hidSystemState)
-    let down = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true)
-    let up = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false)
-    down?.post(tap: .cghidEventTap)
-    up?.post(tap: .cghidEventTap)
-}
-
-func fallbackConfirmReturn(input: AXUIElement) -> [String: Any] {
+func submitInput(input: AXUIElement, text: String) -> [String: Any] {
+    guard inputStillContains(input, text: text) else {
+        return ["method": "ax_confirm", "confirmed": false, "reason": "input_modified_before_submit"]
+    }
     let confirm = AXUIElementPerformAction(input, kAXConfirmAction as CFString)
-    Thread.sleep(forTimeInterval: 0.05)
-    pressReturnKey()
-    return ["method": "ax_confirm_return", "code": confirm.rawValue]
-}
-
-func findSendButton(root: AXUIElement, window: AXUIElement?, input: AXUIElement) -> AXUIElement? {
-    var buttons: [AXUIElement] = []
-    if let window = window {
-        collectButtons(window, buttons: &buttons)
+    guard confirm == .success else {
+        return ["method": "ax_confirm", "submitted": false, "confirmed": false, "code": confirm.rawValue]
     }
-    if buttons.isEmpty {
-        collectButtons(root, buttons: &buttons)
-    }
-    let inputPos = pointAttr(input, kAXPositionAttribute as CFString) ?? .zero
-    let inputSize = sizeAttr(input) ?? .zero
-    let inputCenterY = inputPos.y + inputSize.height / 2
-    let labelled = buttons.filter { button in
-        textValues(button).contains { value in
-            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return normalized == "发送" || normalized == "send" || normalized.contains("发送")
-        }
-    }
-    if let button = labelled.min(by: { lhs, rhs in
-        let lp = pointAttr(lhs, kAXPositionAttribute as CFString) ?? .zero
-        let rp = pointAttr(rhs, kAXPositionAttribute as CFString) ?? .zero
-        return abs(lp.y - inputCenterY) < abs(rp.y - inputCenterY)
-    }) {
-        return button
-    }
-    return buttons.filter { button in
-        guard textValues(button).isEmpty,
-              let pos = pointAttr(button, kAXPositionAttribute as CFString),
-              let size = sizeAttr(button) else {
-            return false
-        }
-        let centerX = pos.x + size.width / 2
-        let centerY = pos.y + size.height / 2
-        return centerX >= inputPos.x + max(120, inputSize.width - 180)
-            && centerX <= inputPos.x + inputSize.width + 40
-            && centerY >= inputPos.y - 20
-            && centerY <= inputPos.y + inputSize.height + 70
-            && size.width >= 36
-            && size.width <= 120
-            && size.height >= 24
-            && size.height <= 80
-    }.min(by: { lhs, rhs in
-        let lp = pointAttr(lhs, kAXPositionAttribute as CFString) ?? .zero
-        let rp = pointAttr(rhs, kAXPositionAttribute as CFString) ?? .zero
-        return lp.x > rp.x
-    })
-}
-
-func submitInput(root: AXUIElement, window: AXUIElement?, input: AXUIElement, text: String) -> [String: Any] {
-    if let pos = pointAttr(input, kAXPositionAttribute as CFString),
-       let size = sizeAttr(input) {
-        clickAt(x: Double(pos.x + min(max(size.width - 16, 10), size.width / 2)), y: Double(pos.y + size.height / 2))
-    }
-    Thread.sleep(forTimeInterval: 0.12)
-    if let button = findSendButton(root: root, window: window, input: input) {
-        let press = AXUIElementPerformAction(button, kAXPressAction as CFString)
-        var method = "ax_send_button"
-        if press != .success, let center = buttonCenter(button) {
-            clickAt(x: Double(center.x), y: Double(center.y))
-            method = "cg_send_button"
-        }
-        if !waitUntilInputChanges(input, text: text) {
-            let fallback = fallbackConfirmReturn(input: input)
-            return [
-                "method": "\(method)+\(fallback["method"] ?? "fallback")",
-                "buttonCode": press.rawValue,
-                "fallbackCode": fallback["code"] ?? 0
-            ]
-        }
-        return ["method": method, "buttonCode": press.rawValue]
-    }
-    return fallbackConfirmReturn(input: input)
+    // WeCom does not consistently clear AXValue after accepting AXConfirmAction.
+    // "confirmed" is therefore only an input-state observation; the caller must
+    // verify delivery from a newly visible outgoing bubble.
+    return [
+        "method": "ax_confirm",
+        "submitted": true,
+        "confirmed": waitUntilInputChanges(input, text: text),
+        "code": confirm.rawValue,
+    ]
 }
 
 func previewPayload(root: AXUIElement) -> [String: Any] {
@@ -1167,6 +1098,24 @@ func inputReadyPayload(root: AXUIElement, window: AXUIElement?) -> [String: Any]
     ]
 }
 
+func sendReadyPayload(root: AXUIElement, window: AXUIElement?) -> [String: Any] {
+    guard let input = bestTextInput(root: root, window: window) else {
+        return ["ok": false, "error": "chat_input_not_found"]
+    }
+    let pos = pointAttr(input, kAXPositionAttribute as CFString) ?? .zero
+    let size = sizeAttr(input) ?? .zero
+    return [
+        "ok": true,
+        "input": [
+            "x": Double(pos.x),
+            "y": Double(pos.y),
+            "width": Double(size.width),
+            "height": Double(size.height),
+            "valueLength": (stringAttr(input, kAXValueAttribute as CFString) ?? "").count,
+        ],
+    ]
+}
+
 func collectWebAreas(_ element: AXUIElement, out: inout [AXUIElement], maxDepth: Int = 14, depth: Int = 0) {
     if depth > maxDepth {
         return
@@ -1199,17 +1148,26 @@ func sidebarIdentityPayload(root: AXUIElement, window: AXUIElement?) -> [String:
         .filter { !$0.isEmpty }
     let uidRegex = try? NSRegularExpression(pattern: #"\b(w[mo][A-Za-z0-9_-]{8,})\b"#)
     var uid = ""
+    var displayName = ""
     for text in texts {
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         if let match = uidRegex?.firstMatch(in: text, range: range),
            let swiftRange = Range(match.range(at: 1), in: text) {
             uid = String(text[swiftRange])
+            let firstLine = text
+                .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+                .first?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !firstLine.isEmpty && !firstLine.contains("企微") {
+                displayName = firstLine
+            }
             break
         }
     }
     return [
         "ok": true,
         "external_user_id": uid,
+        "display_name": displayName,
         "texts": Array(texts.prefix(120)),
         "textCount": texts.count,
         "webArea": rectPayload(sidebar) ?? [:]
@@ -1268,6 +1226,8 @@ if command == "rows" {
     }
 } else if command == "input-ready" {
     jsonLine(inputReadyPayload(root: root, window: window))
+} else if command == "send-ready" {
+    jsonLine(sendReadyPayload(root: root, window: window))
 } else if command == "sidebar-identity" {
     jsonLine(sidebarIdentityPayload(root: root, window: window))
 } else if command == "chat" || command == "chat-all" {
@@ -1442,18 +1402,19 @@ if command == "rows" {
         jsonLine(["ok": false, "error": "set_input_failed", "code": setResult.rawValue])
         exit(0)
     }
-    activateRunningApp(bundleID: bundleID)
-    AXUIElementSetAttributeValue(root, kAXFocusedUIElementAttribute as CFString, input)
-    AXUIElementSetAttributeValue(input, kAXFocusedAttribute as CFString, boolValue(true))
     Thread.sleep(forTimeInterval: 0.15)
+    guard inputStillContains(input, text: text) else {
+        jsonLine(["ok": false, "error": "input_modified_before_submit"])
+        exit(0)
+    }
     var submitResult: [String: Any] = ["method": "stage_only"]
     if command == "send" {
-        submitResult = submitInput(root: root, window: window, input: input, text: text)
+        submitResult = submitInput(input: input, text: text)
     }
     let pos = pointAttr(input, kAXPositionAttribute as CFString) ?? .zero
     let size = sizeAttr(input) ?? .zero
     jsonLine([
-        "ok": true,
+        "ok": command == "stage" || (submitResult["submitted"] as? Bool == true),
         "submitted": command == "send",
         "chars": text.count,
         "method": submitResult["method"] ?? "ax_text_input",

@@ -505,7 +505,33 @@ def test_selected_conversation_row_prefers_swift_selected_row(monkeypatch):
     assert row["title"] == "客户A"
     assert row["selected"] is True
     assert row["source"] == "axuielement-selected"
-    assert commands == ["selected-row"]
+    assert commands == ["rows", "selected-row"]
+
+
+def test_selected_conversation_row_uses_selected_flag_from_row_scan_before_fallback(monkeypatch):
+    commands = []
+
+    def fake_swift(command):
+        commands.append(command)
+        if command == "rows":
+            return [{
+                "texts": ["客户A", "刚刚", "查订单", "@微信"],
+                "x": 60,
+                "y": 100,
+                "width": 250,
+                "height": 64,
+                "selected": True,
+            }]
+        raise AssertionError("selected-row should not run when the row scan is selected")
+
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.resolve_app_name", lambda app_name=None: "企业微信")
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift)
+
+    row = macos_backend.selected_conversation_row(limit=8)
+
+    assert row["title"] == "客户A"
+    assert row["selected"] is True
+    assert commands == ["rows"]
 
 
 def test_ax_chat_messages_accepts_chat_pane_on_sidebar_boundary(monkeypatch):
@@ -581,14 +607,14 @@ def test_ax_chat_messages_falls_back_to_sidebar_boundary_when_chat_left_missing(
     assert [message["text"] for message in messages] == ["真正消息"]
 
 
-def test_send_via_ax_text_input_preflights_input_ready(monkeypatch):
+def test_send_via_ax_text_input_preflights_send_ready(monkeypatch):
     commands = []
     events = []
 
     def fake_swift(command):
         commands.append(command)
-        if command == "input-ready":
-            return [{"ok": True, "input": {"x": 10}, "sidebar": {"ok": True}}]
+        if command == "send-ready":
+            return [{"ok": True, "input": {"x": 10, "valueLength": 0}}]
         if command == ["send", "hello"]:
             return [{"ok": True, "submitted": True, "chars": 5}]
         return []
@@ -599,7 +625,7 @@ def test_send_via_ax_text_input_preflights_input_ready(monkeypatch):
     result = macos_backend.send_via_ax_text_input("hello", submit=True)
 
     assert result["ok"] is True
-    assert commands == ["input-ready", ["send", "hello"]]
+    assert commands == ["send-ready", ["send", "hello"]]
     assert events[0]["type"] == "wecom_send_input_preflight"
 
 def test_ax_chat_messages_returns_image_placeholder(monkeypatch):
@@ -1245,7 +1271,7 @@ def test_ax_text_input_retries_empty_swift_result(monkeypatch):
     calls = []
     results = iter(
         [
-            [{"ok": True, "input": {"x": 1}, "sidebar": {"ok": True}}],
+            [{"ok": True, "input": {"x": 1, "valueLength": 0}}],
             [],
             [{"ok": True, "submitted": True, "chars": 5, "method": "ax_text_input"}],
         ]
@@ -1263,7 +1289,7 @@ def test_ax_text_input_retries_empty_swift_result(monkeypatch):
 
     assert data["ok"] is True
     assert data["method"] == "ax_text_input"
-    assert calls == ["input-ready", ["send", "hello"], ["send", "hello"]]
+    assert calls == ["send-ready", ["send", "hello"], ["send", "hello"]]
 
 def test_scroll_sidebar_uses_adaptive_geometry(monkeypatch):
     calls = []

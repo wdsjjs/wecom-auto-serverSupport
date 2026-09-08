@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cli_anything.wecom_gui.core import edge_channel, edge_state, edge_worker
+from cli_anything.wecom_gui.core import edge_channel, edge_state, edge_worker, state
 
 
 class FakeChannel:
@@ -25,6 +25,7 @@ class FakeChannel:
 def _inbound_payload() -> dict:
     return {
         "event_type": "inbound_message",
+        "occurred_at": 1_788_282_000.0,
         "conversation": {"key": "uid:customer-1"},
         "message": {"id": "edge-msg-1", "hash": "message-hash", "text": "你好", "media": []},
     }
@@ -40,6 +41,13 @@ def _command(*, expires_at=None) -> dict:
     if expires_at is not None:
         value["expires_at"] = expires_at
     return value
+
+
+def _match_sidebar_identity(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.edge_worker._current_identity_for_row",
+        lambda row: (str(row.get("external_user_id") or "customer-1"), ""),
+    )
 
 
 def test_inbound_spool_reuses_persisted_event_id_and_retries(monkeypatch, tmp_path):
@@ -63,11 +71,13 @@ def test_inbound_spool_reuses_persisted_event_id_and_retries(monkeypatch, tmp_pa
     healthy = FakeChannel()
     assert edge_worker.flush_inbound(healthy) == {"delivered": 1, "failed": 0}
     assert healthy.inbound_calls[0][0]["client_event_id"] == first["client_event_id"]
+    assert healthy.inbound_calls[0][0]["occurred_at"] == "2026-09-01T17:00:00+00:00"
     assert edge_state.edge_status()["inbound_pending"] == 0
 
 
 def test_capture_unread_text_and_image_to_durable_spool(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    _match_sidebar_identity(monkeypatch)
     image_path = tmp_path / "captured.jpg"
     image_path.write_bytes(b"image-data")
     row = {
@@ -105,6 +115,267 @@ def test_capture_unread_text_and_image_to_durable_spool(monkeypatch, tmp_path):
     assert event["payload"]["message"]["media"][0]["sha256"]
 
 
+def test_capture_all_customer_messages_in_one_unresolved_turn(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    _match_sidebar_identity(monkeypatch)
+    row = {
+        "title": "客户A",
+        "preview": "第三句",
+        "unread": True,
+        "unread_count": 3,
+        "external_user_id": "customer-1",
+        "tags": ["@微信"],
+    }
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.scan_visible", lambda limit: {"conversations": [row]})
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda target: target == row)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row", lambda limit=30: row)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "customer-1")
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda **kwargs: {
+            "hash": "visible-chat-hash",
+            "messages": [
+                {"role": "客服", "text": "您好", "media": []},
+                {"role": "用户", "text": "第一句", "media": []},
+                {"role": "用户", "text": "第一句", "media": []},
+                {"role": "用户", "text": "第三句", "media": []},
+            ],
+        },
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.core.edge_worker.time.sleep", lambda _: None)
+
+    result = edge_worker.collect_inbound_once()
+    events = edge_state.due_inbound(limit=10)
+
+    assert result["captured"] == 3
+    assert [event["payload"]["message"]["text"] for event in events] == ["第一句", "第一句", "第三句"]
+    assert len({event["client_event_id"] for event in events}) == 3
+
+
+def test_visible_staff_message_remains_unknown_without_a_central_delivery_echo(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    _match_sidebar_identity(monkeypatch)
+    monkeypatch.setenv("WECOM_GUI_CAPTURE_OUTBOUND", "1")
+    row = {"title": "客户A", "external_user_id": "customer-1"}
+    reads = iter([
+        {"hash": "baseline", "messages": []},
+        {"hash": "new", "messages": [
+            {"role": "客服", "text": "人工新回复"},
+        ]},
+    ])
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row", lambda limit=30: row)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "customer-1")
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda **kwargs: next(reads))
+
+    first = edge_worker.collect_visible_outbound_once()
+    second = edge_worker.collect_visible_outbound_once()
+    events = edge_state.due_inbound(limit=10)
+
+    assert first["captured"] == 0
+    assert second["captured"] == 1
+    assert events[0]["payload"]["event_type"] == "unknown_message"
+    assert events[0]["payload"]["message"]["direction"] == "unknown"
+    assert events[0]["payload"]["message"]["text"] == "人工新回复"
+
+
+def test_visual_staff_direction_does_not_resolve_without_a_central_delivery_echo(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    _match_sidebar_identity(monkeypatch)
+    monkeypatch.setenv("WECOM_GUI_CAPTURE_OUTBOUND", "1")
+    row = {"title": "客户A", "external_user_id": "customer-1"}
+    reads = iter([
+        {"hash": "baseline", "messages": []},
+        {"hash": "unknown", "messages": [
+            {"role": "用户", "role_confidence": "low", "text": "等待方向确认", "time": "10:00"},
+        ]},
+        {"hash": "resolved", "messages": [
+            {"role": "客服", "role_confidence": "high", "text": "等待方向确认", "time": "10:00"},
+        ]},
+    ])
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row", lambda limit=30: row)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "customer-1")
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda **kwargs: next(reads))
+
+    edge_worker.collect_visible_conversation_once()
+    uncertain = edge_worker.collect_visible_conversation_once()
+    unknown_event = edge_state.due_inbound(limit=10)[0]
+
+    assert uncertain["captured"] == 1
+    assert uncertain["pending_direction"] == 1
+    assert unknown_event["payload"]["message"]["direction"] == "unknown"
+    edge_state.mark_inbound_delivered(unknown_event["client_event_id"])
+
+    resolved = edge_worker.collect_visible_conversation_once()
+    events = edge_state.due_inbound(limit=10)
+
+    assert resolved["captured"] == 0
+    assert resolved["pending_direction"] == 1
+    assert events == []
+
+
+def test_visible_customer_message_is_uploaded_when_the_open_chat_is_not_unread(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    _match_sidebar_identity(monkeypatch)
+    row = {"title": "客户A", "external_user_id": "customer-1", "unread": False}
+    reads = iter([
+        {"hash": "baseline", "messages": [{"role": "客服", "text": "历史回复"}]},
+        {"hash": "new", "messages": [
+            {"role": "客服", "text": "历史回复"},
+            {"role": "用户", "text": "当前打开会话的新消息"},
+        ]},
+    ])
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row", lambda limit=30: row)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "customer-1")
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda **kwargs: next(reads))
+
+    edge_worker.collect_visible_conversation_once()
+    result = edge_worker.collect_visible_conversation_once()
+    events = edge_state.due_inbound(limit=10)
+
+    assert result["captured"] == 1
+    assert events[0]["payload"]["event_type"] == "inbound_message"
+    assert events[0]["payload"]["message"]["direction"] == "inbound"
+    assert events[0]["payload"]["message"]["text"] == "当前打开会话的新消息"
+
+
+def test_visible_capture_retries_selected_row_after_activating_background_wecom(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    _match_sidebar_identity(monkeypatch)
+    row = {"title": "客户A", "external_user_id": "customer-1"}
+    selected_rows = iter([None, row])
+    activated = []
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row",
+        lambda limit=30: next(selected_rows),
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.activate_app", lambda: activated.append(True))
+    monkeypatch.setattr("cli_anything.wecom_gui.core.edge_worker.time.sleep", lambda _: None)
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda **kwargs: {"messages": []})
+
+    result = edge_worker.collect_visible_conversation_once()
+
+    assert result["captured"] == 0
+    assert activated == [True]
+
+
+def test_visible_capture_refuses_sidebar_identity_that_does_not_match_selected_row(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    row = {"title": "客户A", "external_user_id": "customer-a"}
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row", lambda limit=30: row)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.edge_worker._current_identity_for_row",
+        lambda _row: ("", "sidebar_identity_title_mismatch"),
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("chat must not be read for an identity mismatch")),
+    )
+
+    result = edge_worker.collect_visible_conversation_once()
+
+    assert result == {"ok": True, "captured": 0, "reason": "sidebar_identity_title_mismatch"}
+    assert edge_state.due_inbound(limit=10) == []
+
+
+def test_visible_capture_uses_an_explicitly_verified_local_uid_binding(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    state.bind_wecom_customer(
+        uid="customer-1",
+        customer_name="客户A",
+        source="wecom-sidebar-jsapi",
+    )
+    row = {"title": "客户A"}
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row", lambda limit=30: row)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.sidebar_identity", lambda: {"external_user_id": ""})
+    reads = iter([
+        {"messages": []},
+        {"messages": [{"role": "用户", "text": "来自已绑定客户的新消息"}]},
+    ])
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda **kwargs: next(reads))
+
+    edge_worker.collect_visible_conversation_once()
+    result = edge_worker.collect_visible_conversation_once()
+
+    assert result["captured"] == 1
+    event = edge_state.due_inbound(limit=10)[0]
+    assert event["payload"]["conversation"]["external_user_id"] == "customer-1"
+
+
+def test_untrusted_name_binding_does_not_replace_sidebar_identity(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    state.bind_wecom_customer(uid="customer-1", customer_name="客户A", source="imported-unknown")
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.sidebar_identity", lambda: {"external_user_id": ""})
+
+    uid, error = edge_worker._current_identity_for_row({"title": "客户A"})
+
+    assert uid == ""
+    assert error == "sidebar_external_user_id_missing"
+
+
+def test_command_echo_is_not_uploaded_twice_as_manual_staff_message(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    monkeypatch.setenv("WECOM_GUI_CAPTURE_OUTBOUND", "1")
+    row = {"title": "客户A", "external_user_id": "customer-1"}
+    reads = iter([
+        {"hash": "baseline", "messages": []},
+        {"hash": "echo", "messages": [{"role": "客服", "text": "中台发送"}]},
+    ])
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row", lambda limit=30: row)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "customer-1")
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda **kwargs: next(reads))
+
+    edge_worker.collect_visible_outbound_once()
+    edge_state.register_outbound_echo_suppression("cmd-1", "uid:customer-1", "中台发送")
+    result = edge_worker.collect_visible_outbound_once()
+
+    assert result["captured"] == 0
+    assert edge_state.due_inbound(limit=10) == []
+
+
+def test_uncertain_command_is_reconciled_without_a_second_send(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    command = _command()
+    edge_state.record_command(command)
+    assert edge_state.mark_command_executing(command["command_id"])
+    edge_state.save_command_result(command["command_id"], {"status": "needs_reconciliation", "reason": "reply_not_visible_after_send"})
+    edge_state.mark_command_result_reported(command["command_id"])
+    row = {"title": "客户A", "external_user_id": "customer-1"}
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda target: target == row)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row", lambda limit=30: row)
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.current_external_user_id", lambda: "customer-1")
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.chat.read_current",
+        lambda **kwargs: {"messages": [{"role": "客服", "text": command["text"]}]},
+    )
+
+    result = edge_worker.reconcile_pending_command_echoes()
+
+    assert result == {"checked": 1, "confirmed": 1}
+    receipt = edge_state.due_command_results()[0]
+    assert receipt["result"] == {"status": "succeeded", "verification": "reconciled_reply_visible"}
+
+
+def test_unconfirmed_command_stops_background_reconciliation_after_the_limit(monkeypatch, tmp_path):
+    monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    command = _command()
+    edge_state.record_command(command)
+    assert edge_state.mark_command_executing(command["command_id"])
+    edge_state.save_command_result(command["command_id"], {"status": "needs_reconciliation"})
+    edge_state.mark_command_result_reported(command["command_id"])
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.edge_worker.reconcile_command_echo",
+        lambda receipt, **kwargs: {"confirmed": False, "reason": "reply_not_visible"},
+    )
+    monkeypatch.setenv("WECOM_GUI_RECONCILIATION_POLL_SECONDS", "0")
+    monkeypatch.setenv("WECOM_GUI_RECONCILIATION_MAX_ATTEMPTS", "2")
+
+    assert edge_worker.reconcile_pending_command_echoes() == {"checked": 1, "confirmed": 0}
+    assert edge_worker.reconcile_pending_command_echoes() == {"checked": 1, "confirmed": 0}
+    assert edge_worker.reconcile_pending_command_echoes() == {"checked": 0, "confirmed": 0}
+
+
+
+
 def test_command_refuses_same_name_when_current_sidebar_uid_cannot_be_verified(monkeypatch):
     command = _command()
     command["expected_latest_message_id"] = "unused"
@@ -120,6 +391,32 @@ def test_command_refuses_same_name_when_current_sidebar_uid_cannot_be_verified(m
     result = edge_worker.execute_command(FakeChannel(), command)
 
     assert result == {"status": "precondition_failed", "reason": "opened_conversation_mismatch"}
+
+
+def test_command_waits_for_target_conversation_selection(monkeypatch):
+    command = _command()
+    row = {"title": "客户A", "external_user_id": "customer-1", "conversation_key": "uid:customer-1"}
+    selected_rows = iter([
+        {"title": "其他客户", "external_user_id": "customer-2"},
+        {"title": "客户A", "external_user_id": "customer-1"},
+    ])
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda target: target == row)
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row",
+        lambda limit=30: next(selected_rows),
+    )
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.send_input_ready", lambda: {"ok": True, "input": {"valueLength": 0}})
+    reads = iter([
+        {"messages": [{"role": "用户", "text": "最新问题"}]},
+        {"messages": [{"role": "用户", "text": "最新问题"}, {"role": "客服", "text": command["text"]}]},
+    ])
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda **kwargs: next(reads))
+    monkeypatch.setattr("cli_anything.wecom_gui.core.reply.send_message", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr("cli_anything.wecom_gui.core.edge_worker.time.sleep", lambda _: None)
+
+    result = edge_worker.execute_command(FakeChannel(), command)
+
+    assert result == {"status": "succeeded", "verification": "reply_visible"}
 
 
 def test_duplicate_command_is_durable_but_never_becomes_executable_twice(monkeypatch, tmp_path):
@@ -146,6 +443,7 @@ def test_expired_command_never_touches_gui(monkeypatch):
 
 def test_send_without_visible_confirmation_needs_reconciliation(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
+    monkeypatch.setenv("WECOM_GUI_SEND_ECHO_ATTEMPTS", "1")
     command = _command()
     row = {"title": "客户A", "external_user_id": "customer-1", "conversation_key": "uid:customer-1"}
     customer_message = {"role": "用户", "text": "物流到哪里了"}
@@ -158,7 +456,7 @@ def test_send_without_visible_confirmation_needs_reconciliation(monkeypatch, tmp
         "cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row",
         lambda limit=30: {"title": "客户A", "external_user_id": "customer-1"},
     )
-    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.ensure_input_ready", lambda: {"ok": True})
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.send_input_ready", lambda: {"ok": True, "input": {"valueLength": 0}})
     reads = iter([
         {"hash": "before", "messages": [customer_message]},
         {"hash": "after", "messages": [customer_message]},
@@ -177,23 +475,47 @@ def test_send_without_visible_confirmation_needs_reconciliation(monkeypatch, tmp
     assert result == {"status": "needs_reconciliation", "reason": "reply_not_visible_after_send"}
 
 
-def test_command_without_expected_message_identifiers_is_precondition_failure(monkeypatch):
+def test_command_with_different_message_identifiers_still_sends_after_conversation_check(monkeypatch):
     command = _command()
     monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda row: None)
     monkeypatch.setattr(
         "cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row",
         lambda limit=30: {"title": "客户A", "external_user_id": "customer-1"},
     )
-    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.ensure_input_ready", lambda: {"ok": True})
+    monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.send_input_ready", lambda: {"ok": True, "input": {"valueLength": 0}})
+    reads = iter([
+        {"messages": [{"role": "用户", "text": "最新问题"}]},
+        {"messages": [{"role": "用户", "text": "最新问题"}, {"role": "客服", "text": command["text"]}]},
+    ])
+    monkeypatch.setattr("cli_anything.wecom_gui.core.chat.read_current", lambda **kwargs: next(reads))
+    monkeypatch.setattr("cli_anything.wecom_gui.core.reply.send_message", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr("cli_anything.wecom_gui.core.edge_worker.time.sleep", lambda _: None)
+
+    result = edge_worker.execute_command(FakeChannel(), command)
+
+    assert result == {"status": "succeeded", "verification": "reply_visible"}
+
+
+def test_command_never_overwrites_an_existing_chat_draft(monkeypatch):
+    command = _command()
+    monkeypatch.setattr("cli_anything.wecom_gui.core.inbox.open_row", lambda row: None)
     monkeypatch.setattr(
-        "cli_anything.wecom_gui.core.chat.read_current",
-        lambda **kwargs: {"messages": [{"role": "用户", "text": "最新问题"}]},
+        "cli_anything.wecom_gui.utils.macos_backend.selected_conversation_row",
+        lambda limit=30: {"title": "客户A", "external_user_id": "customer-1"},
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.utils.macos_backend.send_input_ready",
+        lambda: {"ok": True, "input": {"valueLength": 12}},
+    )
+    monkeypatch.setattr(
+        "cli_anything.wecom_gui.core.reply.send_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not overwrite draft")),
     )
     monkeypatch.setattr("cli_anything.wecom_gui.core.edge_worker.time.sleep", lambda _: None)
 
     result = edge_worker.execute_command(FakeChannel(), command)
 
-    assert result == {"status": "precondition_failed", "reason": "expected_latest_message_mismatch"}
+    assert result == {"status": "precondition_failed", "reason": "chat_input_not_empty"}
 
 
 def test_command_result_is_persisted_before_report_and_retries(monkeypatch, tmp_path):

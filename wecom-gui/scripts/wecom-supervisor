@@ -1,0 +1,14 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+ENV_FILE="${WECOM_CHANNEL_ENV:-$ROOT_DIR/.env.local}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  source "$ENV_FILE"
+  set +a
+fi
+PYTHON_BIN="${WECOM_GUI_PYTHON:-/Users/uyuc/miniconda3/bin/python}"
+export PYTHONPATH="${WECOM_GUI_PYTHONPATH:-}"
+cd "$ROOT_DIR"
+exec "$PYTHON_BIN" -m cli_anything.wecom_gui --json supervisor "$@"

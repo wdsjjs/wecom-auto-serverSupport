@@ -17,7 +17,7 @@ import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from cli_anything.wecom_gui.core import chat, fixed_agent, handoff, inbox, llm, reply, state, watcher, worker, welcome
+from cli_anything.wecom_gui.core import chat, fixed_agent, handoff, inbox, llm, reply, runtime_reporting, state, watcher, worker, welcome
 from cli_anything.wecom_gui.core.text import clean_customer_reply_text, clean_history_message_text
 from cli_anything.wecom_gui.utils import macos_backend
 
@@ -1913,6 +1913,16 @@ def _read_one_pending(
             if agent_mode == SUPPLEMENT_REPLY_SOURCE
             else None,
         )
+        runtime_reporting.publish(
+            "ai_reply",
+            status="running",
+            phase="generating_draft",
+            conversation_key=str(job.get("conversation_key") or ""),
+            conversation_label=title,
+            direction="inbound",
+            rationale="confirmed_customer_turn",
+            metrics={"history_messages": len(current.get("messages") or [])},
+        )
         customer_uid = visible_uid
         if not customer_uid:
             binding = state.lookup_wecom_customer(customer_name=title) or {}
@@ -2193,6 +2203,13 @@ def _send_one_ready(*, last: int, mode: str) -> dict:
     supplement_trace_id = str(context.get("supplement_trace_id") or "")
     supplement_customer_key = str(context.get("supplement_customer_key") or job.get("conversation_key") or "")
     try:
+        runtime_reporting.publish(
+            "ai_reply",
+            status="running",
+            phase="sending_reply",
+            conversation_key=str(job.get("conversation_key") or ""),
+            conversation_label=title,
+        )
         with state.gui_lock():
             inbox.open_row(job)
             time.sleep(0.25)
@@ -2722,6 +2739,12 @@ def agent_loop(
         f"最多并发AI={max_drafts}，文本池={text_workers}，图片池={image_workers}"
     )
     _normalize_wecom_window()
+    runtime_reporting.publish(
+        "ai_reply",
+        status="running",
+        phase="starting",
+        metrics={"mode": mode, "max_drafts": max_drafts, "inbox_limit": inbox_limit},
+    )
     with ThreadPoolExecutor(max_workers=max_drafts) as executor:
         while True:
             iterations += 1
@@ -2729,6 +2752,7 @@ def agent_loop(
             state.reset_stale_active(older_than_seconds=_stale_active_seconds())
 
             if now >= next_scan_at:
+                runtime_reporting.publish("ai_reply", status="running", phase="scanning_inbox")
                 effective_scan_pages = max(1, scan_pages if now >= next_deep_scan_at else 1)
                 current_result: dict = {"ok": False, "enqueued": 0, "reason": "not_run"}
                 scan = {
@@ -2770,6 +2794,12 @@ def agent_loop(
                 last_scan = scan
                 scanned += scan["enqueued"] + current_result.get("enqueued", 0)
                 _log_scan(scan)
+                runtime_reporting.publish(
+                    "ai_reply",
+                    status="waiting" if not scan.get("enqueued") else "running",
+                    phase="waiting_for_customer" if not scan.get("enqueued") else "reading_customer_context",
+                    metrics={"queued": int(scan.get("enqueued") or 0)},
+                )
                 next_scan_at = time.time() + scan_interval
 
             if not read_only_mode:

@@ -19,8 +19,10 @@ from cli_anything.wecom_gui.core import inbox as inbox_core
 from cli_anything.wecom_gui.core import llm as llm_core
 from cli_anything.wecom_gui.core import reply as reply_core
 from cli_anything.wecom_gui.core import review_server
+from cli_anything.wecom_gui.core import runtime_state as runtime_state_core
 from cli_anything.wecom_gui.core import sidebar_server
 from cli_anything.wecom_gui.core import state as state_core
+from cli_anything.wecom_gui.core import supervisor as supervisor_core
 from cli_anything.wecom_gui.core import watcher
 from cli_anything.wecom_gui.core import worker as worker_core
 from cli_anything.wecom_gui.utils import output
@@ -369,6 +371,45 @@ def edge_channel_group() -> None:
     """Run the unattended central-channel client on this Mac."""
 
 
+@cli.group("supervisor")
+def supervisor_group() -> None:
+    """Manage the controlled local edge-channel session."""
+
+
+@supervisor_group.command("status")
+def supervisor_status() -> None:
+    _emit_or_fail(supervisor_core.status)
+
+
+@supervisor_group.command("start")
+@click.argument("service", type=click.Choice(["edge", "all"]))
+def supervisor_start(service: str) -> None:
+    _emit_or_fail(supervisor_core.action, service, "start")
+
+
+@supervisor_group.command("stop")
+@click.argument("service", type=click.Choice(["edge", "all"]))
+def supervisor_stop(service: str) -> None:
+    _emit_or_fail(supervisor_core.action, service, "stop")
+
+
+@supervisor_group.command("restart")
+@click.argument("service", type=click.Choice(["edge", "all"]))
+def supervisor_restart(service: str) -> None:
+    _emit_or_fail(supervisor_core.action, service, "restart")
+
+
+@cli.group("runtime")
+def runtime_group() -> None:
+    """Read the redacted local runtime state for the native desktop client."""
+
+
+@runtime_group.command("status")
+@click.option("--limit", default=20, show_default=True, type=click.IntRange(min=1, max=20))
+def runtime_status(limit: int) -> None:
+    _emit_or_fail(runtime_state_core.snapshot, limit=limit)
+
+
 @edge_channel_group.command("status")
 def edge_channel_status() -> None:
     """Show the local durable spool; this never contacts the central service."""
@@ -379,7 +420,7 @@ def edge_channel_status() -> None:
 @click.option("--once", is_flag=True, help="Run one capture/upload/pull/send tick and exit.")
 @click.option("--poll", default=1.0, show_default=True, type=click.FloatRange(min=0.1))
 @click.option("--inbox-limit", default=30, show_default=True, type=click.IntRange(min=1, max=100))
-@click.option("--last", default=20, show_default=True, type=click.IntRange(min=1, max=100))
+@click.option("--last", default=100, show_default=True, type=click.IntRange(min=1, max=100))
 def edge_channel_run(once: bool, poll: float, inbox_limit: int, last: int) -> None:
     """Capture external direct chats and execute centrally issued commands."""
     if once:

@@ -110,6 +110,26 @@ Logs:
 ./scripts/wecom-agent logs
 ```
 
+## Native Mac Agent
+
+Install the AppKit menu-bar client to `~/Applications`:
+
+```bash
+./scripts/install-desktop-client
+```
+
+The client has no Dock icon and only reads redacted local operational state. It
+can start, stop, or restart the controlled edge channel through
+`wecom-supervisor`; the AI reply is generated in the central service and is
+not a Mac process. It never provides a direct customer read/send action.
+Installation does not start the edge channel. Existing channel commands remain
+compatible and now delegate to the same supervisor:
+
+```bash
+./scripts/wecom-channel status
+./scripts/wecom-supervisor start edge
+```
+
 One-time foreground dry run:
 
 ```bash
@@ -199,6 +219,17 @@ not bind the Mac to a WeCom account; tenant and channel-account isolation must
 be introduced before multi-tenant use.
 The client records command ids before GUI execution and reports an unconfirmed
 post-click state as `needs_reconciliation`; it never blindly sends it again.
+For text commands, an `AXConfirmAction` success is only a submit signal: the
+client waits for a newly visible right-side staff bubble before reporting
+`succeeded`. It does not use a global clipboard/Return fallback for central
+commands, so a stale input cannot be appended and sent to the wrong chat.
+
+After the central channel has been deployed with `message.direction` support,
+set `WECOM_GUI_CAPTURE_OUTBOUND=1` and restart the edge client to upload new
+manual staff bubbles from the currently open conversation. It defaults to `0`
+to prevent an older central service from treating staff messages as inbound
+customer messages. The first observation establishes a local baseline; it does
+not backfill the visible history.
 
 SQLite schema notes:
 

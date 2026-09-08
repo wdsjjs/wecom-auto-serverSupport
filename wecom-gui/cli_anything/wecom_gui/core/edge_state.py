@@ -73,6 +73,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             result_status TEXT NOT NULL DEFAULT '',
             result_attempts INTEGER NOT NULL DEFAULT 0,
             result_next_attempt_at REAL NOT NULL DEFAULT 0,
+            reconciliation_next_attempt_at REAL NOT NULL DEFAULT 0,
+            reconciliation_attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT NOT NULL DEFAULT '',
             received_at REAL NOT NULL,
             executed_at REAL,
@@ -84,6 +86,51 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_edge_command_results_pending
         ON edge_command_receipts(result_status, result_next_attempt_at, received_at)
+        """
+    )
+    _ensure_column(conn, "edge_command_receipts", "reconciliation_next_attempt_at", "REAL NOT NULL DEFAULT 0")
+    _ensure_column(conn, "edge_command_receipts", "reconciliation_attempts", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS edge_chat_observations (
+            conversation_key TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            observed_at REAL NOT NULL,
+            last_observed_at REAL NOT NULL,
+            capture_status TEXT NOT NULL DEFAULT 'captured',
+            direction_confidence TEXT NOT NULL DEFAULT '',
+            direction_attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (conversation_key, fingerprint)
+        )
+        """
+    )
+    _ensure_column(conn, "edge_chat_observations", "last_observed_at", "REAL NOT NULL DEFAULT 0")
+    _ensure_column(conn, "edge_chat_observations", "capture_status", "TEXT NOT NULL DEFAULT 'captured'")
+    _ensure_column(conn, "edge_chat_observations", "direction_confidence", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "edge_chat_observations", "direction_attempts", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS edge_chat_observation_baselines (
+            conversation_key TEXT PRIMARY KEY,
+            initialized_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS edge_outbound_echo_suppressions (
+            command_id TEXT PRIMARY KEY,
+            conversation_key TEXT NOT NULL,
+            normalized_text TEXT NOT NULL,
+            expires_at REAL NOT NULL,
+            consumed_at REAL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_edge_outbound_echo_suppressions_due
+        ON edge_outbound_echo_suppressions(conversation_key, normalized_text, expires_at)
         """
     )
 
@@ -102,6 +149,12 @@ def _command_row(row: sqlite3.Row) -> dict:
     return item
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def enqueue_inbound(*, dedupe_key: str, payload: dict, media: list[dict]) -> tuple[bool, dict]:
     """Persist a captured inbound event before any network request.
 
@@ -109,14 +162,37 @@ def enqueue_inbound(*, dedupe_key: str, payload: dict, media: list[dict]) -> tup
     rather than making a new event id for the same visible customer message.
     """
     now = time.time()
+    client_event_id = str(payload.get("client_event_id") or uuid.uuid4())
+    complete_payload = {**payload, "client_event_id": client_event_id}
     with _connect() as conn:
         existing = conn.execute(
             "SELECT * FROM edge_inbound_events WHERE dedupe_key = ?", (dedupe_key,)
         ).fetchone()
         if existing is not None:
+            existing_payload = json.loads(existing["payload_json"])
+            existing_direction = str((existing_payload.get("message") or {}).get("direction") or "")
+            next_direction = str((complete_payload.get("message") or {}).get("direction") or "")
+            if existing_direction == "unknown" and next_direction in {"inbound", "outbound"}:
+                complete_payload["client_event_id"] = str(existing["client_event_id"])
+                conn.execute(
+                    """
+                    UPDATE edge_inbound_events
+                    SET payload_json = ?, media_json = ?, status = ?, attempts = 0,
+                        next_attempt_at = 0, last_error = '', delivered_at = NULL
+                    WHERE dedupe_key = ?
+                    """,
+                    (
+                        json.dumps(complete_payload, ensure_ascii=False),
+                        json.dumps(media, ensure_ascii=False),
+                        PENDING,
+                        dedupe_key,
+                    ),
+                )
+                updated = conn.execute(
+                    "SELECT * FROM edge_inbound_events WHERE dedupe_key = ?", (dedupe_key,)
+                ).fetchone()
+                return True, _event_row(updated)
             return False, _event_row(existing)
-        client_event_id = str(payload.get("client_event_id") or uuid.uuid4())
-        complete_payload = {**payload, "client_event_id": client_event_id}
         conn.execute(
             """
             INSERT INTO edge_inbound_events
@@ -254,6 +330,208 @@ def mark_command_result_reported(command_id: str) -> None:
                WHERE command_id = ?""",
             (RESULT_REPORTED, time.time(), command_id),
         )
+
+
+def due_reconciliation_checks(
+    limit: int = 3,
+    *,
+    max_attempts: int = 3,
+    now: float | None = None,
+) -> list[dict]:
+    """Return uncertain sends which can be verified without resending them."""
+    current = time.time() if now is None else now
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM edge_command_receipts
+            WHERE execution_status = 'needs_reconciliation'
+              AND result_status = ?
+              AND reconciliation_next_attempt_at <= ?
+              AND reconciliation_attempts < ?
+            ORDER BY executed_at ASC, received_at ASC LIMIT ?
+            """,
+            (RESULT_REPORTED, current, max(1, max_attempts), limit),
+        ).fetchall()
+    return [_command_row(row) for row in rows]
+
+
+def schedule_reconciliation_check(command_id: str, *, delay_seconds: float) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE edge_command_receipts
+            SET reconciliation_next_attempt_at = ?,
+                reconciliation_attempts = reconciliation_attempts + 1
+            WHERE command_id = ? AND execution_status = 'needs_reconciliation'
+            """,
+            (time.time() + max(0.0, delay_seconds), command_id),
+        )
+
+
+def record_visible_chat_observations(
+    conversation_key: str,
+    fingerprints: list[str],
+    *,
+    bootstrap_recent_count: int = 0,
+) -> list[str]:
+    """Return visible messages still awaiting a direction-safe capture.
+
+    The first observation establishes a baseline so history is never replayed.
+    Later observations remain ``pending_direction`` until the caller captures
+    them or explicitly ignores them. For a newly discovered unread chat, the
+    unread badge bounds the trailing messages that can be treated as new while
+    the visible history still establishes the baseline.
+    """
+    now = time.time()
+    unique = list(dict.fromkeys(item for item in fingerprints if item))
+    if not conversation_key:
+        return []
+    with _connect() as conn:
+        baseline = conn.execute(
+            "SELECT 1 FROM edge_chat_observation_baselines WHERE conversation_key = ?",
+            (conversation_key,),
+        ).fetchone()
+        bootstrap_count = min(max(0, int(bootstrap_recent_count)), len(unique))
+        bootstrap_start = len(unique) - bootstrap_count
+        for index, fingerprint in enumerate(unique):
+            if baseline is None:
+                capture_status = "pending_direction" if index >= bootstrap_start else "baseline"
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO edge_chat_observations
+                        (conversation_key, fingerprint, observed_at, last_observed_at, capture_status)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (conversation_key, fingerprint, now, now, capture_status),
+                )
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO edge_chat_observations
+                    (conversation_key, fingerprint, observed_at, last_observed_at, capture_status)
+                VALUES (?, ?, ?, ?, 'pending_direction')
+                """,
+                (conversation_key, fingerprint, now, now),
+            )
+            conn.execute(
+                """
+                UPDATE edge_chat_observations
+                SET last_observed_at = ?
+                WHERE conversation_key = ? AND fingerprint = ?
+                  AND capture_status = 'pending_direction'
+                """,
+                (now, conversation_key, fingerprint),
+            )
+        if baseline is None:
+            conn.execute(
+                """
+                INSERT INTO edge_chat_observation_baselines(conversation_key, initialized_at)
+                VALUES (?, ?)
+                """,
+                (conversation_key, now),
+            )
+            if not bootstrap_count:
+                return []
+        if not unique:
+            return []
+        placeholders = ", ".join("?" for _ in unique)
+        rows = conn.execute(
+            f"""
+            SELECT fingerprint FROM edge_chat_observations
+            WHERE conversation_key = ? AND capture_status = 'pending_direction'
+              AND fingerprint IN ({placeholders})
+            """,
+            (conversation_key, *unique),
+        ).fetchall()
+        return [str(row["fingerprint"]) for row in rows]
+
+
+def mark_chat_observation_pending_direction(
+    conversation_key: str,
+    fingerprint: str,
+    *,
+    confidence: str,
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE edge_chat_observations
+            SET direction_confidence = ?, direction_attempts = direction_attempts + 1,
+                last_observed_at = ?
+            WHERE conversation_key = ? AND fingerprint = ?
+              AND capture_status = 'pending_direction'
+            """,
+            (str(confidence)[:32], time.time(), conversation_key, fingerprint),
+        )
+
+
+def mark_chat_observation_captured(conversation_key: str, fingerprint: str, *, confidence: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE edge_chat_observations
+            SET capture_status = 'captured', direction_confidence = ?, last_observed_at = ?
+            WHERE conversation_key = ? AND fingerprint = ?
+              AND capture_status = 'pending_direction'
+            """,
+            (str(confidence)[:32], time.time(), conversation_key, fingerprint),
+        )
+
+
+def ignore_chat_observation(conversation_key: str, fingerprint: str, *, reason: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE edge_chat_observations
+            SET capture_status = ?, last_observed_at = ?
+            WHERE conversation_key = ? AND fingerprint = ?
+              AND capture_status = 'pending_direction'
+            """,
+            (f"ignored:{str(reason)[:64]}", time.time(), conversation_key, fingerprint),
+        )
+
+
+def register_outbound_echo_suppression(command_id: str, conversation_key: str, text: str, *, ttl_seconds: float = 30) -> None:
+    normalized = "".join(str(text).split())
+    if not command_id or not conversation_key or not normalized:
+        return
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO edge_outbound_echo_suppressions(command_id, conversation_key, normalized_text, expires_at, consumed_at)
+            VALUES (?, ?, ?, ?, NULL)
+            ON CONFLICT(command_id) DO UPDATE SET
+                conversation_key = excluded.conversation_key,
+                normalized_text = excluded.normalized_text,
+                expires_at = excluded.expires_at,
+                consumed_at = NULL
+            """,
+            (command_id, conversation_key, normalized, time.time() + max(1, ttl_seconds)),
+        )
+
+
+def consume_outbound_echo_suppression(conversation_key: str, text: str) -> bool:
+    normalized = "".join(str(text).split())
+    if not conversation_key or not normalized:
+        return False
+    now = time.time()
+    with _connect() as conn:
+        conn.execute("DELETE FROM edge_outbound_echo_suppressions WHERE expires_at < ?", (now,))
+        row = conn.execute(
+            """
+            SELECT command_id FROM edge_outbound_echo_suppressions
+            WHERE conversation_key = ? AND normalized_text = ? AND consumed_at IS NULL AND expires_at >= ?
+            ORDER BY expires_at ASC LIMIT 1
+            """,
+            (conversation_key, normalized, now),
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE edge_outbound_echo_suppressions SET consumed_at = ? WHERE command_id = ?",
+            (now, row["command_id"]),
+        )
+        return True
 
 
 def retry_command_result(command_id: str, error: str, *, delay_seconds: float) -> None:

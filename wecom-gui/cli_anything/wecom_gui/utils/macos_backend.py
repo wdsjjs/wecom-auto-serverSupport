@@ -109,7 +109,14 @@ def run_osascript(script: str, *, check: bool = True) -> str:
     args: list[str] = ["osascript"]
     for line in script.strip().splitlines():
         args.extend(["-e", line])
-    proc = subprocess.run(args, text=True, capture_output=True)
+    try:
+        timeout = float(os.environ.get("WECOM_GUI_OSASCRIPT_TIMEOUT", "8"))
+    except ValueError:
+        timeout = 8.0
+    try:
+        proc = subprocess.run(args, text=True, capture_output=True, timeout=max(1.0, timeout))
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("osascript timed out while reading the WeCom accessibility tree") from exc
     if check and proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "osascript failed")
     return proc.stdout.strip()
@@ -501,7 +508,7 @@ def _swift_ax_runner(script_path: Path) -> list[str]:
 def send_via_ax_text_input(text: str, *, submit: bool = True) -> dict:
     """Set the right-side chat input through AXUIElement and optionally submit."""
     command = "send" if submit else "stage"
-    ready_items = _swift_ax("input-ready")
+    ready_items = _swift_ax("send-ready")
     ready = ready_items[-1] if ready_items else {"ok": False, "error": "input_ready_unavailable"}
     _append_event(
         {
@@ -528,6 +535,17 @@ def send_via_ax_text_input(text: str, *, submit: bool = True) -> dict:
     result = items[-1]
     if not result.get("ok"):
         raise RuntimeError(f"AX text input send failed: {result}")
+    return result
+
+
+def send_input_ready(app_name: str | None = None) -> dict:
+    """Check the chat input without activating WeCom or opening its sidebar."""
+    chosen = resolve_app_name(app_name)
+    if not chosen:
+        raise RuntimeError("WeCom is not running or its app name differs. Start WeCom or set WECOM_GUI_APP_NAME.")
+    items = _swift_ax("send-ready")
+    result = items[-1] if items else {"ok": False, "error": "chat_input_not_found"}
+    _append_event({"type": "wecom_send_ready", "ok": bool(result.get("ok")), "error": result.get("error") or ""})
     return result
 
 
@@ -828,6 +846,13 @@ def selected_conversation_row(app_name: str | None = None, *, limit: int = 30) -
     if chosen:
         if os.environ.get("WECOM_GUI_ACTIVATE_BEFORE_SCAN", "0") == "1":
             activate_app(chosen)
+        # The full row scan exposes `selected` reliably on current WeCom builds,
+        # while the dedicated selected-row query can time out independently.
+        for row in _ax_conversation_rows(limit):
+            if str(row.get("title") or "").strip() in NAVIGATION_ROW_TITLES:
+                continue
+            if row.get("selected"):
+                return row
         items = _swift_ax("selected-row")
         for item in items:
             if item.get("ok") is False:

@@ -2,20 +2,17 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GUI_DIR="$ROOT_DIR/wecom-gui"
+SUPERVISOR="$GUI_DIR/scripts/wecom-supervisor"
+APP="$HOME/Applications/UDA WeCom Agent.app"
 
-cd "$ROOT_DIR/wecom-gui"
-./scripts/wecom-agent start
-if [[ "${WECOM_AGENT_MODE:-review}" == "review" ]]; then
-  ./scripts/wecom-agent review-start
+[[ -x "$SUPERVISOR" ]] || { echo "ERROR: missing supervisor: $SUPERVISOR" >&2; exit 1; }
+
+if [[ ! -x "$APP/Contents/MacOS/UDAWeComAgent" ]]; then
+  "$GUI_DIR/scripts/install-desktop-client"
+else
+  open "$APP"
 fi
 
-echo
-echo "已启动。日志命令："
-echo "tail -f \"$ROOT_DIR/wecom-gui/.codex-run/wecom-agent.log\""
-if [[ "${WECOM_AGENT_MODE:-review}" == "review" ]]; then
-  echo
-  echo "审核页日志："
-  echo "tail -f \"$ROOT_DIR/wecom-gui/.codex-run/wecom-review.log\""
-fi
-echo
-read -r -p "按回车关闭窗口..."
+echo "UDA WeCom Agent 已启动。"
+echo "边缘通道默认不启动，请在 Dock 客户端菜单中手动启动。"
