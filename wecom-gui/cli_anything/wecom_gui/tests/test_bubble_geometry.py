@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 import shutil
@@ -89,7 +90,7 @@ def native_helper(tmp_path_factory):
         pytest.skip("Native bubble geometry requires the macOS Swift SDK")
     binary = tmp_path_factory.mktemp("native-bubble-tests") / "ax_wecom"
     source = Path(macos_backend.__file__).resolve().parents[1] / "scripts" / "ax_wecom.swift"
-    subprocess.run(["swiftc", str(source), "-o", str(binary)], check=True, capture_output=True, timeout=90)
+    subprocess.run(["swiftc", "-O", str(source), "-o", str(binary)], check=True, capture_output=True, timeout=90)
     return binary
 
 
@@ -107,6 +108,73 @@ def write_png(path, width, height, rectangles):
     data += chunk(b"IHDR", struct.pack("!2I5B", width, height, 8, 2, 0, 0, 0))
     data += chunk(b"IDAT", zlib.compress(b"".join(b"\0" + row for row in rows)))
     path.write_bytes(data + chunk(b"IEND", b""))
+
+
+def test_native_snapshot_preserves_body_timestamp_media_and_legacy_identity(native_helper, tmp_path):
+    def node(role, texts=(), *, depth=2, x=326, y=140, width=150, height=22, has_rect=True):
+        return {"role": role, "subrole": "", "texts": list(texts), "depth": depth,
+                "x": x, "y": y, "width": width, "height": height,
+                "hasRect": has_rect, "selected": False}
+
+    row = node("AXRow", depth=0, x=300, y=100, width=700, height=100)
+    viewport = {"x": 300, "y": 100, "width": 700, "height": 500}
+    fixture = tmp_path / "chat.json"
+    fixture.write_text(json.dumps({"viewport": viewport, "rows": [
+        [row, node("AXStaticText", ["10:00"]), node("AXTextArea", ["  13:38  "])],
+        [row, node("AXTextArea", ["hello"], width=0, has_rect=False)],
+        [row, node("AXImage", ["图片"], width=160, height=160)],
+        [row],
+        [row, node("AXTextArea", ["hello"]), node("AXTextArea", ["hello"], depth=9)],
+    ]}))
+    completed = subprocess.run([str(native_helper), "chat-fixture", str(fixture)],
+                               check=True, capture_output=True, text=True, timeout=10)
+    rows = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert len(rows) == 5
+    assert rows[0]["texts"] == ["10:00", "  13:38  "]
+    assert rows[0]["messageTexts"] == ["13:38"]
+    assert rows[0]["timestampText"] == "10:00"
+    assert rows[0]["bubbleTextSupported"] is True
+    assert rows[0]["chatViewport"] == viewport
+    assert rows[1]["messageTexts"] == ["hello"]
+    assert rows[1]["bubbleWidth"] == 0
+    assert rows[2]["mediaElements"][0]["mediaType"] == "image"
+    assert rows[2]["bubbleTextSupported"] is False
+    assert rows[2]["messageTexts"] == []
+    assert rows[3]["texts"] == rows[3]["messageTexts"] == []
+    assert rows[4]["texts"] == ["hello"]
+    assert rows[4]["messageTexts"] == ["hello", "hello"]
+    assert rows[4]["bubbleTextSupported"] is False
+
+
+@pytest.mark.parametrize("change,expected", [
+    ("offscreen_layout", True), ("visible_layout", False), ("offscreen_text", False),
+    ("enters_viewport", False), ("leaves_viewport", False), ("new_message", False),
+])
+def test_native_snapshot_validation_ignores_only_offscreen_body_geometry(native_helper, tmp_path, change, expected):
+    row = {"role": "AXRow", "subrole": "", "texts": [], "depth": 0,
+           "x": 300, "y": 100, "width": 700, "height": 100, "hasRect": True, "selected": False}
+    body = {**row, "role": "AXTextArea", "texts": ["hello"], "depth": 2,
+            "x": 326, "y": 140, "width": 150, "height": 22}
+    before = [[row, body], [row, {**body, "texts": ["previous"], "y": -800}]]
+    after = copy.deepcopy(before)
+    if change == "offscreen_layout":
+        after[1][1].update(x=300, y=-763, width=0, height=14)
+    elif change == "visible_layout":
+        after[0][1]["height"] = 23
+    elif change == "offscreen_text":
+        after[1][1]["texts"] = ["updated"]
+    elif change == "enters_viewport":
+        after[1][1]["y"] = 180
+    elif change == "leaves_viewport":
+        after[0][1]["y"] = -800
+    elif change == "new_message":
+        after.append(copy.deepcopy(after[0]))
+    fixture = tmp_path / "validation.json"
+    fixture.write_text(json.dumps({"rows": before, "afterRows": after,
+                                   "viewport": {"x": 300, "y": 100, "width": 700, "height": 500}}))
+    completed = subprocess.run([str(native_helper), "chat-fixture", str(fixture)],
+                               check=True, capture_output=True, text=True, timeout=10)
+    assert json.loads(completed.stdout)["snapshotsMatch"] is expected
 
 
 @pytest.mark.parametrize("scale,origin", [(1, (0, 0)), (2, (-1100, 33))])

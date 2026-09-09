@@ -4,6 +4,18 @@ import AppKit
 import ScreenCaptureKit
 import ImageIO
 
+let profileChatRead = ProcessInfo.processInfo.environment["WECOM_GUI_AX_PROFILE"] == "1"
+
+func measured<T>(_ stage: String, _ operation: () -> T) -> T {
+    guard profileChatRead else { return operation() }
+    let start = ProcessInfo.processInfo.systemUptime
+    defer {
+        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        fputs(String(format: "ax-profile %@: %.3fs\n", stage, elapsed), stderr)
+    }
+    return operation()
+}
+
 func jsonLine(_ object: [String: Any]) {
     if let data = try? JSONSerialization.data(withJSONObject: object, options: []),
        let string = String(data: data, encoding: .utf8) {
@@ -186,15 +198,17 @@ func collectRows(_ element: AXUIElement, rows: inout [AXUIElement], maxDepth: In
     }
 }
 
-func collectTables(_ element: AXUIElement, tables: inout [AXUIElement], maxDepth: Int = 12, depth: Int = 0) {
+func collectTables(_ element: AXUIElement, tables: inout [AXUIElement], maxDepth: Int = 12, depth: Int = 0,
+                   descendIntoTables: Bool = true) {
     if depth > maxDepth {
         return
     }
     if role(element) == "AXTable" {
         tables.append(element)
+        if !descendIntoTables { return }
     }
     for child in children(element) {
-        collectTables(child, tables: &tables, maxDepth: maxDepth, depth: depth + 1)
+        collectTables(child, tables: &tables, maxDepth: maxDepth, depth: depth + 1, descendIntoTables: descendIntoTables)
     }
 }
 
@@ -354,6 +368,49 @@ func collectTextElements(_ element: AXUIElement, out: inout [[String: Any]], max
     }
 }
 
+func mediaPayload(elementRole: String, elementSubrole: String, values: [String], rect: [String: Double]) -> [String: Any]? {
+    let width = rect["width", default: 0]
+    let height = rect["height", default: 0]
+    let loweredValues = values.map { $0.lowercased() }
+    let looksLikeNamedImage = values.contains { value in
+        value.contains("图片") || value.lowercased().contains("image") || value.lowercased().contains("photo")
+    }
+    let looksLikeAnimatedMedia = loweredValues.contains { value in
+        value.contains("动画表情")
+            || value.contains("表情")
+            || value.contains("贴纸")
+            || value.contains("动图")
+            || value.contains("sticker")
+            || value.contains("emoji")
+            || value.contains("gif")
+    }
+    let roleLooksLikeMedia = elementRole == "AXImage"
+        || elementRole == "AXImageView"
+        || elementSubrole.lowercased().contains("image")
+        || looksLikeNamedImage
+        || looksLikeAnimatedMedia
+        || ((elementRole == "AXGroup" || elementRole == "AXButton") && values.isEmpty && width >= 48 && height >= 48)
+    if roleLooksLikeMedia
+        && width >= 32
+        && height >= 32
+        && width <= 640
+        && height <= 640 {
+        let mediaType = looksLikeAnimatedMedia ? "animated_sticker" : "image"
+        return [
+            "role": elementRole,
+            "subrole": elementSubrole,
+            "mediaType": mediaType,
+            "skipCapture": looksLikeAnimatedMedia,
+            "texts": values,
+            "x": rect["x", default: 0],
+            "y": rect["y", default: 0],
+            "width": width,
+            "height": height
+        ]
+    }
+    return nil
+}
+
 func collectMediaElements(_ element: AXUIElement, out: inout [[String: Any]], maxDepth: Int = 10, depth: Int = 0) {
     if depth > maxDepth {
         return
@@ -361,58 +418,97 @@ func collectMediaElements(_ element: AXUIElement, out: inout [[String: Any]], ma
     let elementRole = role(element)
     let elementSubrole = subrole(element)
     let values = textValues(element).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-    if let rect = rectPayload(element) {
-        let width = rect["width", default: 0]
-        let height = rect["height", default: 0]
-        let loweredValues = values.map { $0.lowercased() }
-        let looksLikeNamedImage = values.contains { value in
-            value.contains("图片") || value.lowercased().contains("image") || value.lowercased().contains("photo")
-        }
-        let looksLikeAnimatedMedia = loweredValues.contains { value in
-            value.contains("动画表情")
-                || value.contains("表情")
-                || value.contains("贴纸")
-                || value.contains("动图")
-                || value.contains("sticker")
-                || value.contains("emoji")
-                || value.contains("gif")
-        }
-        let roleLooksLikeMedia = elementRole == "AXImage"
-            || elementRole == "AXImageView"
-            || elementSubrole.lowercased().contains("image")
-            || looksLikeNamedImage
-            || looksLikeAnimatedMedia
-            || ((elementRole == "AXGroup" || elementRole == "AXButton") && values.isEmpty && width >= 48 && height >= 48)
-        if roleLooksLikeMedia
-            && width >= 32
-            && height >= 32
-            && width <= 640
-            && height <= 640 {
-            let mediaType = looksLikeAnimatedMedia ? "animated_sticker" : "image"
-            out.append([
-                "role": elementRole,
-                "subrole": elementSubrole,
-                "mediaType": mediaType,
-                "skipCapture": looksLikeAnimatedMedia,
-                "texts": values,
-                "x": rect["x", default: 0],
-                "y": rect["y", default: 0],
-                "width": width,
-                "height": height
-            ])
-        }
+    if let rect = rectPayload(element),
+       let media = mediaPayload(elementRole: elementRole, elementSubrole: elementSubrole, values: values, rect: rect) {
+        out.append(media)
     }
     for child in children(element) {
         collectMediaElements(child, out: &out, maxDepth: maxDepth, depth: depth + 1)
     }
 }
 
-func chatPayload(_ row: AXUIElement, index: Int) -> [String: Any] {
-    var payload = rowPayload(row, index: index)
+struct ChatNodeSnapshot: Codable {
+    let role: String
+    let subrole: String
+    let texts: [String]
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+    let hasRect: Bool
+    let selected: Bool
+    let depth: Int
+
+    var rect: [String: Double] { ["x": x, "y": y, "width": width, "height": height] }
+    var trimmedTexts: [String] {
+        texts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    }
+}
+
+func readChatNodes(_ row: AXUIElement) -> [ChatNodeSnapshot] {
+    // Read each node once per snapshot; the post-capture validation takes a fresh snapshot.
+    let attributes = [kAXRoleAttribute, kAXSubroleAttribute, kAXValueAttribute, kAXTitleAttribute,
+                      kAXDescriptionAttribute, kAXPositionAttribute, kAXSizeAttribute,
+                      kAXSelectedAttribute, kAXChildrenAttribute]
+    var nodes: [ChatNodeSnapshot] = []
+    func walk(_ element: AXUIElement, _ depth: Int) {
+        guard depth <= 10 else { return }
+        var copied: CFArray?
+        let result = AXUIElementCopyMultipleAttributeValues(element, attributes as CFArray, [], &copied)
+        var values = copied as? [Any] ?? []
+        if result != .success || values.count != attributes.count {
+            values = attributes.map { attribute -> Any in
+                var value: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+                      let value = value else { return NSNull() }
+                return value
+            }
+        }
+        var texts: [String] = []
+        for value in values[2...4] {
+            let text = (value as? String) ?? (value as? NSAttributedString)?.string ?? ""
+            if !text.isEmpty && !texts.contains(text) { texts.append(text) }
+        }
+        var point = CGPoint.zero
+        var size = CGSize.zero
+        let positionValue = values[5] as CFTypeRef
+        let sizeValue = values[6] as CFTypeRef
+        let hasPosition = CFGetTypeID(positionValue) == AXValueGetTypeID()
+            && AXValueGetValue(positionValue as! AXValue, .cgPoint, &point)
+        let hasSize = CFGetTypeID(sizeValue) == AXValueGetTypeID()
+            && AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+        nodes.append(ChatNodeSnapshot(role: values[0] as? String ?? "", subrole: values[1] as? String ?? "",
+            texts: texts, x: Double(point.x), y: Double(point.y), width: Double(size.width), height: Double(size.height),
+            hasRect: hasPosition && hasSize, selected: values[7] as? Bool ?? false, depth: depth))
+        for child in values[8] as? [AXUIElement] ?? [] { walk(child, depth + 1) }
+    }
+    walk(row, 0)
+    return nodes
+}
+
+func chatPayload(_ nodes: [ChatNodeSnapshot], index: Int, viewport: [String: Double]?) -> [String: Any] {
+    guard let row = nodes.first else { return [:] }
+    var texts: [String] = []
+    for node in nodes where node.depth <= 8 {
+        for text in node.texts where !texts.contains(text) { texts.append(text) }
+    }
+    var payload: [String: Any] = ["index": index, "texts": texts, "selected": row.selected,
+                                 "x": row.x, "y": row.y, "width": row.width, "height": row.height]
     var textElements: [[String: Any]] = []
-    collectTextElements(row, out: &textElements)
     var mediaElements: [[String: Any]] = []
-    collectMediaElements(row, out: &mediaElements)
+    for node in nodes {
+        let values = node.trimmedTexts
+        if !values.isEmpty && ["AXTextArea", "AXTextField", "AXStaticText"].contains(node.role) {
+            var text: [String: Any] = node.rect
+            text["role"] = node.role
+            text["texts"] = values
+            textElements.append(text)
+        }
+        if node.hasRect, let media = mediaPayload(elementRole: node.role, elementSubrole: node.subrole,
+                                                 values: values, rect: node.rect) {
+            mediaElements.append(media)
+        }
+    }
     let messageElements = textElements.filter { item in
         let elementRole = item["role"] as? String ?? ""
         guard elementRole == "AXTextArea" || elementRole == "AXTextField" else { return false }
@@ -432,7 +528,7 @@ func chatPayload(_ row: AXUIElement, index: Int) -> [String: Any] {
     payload["bubbleTextSupported"] = messageElements.count == 1 && mediaElements.isEmpty
     payload["timestampText"] = textElements.filter { $0["role"] as? String == "AXStaticText" }
         .flatMap { $0["texts"] as? [String] ?? [] }.first(where: isLikelyTimeText) ?? ""
-    if let viewport = ancestorRect(row, matchingRole: "AXScrollArea") {
+    if let viewport = viewport {
         payload["chatViewport"] = viewport
     }
     if let bubble = messageElements.max(by: {
@@ -458,6 +554,10 @@ func chatPayload(_ row: AXUIElement, index: Int) -> [String: Any] {
         }
     }
     return payload
+}
+
+func chatPayload(_ row: AXUIElement, index: Int, viewport: [String: Double]?) -> [String: Any] {
+    chatPayload(readChatNodes(row), index: index, viewport: viewport)
 }
 
 func ancestorRect(_ element: AXUIElement, matchingRole: String) -> [String: Double]? {
@@ -584,6 +684,26 @@ func waitForCapture<Value>(_ result: CaptureResult<Value>, until deadline: Date)
     return result.get()
 }
 
+func hasVisibleTextBody(_ item: [String: Any]) -> Bool {
+    guard let viewport = item["chatViewport"] as? [String: Double] else { return false }
+    let body = bodyRect(item)
+    return body.width > 0 && body.height > 0 && cgRect(viewport).contains(body)
+}
+
+func chatSnapshotsMatch(_ before: [[String: Any]], _ after: [[String: Any]]) -> Bool {
+    func comparable(_ rows: [[String: Any]]) -> [[String: Any]] {
+        rows.map { item in
+            var row = item
+            // Offscreen AX text rectangles can be relaid out during capture and cannot establish direction.
+            if !hasVisibleTextBody(item) {
+                for key in ["bubbleX", "bubbleY", "bubbleWidth", "bubbleHeight"] { row.removeValue(forKey: key) }
+            }
+            return row
+        }
+    }
+    return NSDictionary(dictionary: ["rows": comparable(before)]).isEqual(to: ["rows": comparable(after)])
+}
+
 func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, window: AXUIElement?,
                             table: AXUIElement?, selected: AXUIElement?) -> [[String: Any]] {
     func unverified(_ reason: String) -> [[String: Any]] {
@@ -597,11 +717,7 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
     guard CGPreflightScreenCaptureAccess() else { return unverified("screen_capture_permission_required") }
     guard let window = window, let windowPayload = rectPayload(window) else { return unverified("window_unavailable") }
     let windowRect = cgRect(windowPayload)
-    guard payloads.contains(where: { item in
-        guard let v = item["chatViewport"] as? [String: Double] else { return false }
-        let body = bodyRect(item)
-        return body.width > 0 && body.height > 0 && cgRect(v).contains(body)
-    }) else { return unverified("no_visible_text_bubbles") }
+    guard payloads.contains(where: hasVisibleTextBody) else { return unverified("no_visible_text_bubbles") }
     let selectedBefore = selected.map { collectText($0) } ?? []
     let deadline = Date().addingTimeInterval(2)
     let contentResult = CaptureResult<Result<SCShareableContent, Error>>()
@@ -609,7 +725,8 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
         if let content = content { contentResult.set(.success(content)) }
         else { contentResult.set(.failure(error ?? NSError(domain: "ScreenCaptureKit", code: -1))) }
     }
-    guard let result = waitForCapture(contentResult, until: deadline), case .success(let content) = result else {
+    guard let result = measured("enumerate_capture_windows", { waitForCapture(contentResult, until: deadline) }),
+          case .success(let content) = result else {
         return unverified("window_enumeration_failed_or_timed_out")
     }
     var pid: pid_t = 0
@@ -634,15 +751,35 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
         if let image = image { imageResult.set(.success(image)) }
         else { imageResult.set(.failure(error ?? NSError(domain: "ScreenCaptureKit", code: -1))) }
     }
-    guard let captured = waitForCapture(imageResult, until: deadline), case .success(let image) = captured else {
+    guard let captured = measured("capture_window", { waitForCapture(imageResult, until: deadline) }),
+          case .success(let image) = captured else {
         return unverified("capture_failed_or_timed_out")
     }
     let after = table.map { children($0).filter { role($0) == "AXRow" } } ?? []
-    let afterPayloads = after.enumerated().map { chatPayload($0.element, index: $0.offset + 1) }
+    let viewportAfter = table.flatMap { ancestorRect($0, matchingRole: "AXScrollArea") }
+    let afterPayloads = measured("revalidate_rows") {
+        after.enumerated().map { chatPayload($0.element, index: $0.offset + 1, viewport: viewportAfter) }
+    }
     let selectedAfter = selected.map { rowPayload($0, index: 0) } ?? [:]
     guard !selectedBefore.isEmpty, selectedBefore == selectedAfter["texts"] as? [String],
           selectedAfter["selected"] as? Bool == true, rectPayload(window) == windowPayload,
-          NSDictionary(dictionary: ["rows": payloads]).isEqual(to: ["rows": afterPayloads]) else {
+          chatSnapshotsMatch(payloads, afterPayloads) else {
+        if profileChatRead {
+            let fields = Set(zip(payloads, afterPayloads).flatMap { before, after in
+                Set(before.keys).union(after.keys).filter { key in
+                    !NSDictionary(dictionary: ["value": before[key] ?? NSNull()])
+                        .isEqual(to: ["value": after[key] ?? NSNull()])
+                }
+            }).sorted().joined(separator: ",")
+            fputs("ax-profile changed_snapshot: fields=\(fields) rows=\(payloads.count)/\(afterPayloads.count) "
+                + "selectionChanged=\(selectedBefore != selectedAfter["texts"] as? [String]) "
+                + "deselected=\(selectedAfter["selected"] as? Bool != true) "
+                + "windowChanged=\(rectPayload(window) != windowPayload)\n", stderr)
+            for (before, after) in zip(payloads, afterPayloads) where bodyRect(before) != bodyRect(after) {
+                fputs("ax-profile changed_body_rect: row=\(before["index"] as? Int ?? 0) "
+                    + "before=\(bodyRect(before)) after=\(bodyRect(after))\n", stderr)
+            }
+        }
         return unverified("chat_changed_during_capture")
     }
     var cachedViewport: CGRect?
@@ -659,7 +796,7 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
             return result
         }
         if cachedViewport != viewport {
-            boxes = bubbleComponents(image: image, window: windowRect, viewport: viewport)
+            boxes = measured("analyse_bubbles") { bubbleComponents(image: image, window: windowRect, viewport: viewport) }
             cachedViewport = viewport
         }
         var evidence = bubbleEvidence(body: bodyRect(item), viewport: viewport, boxes: boxes)
@@ -1162,12 +1299,12 @@ func chatRows(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
     }
 }
 
-func chatSnapshotContext(window: AXUIElement?) -> (table: AXUIElement?, rows: [AXUIElement], selected: AXUIElement?) {
+func chatSnapshotContext(window: AXUIElement?) -> (table: AXUIElement?, payloads: [[String: Any]], selected: AXUIElement?) {
     guard let window = window else { return (nil, [], nil) }
     var tables: [AXUIElement] = []
-    collectTables(window, tables: &tables, maxDepth: 14)
+    measured("locate_table_tree") { collectTables(window, tables: &tables, maxDepth: 14, descendIntoTables: false) }
     var bestTable: AXUIElement?
-    var bestRows: [AXUIElement] = []
+    var bestPayloads: [[String: Any]] = []
     var selectedRow: AXUIElement?
     var bestScore = -1
     var bestArea = 0.0
@@ -1189,18 +1326,19 @@ func chatSnapshotContext(window: AXUIElement?) -> (table: AXUIElement?, rows: [A
             continue
         }
         guard viewport["width", default: 0] >= 240, !rows.isEmpty else { continue }
-        var elements: [[String: Any]] = []
-        collectTextElements(table, out: &elements, maxDepth: 8)
-        let score = elements.filter { $0["role"] as? String == "AXTextArea" }.count
+        let snapshots = measured("read_rows") { rows.map { readChatNodes($0) } }
+        let score = snapshots.reduce(0) { count, nodes in
+            count + nodes.filter { $0.depth <= 7 && $0.role == "AXTextArea" && !$0.trimmedTexts.isEmpty }.count
+        }
         let area = viewport["width", default: 0] * viewport["height", default: 0]
         if score > bestScore || (score == bestScore && area > bestArea) {
             bestTable = table
-            bestRows = rows
+            bestPayloads = snapshots.enumerated().map { chatPayload($0.element, index: $0.offset + 1, viewport: viewport) }
             bestScore = score
             bestArea = area
         }
     }
-    return (bestTable, bestRows, selectedRow)
+    return (bestTable, bestPayloads, selectedRow)
 }
 
 func setWindowFrame(_ window: AXUIElement, frame: NSRect) -> Bool {
@@ -1442,6 +1580,29 @@ func intArg(_ index: Int, defaultValue: Int) -> Int {
 
 let args = CommandLine.arguments
 let command = args.count > 1 ? args[1] : "rows"
+if command == "chat-fixture", args.count == 3 {
+    struct Fixture: Decodable {
+        let rows: [[ChatNodeSnapshot]]
+        let viewport: [String: Double]?
+        let afterRows: [[ChatNodeSnapshot]]?
+    }
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
+        let fixture = try JSONDecoder().decode(Fixture.self, from: data)
+        let payloads = fixture.rows.enumerated().map {
+            chatPayload($0.element, index: $0.offset + 1, viewport: fixture.viewport)
+        }
+        if let afterRows = fixture.afterRows {
+            let afterPayloads = afterRows.enumerated().map {
+                chatPayload($0.element, index: $0.offset + 1, viewport: fixture.viewport)
+            }
+            jsonLine(["snapshotsMatch": chatSnapshotsMatch(payloads, afterPayloads)])
+        } else {
+            for payload in payloads { jsonLine(payload) }
+        }
+        exit(0)
+    } catch { fputs("Invalid chat fixture\n", stderr); exit(2) }
+}
 if command == "bubble-fixture", args.count == 4 {
     do {
         let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
@@ -1464,7 +1625,7 @@ guard let root = appElement(bundleID: bundleID) else {
     exit(1)
 }
 
-let window = mainWindow(root)
+let window = measured("main_window") { mainWindow(root) }
 
 if command == "rows" {
     let rows = conversationRows(root: root, window: window)
@@ -1506,8 +1667,8 @@ if command == "rows" {
 } else if command == "sidebar-identity" {
     jsonLine(sidebarIdentityPayload(root: root, window: window))
 } else if command == "chat" || command == "chat-all" {
-    let context = chatSnapshotContext(window: window)
-    let rawPayloads = context.rows.enumerated().map { chatPayload($0.element, index: $0.offset + 1) }
+    let context = measured("locate_chat") { chatSnapshotContext(window: window) }
+    let rawPayloads = context.payloads
     let payloads = command == "chat" ? verifyBubbleDirections(rawPayloads, root: root, window: window,
         table: context.table, selected: context.selected) : rawPayloads
     for var payload in payloads {

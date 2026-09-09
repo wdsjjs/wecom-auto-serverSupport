@@ -491,7 +491,7 @@ def _swift_ax_runner(script_path: Path) -> list[str]:
             return [str(binary_path)]
         compile_timeout = float(os.environ.get("WECOM_GUI_AX_COMPILE_TIMEOUT", "45"))
         proc = subprocess.run(
-            [swiftc, str(script_path), "-o", str(binary_path)],
+            [swiftc, "-O", str(script_path), "-o", str(binary_path)],
             text=True,
             capture_output=True,
             timeout=compile_timeout,
