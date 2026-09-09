@@ -14,5 +14,9 @@ else
   open "$APP"
 fi
 
-echo "UDA WeCom Agent 已启动。"
-echo "边缘通道默认不启动，请在 Dock 客户端菜单中手动启动。"
+# The unified launcher owns both the status UI and the real WeCom edge worker.
+# Keep the worker lifecycle in the supervisor so repeated launches are idempotent.
+"$SUPERVISOR" start edge
+
+echo "UDA WeCom Agent 和企微边缘通道已启动。"
+"$SUPERVISOR" status

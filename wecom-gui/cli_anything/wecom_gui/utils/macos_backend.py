@@ -1348,13 +1348,15 @@ def _is_chat_pane_item(item: dict, chat_left: float, right_sidebar_left: float =
     )
 
 
-def _meaningful_chat_texts(item: dict) -> tuple[str, list[str], str]:
-    texts = [str(text).strip() for text in item.get("texts", []) if str(text).strip()]
-    stamp = ""
+def _meaningful_chat_texts(item: dict, *, use_message_nodes: bool = True) -> tuple[str, list[str], str]:
+    structured = use_message_nodes and isinstance(item.get("messageTexts"), list)
+    values = item["messageTexts"] if structured else item.get("texts", [])
+    texts = [str(text).strip() for text in values if str(text).strip()]
+    stamp = str(item.get("timestampText") or "") if structured else ""
     content_parts: list[str] = []
     seen_content: set[str] = set()
     for text in texts:
-        if re.fullmatch(r"\d{1,2}:\d{2}", text):
+        if not structured and re.fullmatch(r"\d{1,2}:\d{2}", text):
             stamp = text
         elif text not in CHAT_NOISE_TEXTS and "shield checkmark" not in text and "b2b rich tips" not in text:
             key = "".join(text.split())
@@ -1523,10 +1525,13 @@ def _hidden_image_rows(
     *,
     right_sidebar_left: float = 0.0,
     include_media: bool = True,
+    snapshot_items: list[dict] | None = None,
 ) -> list[dict]:
     """Return image rows that normal AX chat output omits or exposes as text."""
     candidates: list[dict] = []
-    items = _ax_chat_all_items(chat_left, right_sidebar_left)
+    items = _ax_chat_all_items(chat_left, right_sidebar_left) if snapshot_items is None else [
+        item for item in snapshot_items if _is_chat_pane_item(item, chat_left, right_sidebar_left)
+    ]
     for index, item in enumerate(items):
         content, content_parts, _stamp = _meaningful_chat_texts(item)
         media_elements = item.get("mediaElements") if isinstance(item.get("mediaElements"), list) else []
@@ -1786,8 +1791,17 @@ def _ax_chat_messages(
     include_hidden_image_media: bool = True,
 ) -> list[dict]:
     messages: list[dict] = []
-    geometry = window_geometry()
-    chat_left, right_sidebar_left, boundary_source = _chat_pane_boundaries(geometry if isinstance(geometry, dict) else {})
+    snapshot_items = _swift_ax("chat")
+    viewport = next((item.get("chatViewport") for item in snapshot_items
+                     if isinstance(item.get("chatViewport"), dict) and _float_value(item["chatViewport"].get("width")) > 0), None)
+    geometry = {}
+    if viewport:
+        chat_left = _float_value(viewport.get("x"))
+        right_sidebar_left = chat_left + _float_value(viewport.get("width"))
+        boundary_source = "chat-snapshot"
+    else:
+        geometry = window_geometry()
+        chat_left, right_sidebar_left, boundary_source = _chat_pane_boundaries(geometry if isinstance(geometry, dict) else {})
     if boundary_source in {"default", "sidebar"}:
         _append_event(
             {
@@ -1798,13 +1812,14 @@ def _ax_chat_messages(
                 "geometry_ok": bool(isinstance(geometry, dict) and geometry.get("ok")),
             }
         )
-    for item in _swift_ax("chat"):
+    for item in snapshot_items:
         x = float(item.get("x") or 0)
         width = float(item.get("width") or 0)
         if not _is_chat_pane_item(item, chat_left, right_sidebar_left):
             continue
         texts = [str(text).strip() for text in item.get("texts", []) if str(text).strip()]
         content, content_parts, stamp = _meaningful_chat_texts(item)
+        identity_text, _identity_parts, identity_time = _meaningful_chat_texts(item, use_message_nodes=False)
         media_elements = item.get("mediaElements") if isinstance(item.get("mediaElements"), list) else []
         is_mini_program = _is_mini_program_card(content, content_parts)
         if not texts and not media_elements:
@@ -1836,6 +1851,12 @@ def _ax_chat_messages(
             "width": int(message_width),
             "right": right,
             "source": "axuielement-chat-table",
+            # Preserve existing observation/spool IDs when stripping AX timestamp labels from the body.
+            "identity_text": identity_text or content,
+            "identity_time": identity_time,
+            "direction_evidence": item.get("directionEvidence") or {
+                "source": "screencapturekit", "status": "unavailable", "side": "unknown",
+            },
         }
         if has_media:
             media_payload = []
@@ -1887,6 +1908,7 @@ def _ax_chat_messages(
             chat_left,
             right_sidebar_left=right_sidebar_left,
             include_media=include_hidden_image_media,
+            snapshot_items=snapshot_items if snapshot_items and all(item.get("snapshotComplete") for item in snapshot_items) else None,
         ):
             row = int(message.get("row") or 0)
             if row and row not in by_row:
@@ -1900,6 +1922,10 @@ def _ax_chat_messages(
                 by_row[row]["text"] = by_row[row].get("text") or "[图片]"
                 by_row[row]["content"] = by_row[row]["text"]
         messages.sort(key=lambda message: int(message.get("row") or 0))
+    for message in messages:
+        message.setdefault("direction_evidence", {
+            "source": "screencapturekit", "status": "unsupported_media", "side": "unknown",
+        })
     return messages[-last:] if last > 0 else messages
 
 
@@ -2009,6 +2035,9 @@ def chat_messages(
                 "width": int(width) if width.isdigit() else None,
                 "right": int(right) if right.isdigit() else None,
                 "source": "accessibility-chat-table",
+                "direction_evidence": {
+                    "source": "screencapturekit", "status": "ax_fallback_unverified", "side": "unknown",
+                },
             }
         )
     return messages

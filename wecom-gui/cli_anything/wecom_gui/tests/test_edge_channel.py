@@ -213,6 +213,72 @@ def test_visual_staff_direction_does_not_resolve_without_a_central_delivery_echo
     assert events == []
 
 
+@pytest.mark.parametrize("side,direction", [("left", "inbound"), ("right", "outbound")])
+def test_pixel_verified_direction_resolves_same_event_without_a_new_message(monkeypatch, tmp_path, side, direction):
+    monkeypatch.setattr(state, "state_dir", lambda: tmp_path)
+    _match_sidebar_identity(monkeypatch)
+    row = {"title": "客户A", "external_user_id": "customer-1"}
+    monkeypatch.setattr(edge_worker.macos_backend, "selected_conversation_row", lambda limit=30: row)
+    unknown = {"role": "unknown", "role_confidence": "low", "text": "待核对消息", "time": "10:00"}
+    verified = {**unknown, "role": "用户" if side == "left" else "客服", "role_confidence": "high",
+                "direction_evidence": {"source": "screencapturekit", "status": "matched", "side": side}}
+    reads = iter([
+        {"hash": "baseline", "messages": []},
+        {"hash": "unchanged-text", "messages": [unknown]},
+        {"hash": "unchanged-text", "messages": [verified]},
+        {"hash": "unchanged-text", "messages": [verified]},
+    ])
+    monkeypatch.setattr(edge_worker.chat, "read_current", lambda **kwargs: next(reads))
+    edge_worker.collect_visible_conversation_once()
+    edge_worker.collect_visible_conversation_once()
+    first = edge_state.due_inbound()[0]
+    assert first["payload"]["message"]["direction"] == "unknown"
+    edge_state.mark_inbound_delivered(first["client_event_id"])
+    result = edge_worker.collect_visible_conversation_once()
+    resolved = edge_state.due_inbound()[0]
+    assert result["pending_direction"] == 0
+    assert resolved["client_event_id"] == first["client_event_id"]
+    assert resolved["payload"]["message"]["id"] == first["payload"]["message"]["id"]
+    assert resolved["payload"]["message"]["direction"] == direction
+    edge_state.mark_inbound_delivered(resolved["client_event_id"])
+    assert edge_worker.collect_visible_conversation_once()["captured"] == 0
+    assert edge_state.due_inbound() == []
+
+
+@pytest.mark.parametrize("times", [("", ""), ("10:00", "10:01")])
+def test_identical_customer_and_staff_bubbles_are_both_kept(monkeypatch, tmp_path, times):
+    monkeypatch.setattr(state, "state_dir", lambda: tmp_path)
+    _match_sidebar_identity(monkeypatch)
+    row = {"title": "客户A", "external_user_id": "customer-1"}
+    monkeypatch.setattr(edge_worker.macos_backend, "selected_conversation_row", lambda limit=30: row)
+    messages = [
+        {"text": "一样的正文", "time": stamp, "role": role, "role_confidence": "high",
+         "direction_evidence": {"source": "screencapturekit", "status": "matched", "side": side}}
+        for (role, side), stamp in zip([("用户", "left"), ("客服", "right")], times)
+    ]
+    reads = iter([{"messages": []}, {"messages": messages}, {"messages": messages}])
+    monkeypatch.setattr(edge_worker.chat, "read_current", lambda **kwargs: next(reads))
+    edge_worker.collect_visible_conversation_once()
+    assert edge_worker.collect_visible_conversation_once()["captured"] == 2
+    events = edge_state.due_inbound()
+    assert [event["payload"]["message"]["direction"] for event in events] == ["inbound", "outbound"]
+    assert len({event["payload"]["message"]["id"] for event in events}) == 2
+    assert edge_worker.collect_visible_conversation_once()["captured"] == 0
+
+
+def test_verified_staff_history_only_establishes_baseline(monkeypatch, tmp_path):
+    monkeypatch.setattr(state, "state_dir", lambda: tmp_path)
+    _match_sidebar_identity(monkeypatch)
+    row = {"title": "客户A", "external_user_id": "customer-1"}
+    monkeypatch.setattr(edge_worker.macos_backend, "selected_conversation_row", lambda limit=30: row)
+    monkeypatch.setattr(edge_worker.chat, "read_current", lambda **kwargs: {"messages": [
+        {"text": "历史人工回复", "role": "客服", "role_confidence": "high",
+         "direction_evidence": {"source": "screencapturekit", "status": "matched", "side": "right"}},
+    ]})
+    assert edge_worker.collect_visible_conversation_once()["captured"] == 0
+    assert edge_state.due_inbound() == []
+
+
 def test_visible_customer_message_is_uploaded_when_the_open_chat_is_not_unread(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     _match_sidebar_identity(monkeypatch)

@@ -759,6 +759,9 @@ def test_ax_chat_messages_ignores_small_media_icons(monkeypatch):
             "width": 1159,
             "right": 1470,
             "source": "axuielement-chat-table",
+            "identity_text": "客户消息",
+            "identity_time": "",
+            "direction_evidence": {"source": "screencapturekit", "status": "unavailable", "side": "unknown"},
         }
     ]
 
@@ -1235,7 +1238,7 @@ def test_infer_roles_keeps_wide_left_customer_bubble_as_user():
     assert [message["role"] for message in messages] == ["用户", "客服"]
     assert messages[0]["role_confidence"] == "medium"
 
-def test_infer_roles_uses_left_edge_when_right_edge_is_broken():
+def test_infer_roles_does_not_trust_zero_width_text_nodes():
     messages = chat.infer_roles(
         [
             {"role": "unknown", "text": "客户问", "x": 311, "width": 0, "right": 311},
@@ -1243,7 +1246,7 @@ def test_infer_roles_uses_left_edge_when_right_edge_is_broken():
         ]
     )
 
-    assert [message["role"] for message in messages] == ["用户", "客服"]
+    assert all(message["role_confidence"] == "low" for message in messages)
 
 def test_activate_app_refuses_to_launch_when_wecom_not_running(monkeypatch):
     monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend.find_running_app", lambda: None)

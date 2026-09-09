@@ -21,6 +21,10 @@ def _message_text(message: dict) -> str:
     return str(message.get("content") or message.get("text") or "").strip()
 
 
+def _identity_text(message: dict) -> str:
+    return str(message.get("identity_text") or _message_text(message)).strip()
+
+
 def _customer_messages_since_last_staff(messages: list[dict]) -> list[dict]:
     """Return every customer bubble in the current unresolved customer turn."""
     result: list[dict] = []
@@ -67,7 +71,7 @@ def _message_identity(
 ) -> tuple[str, str]:
     media = _media_fingerprint(message.get("media") or [])
     raw = (
-        f"{conversation_key}|{turn_position}|{_message_text(message)}|"
+        f"{conversation_key}|{turn_position}|{_identity_text(message)}|"
         f"{','.join(item['sha256'] for item in media)}"
     )
     fingerprint = _hash(raw)
@@ -237,20 +241,25 @@ def collect_inbound_once(*, inbox_limit: int = 30, last: int = 20) -> dict:
 def _visible_observation_fingerprints(messages: list[dict]) -> list[tuple[str, dict, int]]:
     """Assign stable identities before any sender-direction inference."""
     occurrences: dict[str, int] = {}
+    identity_occurrences: dict[str, int] = {}
     observed: list[tuple[str, dict, int]] = []
     for message in messages:
         text = _message_text(message)
         if not text and not message.get("media"):
             continue
         base = "|".join([
-            text,
-            str(message.get("time") or ""),
+            _identity_text(message),
+            str(message.get("identity_time", message.get("time")) or ""),
             json.dumps(_media_fingerprint(message.get("media") or []), ensure_ascii=False),
         ])
         position = occurrences.get(base, 0) + 1
         occurrences[base] = position
         fingerprint = _hash(f"visible|{base}|{position}")
-        observed.append((fingerprint, message, position))
+        # Event IDs do not include time labels; repeated text at different times still needs separate IDs.
+        identity_base = json.dumps([_identity_text(message), _media_fingerprint(message.get("media") or [])], ensure_ascii=False)
+        identity_position = identity_occurrences.get(identity_base, 0) + 1
+        identity_occurrences[identity_base] = identity_position
+        observed.append((fingerprint, message, identity_position))
     return observed
 
 
@@ -282,10 +291,6 @@ def collect_visible_conversation_once(
                 [fingerprint for fingerprint, _message, _position in candidates],
                 bootstrap_recent_count=bootstrap_recent_count,
             ))
-            unresolved_user_positions = {
-                id(message): position
-                for position, message in enumerate(_customer_messages_since_last_staff(messages), start=1)
-            }
             captured = 0
             pending_direction = 0
             for fingerprint, message, position in candidates:
@@ -296,19 +301,19 @@ def collect_visible_conversation_once(
                 confidence = str(message.get("role_confidence") or "").strip().lower()
                 if not confidence and role in {"用户", "客服"}:
                     confidence = "high"
+                # Re-reading an unknown message must retain its original message ID and position.
+                event_position = position
                 if role == "用户" and confidence in {"high", "medium"}:
-                    event_position = unresolved_user_positions.get(id(message))
-                    if event_position is None:
-                        continue
                     direction = "inbound"
                 elif role == "客服" and confidence in {"high", "medium"}:
-                    # A visual right-side bubble is not sufficient evidence of who sent it.
-                    # Only the locally recorded echo of a central delivery confirms outbound.
                     if text and edge_state.consume_outbound_echo_suppression(conversation_key, text):
                         edge_state.mark_chat_observation_captured(conversation_key, fingerprint, confidence=confidence)
                         continue
-                    direction = "unknown"
-                    event_position = position
+                    evidence = message.get("direction_evidence") or {}
+                    direction = "outbound" if (
+                        evidence.get("source") == "screencapturekit"
+                        and evidence.get("status") == "matched" and evidence.get("side") == "right"
+                    ) else "unknown"
                 else:
                     key, payload, media = _event_for_row(
                         row,

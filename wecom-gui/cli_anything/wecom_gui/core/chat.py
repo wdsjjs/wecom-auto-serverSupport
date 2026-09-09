@@ -50,27 +50,21 @@ def _normalized_role(value: object) -> str:
 
 
 def infer_roles(messages: list[dict]) -> list[dict]:
-    """Infer WeCom message roles from horizontal bubble positions.
+    """Use verified window pixels; keep legacy geometry separate from new captures."""
+    def valid_legacy_geometry(message: dict) -> bool:
+        x, right = message.get("x"), message.get("right")
+        width = message.get("width")
+        if width is None and isinstance(x, int) and isinstance(right, int):
+            width = right - x
+        return (
+            "direction_evidence" not in message
+            and isinstance(x, int) and isinstance(right, int) and right > x
+            and isinstance(width, (int, float)) and width > 0
+        )
 
-    WeCom does not expose sender labels in Accessibility for all message rows.
-    In the desktop layout, outgoing/service bubbles are right-aligned. We split
-    visible message right edges at the midpoint between min/max. This works
-    better than left x-position because long right-aligned bubbles expand left.
-    This is a heuristic, but it is deterministic and exposed through
-    `role_confidence` so watch mode can stay conservative.
-    """
-    xs = [msg.get("x") for msg in messages if isinstance(msg.get("x"), int)]
-    rights = [msg.get("right") for msg in messages if isinstance(msg.get("right"), int)]
-    if len(set(xs)) < 2 and len(set(rights)) < 2:
-        return [
-            {
-                **msg,
-                "role": _normalized_role(msg.get("role")),
-                "role_confidence": "low",
-                "content": msg.get("text", ""),
-            }
-            for msg in messages
-        ]
+    legacy = [message for message in messages if valid_legacy_geometry(message)]
+    xs = [msg["x"] for msg in legacy]
+    rights = [msg["right"] for msg in legacy]
 
     left_threshold = (min(xs) + max(xs)) / 2 if len(set(xs)) >= 2 else None
     right_threshold = (min(rights) + max(rights)) / 2 if len(set(rights)) >= 2 else None
@@ -78,9 +72,25 @@ def infer_roles(messages: list[dict]) -> list[dict]:
     right_margin = 24
     enriched: list[dict] = []
     for msg in messages:
+        evidence = msg.get("direction_evidence")
+        if evidence is not None:
+            verified = (
+                isinstance(evidence, dict) and evidence.get("source") == "screencapturekit"
+                and evidence.get("status") == "matched" and evidence.get("side") in {"left", "right"}
+            )
+            enriched.append({
+                **msg,
+                "role": ("用户" if evidence["side"] == "left" else "客服") if verified else "unknown",
+                "role_confidence": "high" if verified else "low",
+                "content": msg.get("text", ""),
+            })
+            continue
         x = msg.get("x")
         right = msg.get("right")
-        if (
+        if not valid_legacy_geometry(msg) or (left_threshold is None and right_threshold is None):
+            role = _normalized_role(msg.get("role"))
+            confidence = "low"
+        elif (
             isinstance(right, int)
             and right_edge is not None
             and right >= right_edge - right_margin

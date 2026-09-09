@@ -89,6 +89,10 @@ Useful commands:
 ./修复PiProvider.command
 ```
 
+`start-agent.command` starts both the menu-bar client and the real WeCom edge
+channel through the same supervisor. Running it again is idempotent. Starting
+the app directly only opens the status UI and does not start the channel.
+
 If an already-installed Mac reports that `uda-openai` is missing or that
 `models.json` is empty, double-click `修复PiProvider.command`. It rewrites the
 Pi provider JSON and verifies:

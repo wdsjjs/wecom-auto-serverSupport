@@ -47,7 +47,7 @@ Install or repair a Mac with:
 ./install.command
 ```
 
-Then start the customer-service agent:
+Then start the customer-service agent and its WeCom edge channel:
 
 ```bash
 ./start-agent.command
