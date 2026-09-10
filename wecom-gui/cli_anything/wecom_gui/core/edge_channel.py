@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
+from urllib.parse import quote
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,7 @@ class ChannelClient:
     def __init__(self, config: ChannelConfig, *, session: requests.Session | None = None):
         self.config = config
         self.session = session or requests.Session()
+        self.supports_deferred_media = False
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -86,11 +89,21 @@ class ChannelClient:
             raise ChannelError("channel returned non-JSON response") from exc
 
     def heartbeat(self) -> dict:
-        return self._json_request(
+        result = self._json_request(
             "POST",
             _path("WECOM_CHANNEL_HEARTBEAT_PATH", "/api/wecom-channel/edge/heartbeat"),
             json={} if self.config.local_test_mode else {"device_id": self.config.device_id},
         )
+        payload = result.get("data", result) if isinstance(result, dict) else {}
+        self.supports_deferred_media = payload.get("capabilities", {}).get("deferredMediaV1") is True
+        return result
+
+    def register_message(self, event: dict) -> dict:
+        result = self._json_request("POST", "/api/wecom-channel/edge/messages/register", json=event)
+        result = result.get("data", result)
+        if result.get("accepted") is not True:
+            raise ChannelError("message registration was not acknowledged")
+        return result
 
     def post_runtime(self, payload: dict) -> dict:
         return self._json_request(
@@ -100,8 +113,9 @@ class ChannelClient:
             timeout=min(self.config.timeout_seconds, 2.0),
         )
 
-    def post_inbound(self, event: dict, media: list[dict]) -> dict:
-        path = _path("WECOM_CHANNEL_INBOUND_PATH", "/api/wecom-channel/edge/inbound-events")
+    def post_inbound(self, event: dict, media: list[dict], *, attachment_only: bool = False) -> dict:
+        path = (f'/api/wecom-channel/edge/messages/{quote(event["message"]["id"], safe="")}/media' if attachment_only else
+                _path("WECOM_CHANNEL_INBOUND_PATH", "/api/wecom-channel/edge/inbound-events"))
         upload_event = json.loads(json.dumps(event, ensure_ascii=False))
         files: list[tuple[str, tuple[str, object, str]]] = []
         opened: list[object] = []
@@ -112,16 +126,24 @@ class ChannelClient:
                     raise ChannelError(f"captured inbound image missing: {capture_path}")
                 handle = capture_path.open("rb")
                 opened.append(handle)
-                files.append(("media", (capture_path.name, handle, "image/jpeg")))
+                files.append(("media", (capture_path.name, handle,
+                                       mimetypes.guess_type(capture_path.name)[0] or "application/octet-stream")))
                 upload_event["message"]["media"][index].pop("capture_path", None)
             if not files:
+                if attachment_only:
+                    raise ChannelError("attachment completion requires image files")
                 return self._json_request("POST", path, json=upload_event)
-            return self._json_request(
+            result = self._json_request(
                 "POST",
                 path,
                 data={"event": json.dumps(upload_event, ensure_ascii=False)},
                 files=files,
             )
+            if attachment_only:
+                result = result.get("data", result)
+                if result.get("accepted") is not True or result.get("message", {}).get("mediaState") != "ready":
+                    raise ChannelError("attachment completion was not acknowledged")
+            return result
         finally:
             for handle in opened:
                 handle.close()

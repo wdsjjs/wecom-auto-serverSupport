@@ -562,7 +562,7 @@ def test_ax_chat_messages_filters_conversation_list_when_chat_left_present(monke
                     "rightSidebarLeft": 3500,
                 }
             ]
-        if command == "chat":
+        if command == ["chat", "10"]:
             return [
                 {
                     "index": 1,
@@ -593,7 +593,7 @@ def test_ax_chat_messages_falls_back_to_sidebar_boundary_when_chat_left_missing(
     def fake_swift(command):
         if command == "geometry":
             return [{"ok": True, "sidebar": {"x": 60, "width": 250}}]
-        if command == "chat":
+        if command == ["chat", "10"]:
             return [
                 {"index": 1, "texts": ["客户A", "预览", "@微信"], "x": 60, "width": 250},
                 {"index": 2, "texts": ["真正消息"], "x": 311, "width": 1159},
@@ -656,7 +656,7 @@ def test_ax_chat_messages_can_include_hidden_image_rows(monkeypatch):
         commands.append(command)
         if command == "geometry":
             return [{"ok": True, "sidebar": {"x": 60, "width": 250}}]
-        if command == "chat":
+        if command == ["chat", "10"]:
             return [
                 {"index": 34, "texts": ["客服答"], "x": 431, "width": 1013, "bubbleX": 431, "bubbleWidth": 1013},
                 {"index": 36, "texts": ["这个牛奶是你们产品吗"], "x": 311, "width": 1159, "bubbleX": 337, "bubbleWidth": 143},
@@ -686,7 +686,7 @@ def test_ax_chat_messages_enriches_image_placeholder_rows(monkeypatch):
         commands.append(command)
         if command == "geometry":
             return [{"ok": True, "sidebar": {"x": 60, "width": 250}}]
-        if command == "chat":
+        if command == ["chat", "10"]:
             return [
                 {"index": 35, "texts": ["[图片]"], "x": 311, "y": 285, "width": 1159, "height": 336},
                 {"index": 36, "texts": ["这是哪里？"], "x": 311, "width": 1159, "bubbleX": 337, "bubbleWidth": 120},
@@ -718,7 +718,7 @@ def test_ax_chat_messages_does_not_read_hidden_rows_unless_requested(monkeypatch
         commands.append(command)
         if command == "geometry":
             return [{"ok": True, "sidebar": {"x": 60, "width": 250}}]
-        if command == "chat":
+        if command == ["chat", "10"]:
             return [{"index": 2, "texts": ["真正聊天消息"], "x": 311, "width": 1159}]
         if command == "chat-all":
             raise AssertionError("chat-all should only run for formal image capture")
@@ -769,7 +769,7 @@ def test_ax_chat_messages_dedupes_duplicate_text_nodes_in_same_row(monkeypatch):
     def fake_swift(command):
         if command == "geometry":
             return [{"ok": True, "sidebar": {"x": 60, "width": 250}}]
-        if command == "chat":
+        if command == ["chat", "10"]:
             return [
                 {
                     "index": 2,
@@ -1270,7 +1270,7 @@ def test_extract_wecom_external_user_id_from_sidebar_text():
     assert wm_uid == "wmapJOBwAAhEK25tzmHoIS9cIKKdIBMw"
     assert wo_uid == "woapJOBwAAHkJVlpqbTCpkWpgZ1-_1pg"
 
-def test_ax_text_input_retries_empty_swift_result(monkeypatch):
+def test_ax_text_input_does_not_resend_after_empty_swift_result(monkeypatch):
     calls = []
     results = iter(
         [
@@ -1288,11 +1288,48 @@ def test_ax_text_input_retries_empty_swift_result(monkeypatch):
     monkeypatch.setenv("WECOM_GUI_AX_SEND_RETRY_DELAY", "0")
     monkeypatch.setattr("cli_anything.wecom_gui.utils.macos_backend._swift_ax", fake_swift_ax)
 
-    data = macos_backend.send_via_ax_text_input("hello", submit=True)
+    with pytest.raises(macos_backend.TextSendError, match="ax_send_result_missing") as raised:
+        macos_backend.send_via_ax_text_input("hello", submit=True)
+    assert raised.value.submitted is None
+    assert calls == ["send-ready", ["send", "hello"]]
 
-    assert data["ok"] is True
-    assert data["method"] == "ax_text_input"
-    assert calls == ["send-ready", ["send", "hello"], ["send", "hello"]]
+
+def test_ax_text_input_preserves_specific_error_without_logging_body(monkeypatch):
+    events = []
+    results = iter([
+        [{"ok": True, "input": {"valueLength": 0}}],
+        [{"ok": False, "submitted": False, "method": "targeted_return",
+          "submit": {"submitted": False, "reason": "chat_input_focus_not_confirmed"}}],
+    ])
+    monkeypatch.setattr(macos_backend, "_swift_ax", lambda _command: next(results))
+    monkeypatch.setattr(macos_backend, "_append_event", events.append)
+    with pytest.raises(macos_backend.TextSendError) as raised:
+        macos_backend.send_via_ax_text_input("private customer reply")
+    assert raised.value.reason_code == "chat_input_focus_not_confirmed"
+    assert raised.value.submitted is False
+    assert events[-1]["error"] == "chat_input_focus_not_confirmed"
+    assert "private customer reply" not in str(events)
+
+
+def test_text_preflight_failure_never_calls_native_send(monkeypatch):
+    calls = []
+    def read(command):
+        calls.append(command)
+        return [{"ok": False, "error": "chat_input_value_unavailable"}]
+    monkeypatch.setattr(macos_backend, "_swift_ax", read)
+    with pytest.raises(macos_backend.TextSendError) as raised:
+        macos_backend.send_via_ax_text_input("hello")
+    assert raised.value.submitted is False
+    assert calls == ["send-ready"]
+
+
+def test_native_send_failure_without_submission_evidence_remains_uncertain(monkeypatch):
+    results = iter([[{"ok": True, "input": {"valueLength": 0}}], [{"ok": False, "error": "unexpected"}]])
+    monkeypatch.setattr(macos_backend, "_swift_ax", lambda command: next(results))
+    with pytest.raises(macos_backend.TextSendError) as raised:
+        macos_backend.send_via_ax_text_input("hello")
+    assert raised.value.submitted is None
+
 
 def test_scroll_sidebar_uses_adaptive_geometry(monkeypatch):
     calls = []

@@ -526,6 +526,10 @@ func chatPayload(_ nodes: [ChatNodeSnapshot], index: Int, viewport: [String: Dou
     }
     payload["messageTexts"] = messageElements.flatMap { $0["texts"] as? [String] ?? [] }
     payload["bubbleTextSupported"] = messageElements.count == 1 && mediaElements.isEmpty
+    let bodyTexts = messageElements.flatMap { $0["texts"] as? [String] ?? [] }
+    payload["bubbleImageSupported"] = row.height >= 64
+        && bodyTexts.allSatisfy { ["[图片]", "图片", "[image]"].contains($0) }
+        && mediaElements.allSatisfy { $0["mediaType"] as? String == "image" }
     payload["timestampText"] = textElements.filter { $0["role"] as? String == "AXStaticText" }
         .flatMap { $0["texts"] as? [String] ?? [] }.first(where: isLikelyTimeText) ?? ""
     if let viewport = viewport {
@@ -587,7 +591,7 @@ func bodyRect(_ payload: [String: Any]) -> CGRect {
 }
 
 // Pixel components locate bubble outlines; sender names and message text do not determine the side.
-func bubbleComponents(image: CGImage, window: CGRect, viewport: CGRect) -> [CGRect] {
+func bubbleComponents(image: CGImage, window: CGRect, viewport: CGRect, images: Bool = false) -> [CGRect] {
     guard window.width > 0, window.height > 0, window.contains(viewport),
           viewport.width >= 1, viewport.height >= 1,
           viewport.width * viewport.height <= 4_000_000 else { return [] }
@@ -614,17 +618,34 @@ func bubbleComponents(image: CGImage, window: CGRect, viewport: CGRect) -> [CGRe
         histogram[color, default: 0] += 1
     }
     let frequent = histogram.sorted { $0.value > $1.value }
-    guard let background = frequent.first?.key else { return [] }
+    var marginColors: [Int: Int] = [:]
+    // Empty outer margins establish the background even when a photo occupies
+    // most of the viewport. Message length cannot determine its color palette.
+    for y in 0..<height {
+        for x in [3, 4, 5, width - 6, width - 5, width - 4] where x >= 0 && x < width {
+            marginColors[colors[y * width + x], default: 0] += 1
+        }
+    }
+    guard let background = marginColors.max(by: { $0.value < $1.value })?.key else { return [] }
     func colorDistance(_ a: Int, _ b: Int) -> Int {
         return max(abs((a >> 16 & 255) - (b >> 16 & 255)),
                    abs((a >> 8 & 255) - (b >> 8 & 255)), abs((a & 255) - (b & 255)))
     }
-    let palette = Set(frequent.prefix(12).filter {
-        $0.value > max(100, width * height / 250) && colorDistance($0.key, background) >= 12
+    // A qualifying component is at least 20 x 18 with 35% fill. Keep every
+    // color that can form one, including short bubbles next to colorful photos.
+    let minimumTextPixels = 126
+    let palette = Set(histogram.filter {
+        $0.value >= minimumTextPixels && colorDistance($0.key, background) >= 12
     }.map { $0.key })
+    if profileChatRead {
+        let samples = frequent.prefix(24).map { String(format: "%06x:%d", $0.key, $0.value) }.joined(separator: ",")
+        fputs("ax-profile bubble_palette: images=\(images) threshold=\(minimumTextPixels) "
+            + String(format: "background=%06x ", background) + "colors=\(samples)\n", stderr)
+    }
+    let foreground = images ? colors.map { colorDistance($0, background) >= 20 } : []
     var visited = [Bool](repeating: false, count: colors.count)
     var boxes: [CGRect] = []
-    for start in colors.indices where !visited[start] && palette.contains(colors[start]) {
+    for start in colors.indices where !visited[start] && (images ? foreground[start] : palette.contains(colors[start])) {
         let color = colors[start]
         var stack = [start]
         visited[start] = true
@@ -635,19 +656,48 @@ func bubbleComponents(image: CGImage, window: CGRect, viewport: CGRect) -> [CGRe
             minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
             for next in [x > 0 ? pixel - 1 : -1, x + 1 < width ? pixel + 1 : -1,
                          y > 0 ? pixel - width : -1, y + 1 < height ? pixel + width : -1] {
-                if next >= 0 && !visited[next] && colors[next] == color {
+                if next >= 0 && !visited[next] && (images ? foreground[next] : colors[next] == color) {
                     visited[next] = true
                     stack.append(next)
                 }
             }
         }
         let w = maxX - minX + 1, h = maxY - minY + 1
-        if w >= 20 && h >= 18 && Double(count) / Double(w * h) >= 0.35 {
+        let sizeMatches = images ? w >= 64 && h >= 64 && Double(w) <= viewport.width * 0.8 : w >= 20 && h >= 18
+        if sizeMatches && Double(count) / Double(w * h) >= 0.35 {
             boxes.append(CGRect(x: viewport.minX + Double(minX), y: viewport.minY + Double(minY),
                                 width: Double(w), height: Double(h)))
         }
     }
+    if profileChatRead {
+        fputs("ax-profile bubble_components: images=\(images) count=\(boxes.count) boxes=\(Array(boxes.prefix(30)))\n", stderr)
+    }
     return boxes
+}
+
+func imageBubbleEvidence(row: CGRect, viewport: CGRect, boxes: [CGRect]) -> [String: Any] {
+    var result: [String: Any] = ["source": "screencapturekit", "method": "image_pixels",
+                               "status": "no_matching_image", "side": "unknown"]
+    let visible = row.intersection(viewport)
+    guard !visible.isNull, visible.height >= 64 else {
+        result["status"] = "outside_viewport_or_unlaid_out"
+        return result
+    }
+    let candidates = boxes.filter {
+        visible.insetBy(dx: -2, dy: -2).contains($0)
+            && $0.minY > viewport.minY + 2 && $0.maxY < viewport.maxY - 2
+    }
+    let matches = candidates.compactMap { box -> (CGRect, String)? in
+        let left = box.minX - viewport.minX, right = viewport.maxX - box.maxX
+        guard min(left, right) <= 40, abs(left - right) > 40 else { return nil }
+        return (box, left < right ? "left" : "right")
+    }
+    // Fragmented, centered or competing regions cannot establish a unique image.
+    guard candidates.count == 1, matches.count == 1, let match = matches.first else { return result }
+    result["status"] = "matched"
+    result["side"] = match.1
+    result["bubbleRect"] = rectDictionary(match.0)
+    return result
 }
 
 func bubbleEvidence(body: CGRect, viewport: CGRect, boxes: [CGRect]) -> [String: Any] {
@@ -690,6 +740,16 @@ func hasVisibleTextBody(_ item: [String: Any]) -> Bool {
     return body.width > 0 && body.height > 0 && cgRect(viewport).contains(body)
 }
 
+func hasVisibleDirectionBody(_ item: [String: Any]) -> Bool {
+    if hasVisibleTextBody(item) { return true }
+    guard item["bubbleImageSupported"] as? Bool == true,
+          let viewport = item["chatViewport"] as? [String: Double] else { return false }
+    let rect = CGRect(x: item["x"] as? Double ?? 0, y: item["y"] as? Double ?? 0,
+                      width: item["width"] as? Double ?? 0, height: item["height"] as? Double ?? 0)
+    let visible = rect.intersection(cgRect(viewport))
+    return !visible.isNull && visible.height >= 64
+}
+
 func chatSnapshotsMatch(_ before: [[String: Any]], _ after: [[String: Any]]) -> Bool {
     func comparable(_ rows: [[String: Any]]) -> [[String: Any]] {
         rows.map { item in
@@ -704,8 +764,13 @@ func chatSnapshotsMatch(_ before: [[String: Any]], _ after: [[String: Any]]) -> 
     return NSDictionary(dictionary: ["rows": comparable(before)]).isEqual(to: ["rows": comparable(after)])
 }
 
+func chatWindowIndices(rowCount: Int, last: Int) -> Range<Int> {
+    let start = last > 0 ? max(0, rowCount - last) : 0
+    return start..<rowCount
+}
+
 func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, window: AXUIElement?,
-                            table: AXUIElement?, selected: AXUIElement?) -> [[String: Any]] {
+                            table: AXUIElement?, selected: AXUIElement?, last: Int) -> [[String: Any]] {
     func unverified(_ reason: String) -> [[String: Any]] {
         return payloads.map { item in
             var result = item
@@ -717,7 +782,7 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
     guard CGPreflightScreenCaptureAccess() else { return unverified("screen_capture_permission_required") }
     guard let window = window, let windowPayload = rectPayload(window) else { return unverified("window_unavailable") }
     let windowRect = cgRect(windowPayload)
-    guard payloads.contains(where: hasVisibleTextBody) else { return unverified("no_visible_text_bubbles") }
+    guard payloads.contains(where: hasVisibleDirectionBody) else { return unverified("no_visible_message_bubbles") }
     let selectedBefore = selected.map { collectText($0) } ?? []
     let deadline = Date().addingTimeInterval(2)
     let contentResult = CaptureResult<Result<SCShareableContent, Error>>()
@@ -758,7 +823,9 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
     let after = table.map { children($0).filter { role($0) == "AXRow" } } ?? []
     let viewportAfter = table.flatMap { ancestorRect($0, matchingRole: "AXScrollArea") }
     let afterPayloads = measured("revalidate_rows") {
-        after.enumerated().map { chatPayload($0.element, index: $0.offset + 1, viewport: viewportAfter) }
+        chatWindowIndices(rowCount: after.count, last: last).map {
+            chatPayload(after[$0], index: $0 + 1, viewport: viewportAfter)
+        }
     }
     let selectedAfter = selected.map { rowPayload($0, index: 0) } ?? [:]
     guard !selectedBefore.isEmpty, selectedBefore == selectedAfter["texts"] as? [String],
@@ -784,6 +851,7 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
     }
     var cachedViewport: CGRect?
     var boxes: [CGRect] = []
+    var imageBoxes: [CGRect]?
     return payloads.map { item in
         var result = item
         guard let v = item["chatViewport"] as? [String: Double] else {
@@ -791,15 +859,26 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
             return result
         }
         let viewport = cgRect(v)
-        guard item["bubbleTextSupported"] as? Bool == true else {
+        guard item["bubbleTextSupported"] as? Bool == true || item["bubbleImageSupported"] as? Bool == true else {
             result["directionEvidence"] = ["source": "screencapturekit", "status": "unsupported_message_layout", "side": "unknown"]
             return result
         }
         if cachedViewport != viewport {
             boxes = measured("analyse_bubbles") { bubbleComponents(image: image, window: windowRect, viewport: viewport) }
             cachedViewport = viewport
+            imageBoxes = nil
         }
-        var evidence = bubbleEvidence(body: bodyRect(item), viewport: viewport, boxes: boxes)
+        var evidence: [String: Any]
+        if item["bubbleImageSupported"] as? Bool == true {
+            if imageBoxes == nil {
+                imageBoxes = measured("analyse_images") { bubbleComponents(image: image, window: windowRect, viewport: viewport, images: true) }
+            }
+            let row = CGRect(x: item["x"] as? Double ?? 0, y: item["y"] as? Double ?? 0,
+                             width: item["width"] as? Double ?? 0, height: item["height"] as? Double ?? 0)
+            evidence = imageBubbleEvidence(row: row, viewport: viewport, boxes: imageBoxes ?? [])
+        } else {
+            evidence = bubbleEvidence(body: bodyRect(item), viewport: viewport, boxes: boxes)
+        }
         evidence["windowId"] = target.windowID
         result["directionEvidence"] = evidence
         return result
@@ -920,22 +999,52 @@ func waitUntilInputChanges(_ input: AXUIElement, text: String, attempts: Int = 8
     return !inputStillContains(input, text: text)
 }
 
-func submitInput(input: AXUIElement, text: String) -> [String: Any] {
+func submitInput(root: AXUIElement, window: AXUIElement?, input: AXUIElement, text: String,
+                 selected: AXUIElement, selectedTexts: [String]) -> [String: Any] {
+    func rejected(_ reason: String) -> [String: Any] {
+        return ["method": "targeted_return", "submitted": false, "confirmed": false, "reason": reason]
+    }
     guard inputStillContains(input, text: text) else {
-        return ["method": "ax_confirm", "confirmed": false, "reason": "input_modified_before_submit"]
+        return rejected("input_modified_before_submit")
     }
-    let confirm = AXUIElementPerformAction(input, kAXConfirmAction as CFString)
-    guard confirm == .success else {
-        return ["method": "ax_confirm", "submitted": false, "confirmed": false, "code": confirm.rawValue]
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(root, &pid) == .success, let app = NSRunningApplication(processIdentifier: pid) else {
+        return rejected("target_process_unavailable")
     }
-    // WeCom does not consistently clear AXValue after accepting AXConfirmAction.
-    // "confirmed" is therefore only an input-state observation; the caller must
-    // verify delivery from a newly visible outgoing bubble.
+    app.activate(options: [])
+    AXUIElementSetAttributeValue(root, kAXFocusedUIElementAttribute as CFString, input)
+    AXUIElementSetAttributeValue(input, kAXFocusedAttribute as CFString, boolValue(true))
+    func hasInputFocus() -> Bool {
+        var focused: CFTypeRef?
+        return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+            && AXUIElementCopyAttributeValue(root, kAXFocusedUIElementAttribute as CFString, &focused) == .success
+            && focused.map { CFEqual($0, input) } == true
+    }
+    for _ in 0..<8 {
+        if hasInputFocus() { break }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    guard let currentSelected = selectedConversationRow(root: root, window: window),
+          CFEqual(currentSelected, selected), collectText(currentSelected) == selectedTexts else {
+        return rejected("conversation_changed_before_submit")
+    }
+    guard inputStillContains(input, text: text) else { return rejected("input_modified_before_submit") }
+    guard hasInputFocus() else { return rejected("chat_input_focus_not_confirmed") }
+    guard let source = CGEventSource(stateID: .privateState),
+          let down = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+          let up = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) else {
+        return rejected("return_event_unavailable")
+    }
+    down.flags = []
+    up.flags = []
+    // Send once to the verified process, never to whichever app gains global focus.
+    // Input clearing is only a hint; the worker must still verify a new outgoing bubble.
+    down.postToPid(pid)
+    up.postToPid(pid)
     return [
-        "method": "ax_confirm",
+        "method": "targeted_return",
         "submitted": true,
         "confirmed": waitUntilInputChanges(input, text: text),
-        "code": confirm.rawValue,
     ]
 }
 
@@ -1299,7 +1408,7 @@ func chatRows(root: AXUIElement, window: AXUIElement?) -> [AXUIElement] {
     }
 }
 
-func chatSnapshotContext(window: AXUIElement?) -> (table: AXUIElement?, payloads: [[String: Any]], selected: AXUIElement?) {
+func chatSnapshotContext(window: AXUIElement?, last: Int) -> (table: AXUIElement?, payloads: [[String: Any]], selected: AXUIElement?) {
     guard let window = window else { return (nil, [], nil) }
     var tables: [AXUIElement] = []
     measured("locate_table_tree") { collectTables(window, tables: &tables, maxDepth: 14, descendIntoTables: false) }
@@ -1326,14 +1435,17 @@ func chatSnapshotContext(window: AXUIElement?) -> (table: AXUIElement?, payloads
             continue
         }
         guard viewport["width", default: 0] >= 240, !rows.isEmpty else { continue }
-        let snapshots = measured("read_rows") { rows.map { readChatNodes($0) } }
+        let indices = chatWindowIndices(rowCount: rows.count, last: last)
+        let snapshots = measured("read_rows") { indices.map { readChatNodes(rows[$0]) } }
         let score = snapshots.reduce(0) { count, nodes in
             count + nodes.filter { $0.depth <= 7 && $0.role == "AXTextArea" && !$0.trimmedTexts.isEmpty }.count
         }
         let area = viewport["width", default: 0] * viewport["height", default: 0]
         if score > bestScore || (score == bestScore && area > bestArea) {
             bestTable = table
-            bestPayloads = snapshots.enumerated().map { chatPayload($0.element, index: $0.offset + 1, viewport: viewport) }
+            bestPayloads = snapshots.enumerated().map {
+                chatPayload($0.element, index: indices.lowerBound + $0.offset + 1, viewport: viewport)
+            }
             bestScore = score
             bestArea = area
         }
@@ -1390,7 +1502,7 @@ func sidebarRightBoundary(root: AXUIElement, window: AXUIElement?) -> Double? {
     return rightSidebarLeftBoundary(root: root, window: window)
 }
 
-func bestTextInput(root: AXUIElement, window: AXUIElement?) -> AXUIElement? {
+func bestTextInput(root: AXUIElement, window: AXUIElement?, requireChatInput: Bool = false) -> AXUIElement? {
     var inputs: [AXUIElement] = []
     if let window = window {
         settableTextInputs(window, inputs: &inputs)
@@ -1417,6 +1529,7 @@ func bestTextInput(root: AXUIElement, window: AXUIElement?) -> AXUIElement? {
             && (sidebarLeft <= 0 || centerX < sidebarLeft - 12)
             && (bottomMin <= 0 || centerY >= bottomMin)
     }
+    if requireChatInput { return chatInputs.count == 1 ? chatInputs[0] : nil }
     if let input = chatInputs.max(by: { inputScore($0) < inputScore($1) }) {
         return input
     }
@@ -1495,22 +1608,34 @@ func inputReadyPayload(root: AXUIElement, window: AXUIElement?) -> [String: Any]
     ]
 }
 
-func sendReadyPayload(root: AXUIElement, window: AXUIElement?) -> [String: Any] {
-    guard let input = bestTextInput(root: root, window: window) else {
-        return ["ok": false, "error": "chat_input_not_found"]
+func textInputPreflight(value: CFTypeRef?, status: AXError) -> [String: Any] {
+    // Empty input is a valid AX value. stringAttr intentionally drops empty text.
+    guard status == .success,
+          let text = (value as? String) ?? (value as? NSAttributedString)?.string else {
+        return ["ok": false, "error": "chat_input_value_unavailable", "submitted": false]
     }
+    return ["ok": text.isEmpty, "error": text.isEmpty ? "" : "chat_input_not_empty",
+            "submitted": false, "input": ["valueLength": text.count]]
+}
+
+func textInputPreflight(_ input: AXUIElement) -> [String: Any] {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(input, kAXValueAttribute as CFString, &value)
+    return textInputPreflight(value: value, status: status)
+}
+
+func sendReadyPayload(root: AXUIElement, window: AXUIElement?) -> [String: Any] {
+    guard let input = bestTextInput(root: root, window: window, requireChatInput: true) else {
+        return ["ok": false, "error": "chat_input_not_found", "submitted": false]
+    }
+    var result = textInputPreflight(input)
     let pos = pointAttr(input, kAXPositionAttribute as CFString) ?? .zero
     let size = sizeAttr(input) ?? .zero
-    return [
-        "ok": true,
-        "input": [
-            "x": Double(pos.x),
-            "y": Double(pos.y),
-            "width": Double(size.width),
-            "height": Double(size.height),
-            "valueLength": (stringAttr(input, kAXValueAttribute as CFString) ?? "").count,
-        ],
-    ]
+    var details = result["input"] as? [String: Any] ?? [:]
+    details.merge(["x": Double(pos.x), "y": Double(pos.y),
+                   "width": Double(size.width), "height": Double(size.height)]) { _, new in new }
+    result["input"] = details
+    return result
 }
 
 func collectWebAreas(_ element: AXUIElement, out: inout [AXUIElement], maxDepth: Int = 14, depth: Int = 0) {
@@ -1585,16 +1710,17 @@ if command == "chat-fixture", args.count == 3 {
         let rows: [[ChatNodeSnapshot]]
         let viewport: [String: Double]?
         let afterRows: [[ChatNodeSnapshot]]?
+        let last: Int?
     }
     do {
         let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
         let fixture = try JSONDecoder().decode(Fixture.self, from: data)
-        let payloads = fixture.rows.enumerated().map {
-            chatPayload($0.element, index: $0.offset + 1, viewport: fixture.viewport)
+        let payloads = chatWindowIndices(rowCount: fixture.rows.count, last: fixture.last ?? 0).map {
+            chatPayload(fixture.rows[$0], index: $0 + 1, viewport: fixture.viewport)
         }
         if let afterRows = fixture.afterRows {
-            let afterPayloads = afterRows.enumerated().map {
-                chatPayload($0.element, index: $0.offset + 1, viewport: fixture.viewport)
+            let afterPayloads = chatWindowIndices(rowCount: afterRows.count, last: fixture.last ?? 0).map {
+                chatPayload(afterRows[$0], index: $0 + 1, viewport: fixture.viewport)
             }
             jsonLine(["snapshotsMatch": chatSnapshotsMatch(payloads, afterPayloads)])
         } else {
@@ -1611,10 +1737,31 @@ if command == "bubble-fixture", args.count == 4 {
               let bodies = fixture["bodies"] as? [[String: Double]],
               let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: args[3]) as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { exit(2) }
-        let boxes = bubbleComponents(image: image, window: cgRect(w), viewport: cgRect(v))
-        for body in bodies { jsonLine(bubbleEvidence(body: cgRect(body), viewport: cgRect(v), boxes: boxes)) }
+        let images = fixture["images"] as? Bool == true
+        let boxes = bubbleComponents(image: image, window: cgRect(w), viewport: cgRect(v), images: images)
+        for body in bodies {
+            jsonLine(images ? imageBubbleEvidence(row: cgRect(body), viewport: cgRect(v), boxes: boxes)
+                            : bubbleEvidence(body: cgRect(body), viewport: cgRect(v), boxes: boxes))
+        }
         exit(0)
     } catch { fputs("Invalid bubble fixture\n", stderr); exit(2) }
+}
+if command == "input-fixture", args.count == 3 {
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: args[2]))
+        guard let cases = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { exit(2) }
+        for item in cases {
+            let value: CFTypeRef?
+            if item["attributed"] as? Bool == true, let text = item["value"] as? String {
+                value = NSAttributedString(string: text)
+            } else {
+                value = item["value"] as CFTypeRef?
+            }
+            let status = AXError(rawValue: Int32(item["status"] as? Int ?? 0)) ?? .failure
+            jsonLine(textInputPreflight(value: value, status: status))
+        }
+        exit(0)
+    } catch { fputs("Invalid input fixture\n", stderr); exit(2) }
 }
 if command == "chat" {
     NSApplication.shared.setActivationPolicy(.prohibited)
@@ -1667,10 +1814,11 @@ if command == "rows" {
 } else if command == "sidebar-identity" {
     jsonLine(sidebarIdentityPayload(root: root, window: window))
 } else if command == "chat" || command == "chat-all" {
-    let context = measured("locate_chat") { chatSnapshotContext(window: window) }
+    let last = max(0, intArg(2, defaultValue: command == "chat" ? 20 : 0))
+    let context = measured("locate_chat") { chatSnapshotContext(window: window, last: last) }
     let rawPayloads = context.payloads
     let payloads = command == "chat" ? verifyBubbleDirections(rawPayloads, root: root, window: window,
-        table: context.table, selected: context.selected) : rawPayloads
+        table: context.table, selected: context.selected, last: last) : rawPayloads
     for var payload in payloads {
         payload["snapshotComplete"] = true
         jsonLine(payload)
@@ -1821,32 +1969,44 @@ if command == "rows" {
 } else if command == "send" || command == "stage" {
     let text = args.dropFirst(2).joined(separator: " ")
     if text.isEmpty {
-        jsonLine(["ok": false, "error": "missing_text"])
+        jsonLine(["ok": false, "error": "missing_text", "submitted": false])
         exit(0)
     }
-    guard let input = bestTextInput(root: root, window: window) else {
-        jsonLine(["ok": false, "error": "chat_input_not_found"])
+    guard let selected = selectedConversationRow(root: root, window: window) else {
+        jsonLine(["ok": false, "error": "selected_conversation_not_found", "submitted": false])
+        exit(0)
+    }
+    let selectedTexts = collectText(selected)
+    guard let input = bestTextInput(root: root, window: window, requireChatInput: true) else {
+        jsonLine(["ok": false, "error": "chat_input_not_found", "submitted": false])
+        exit(0)
+    }
+    let preflight = textInputPreflight(input)
+    guard preflight["ok"] as? Bool == true else {
+        jsonLine(preflight)
         exit(0)
     }
     let setResult = AXUIElementSetAttributeValue(input, kAXValueAttribute as CFString, text as CFTypeRef)
     if setResult != .success {
-        jsonLine(["ok": false, "error": "set_input_failed", "code": setResult.rawValue])
+        jsonLine(["ok": false, "error": "set_input_failed", "code": setResult.rawValue, "submitted": false])
         exit(0)
     }
     Thread.sleep(forTimeInterval: 0.15)
     guard inputStillContains(input, text: text) else {
-        jsonLine(["ok": false, "error": "input_modified_before_submit"])
+        jsonLine(["ok": false, "error": "input_modified_before_submit", "submitted": false])
         exit(0)
     }
     var submitResult: [String: Any] = ["method": "stage_only"]
     if command == "send" {
-        submitResult = submitInput(input: input, text: text)
+        submitResult = submitInput(root: root, window: window, input: input, text: text,
+                                   selected: selected, selectedTexts: selectedTexts)
     }
     let pos = pointAttr(input, kAXPositionAttribute as CFString) ?? .zero
     let size = sizeAttr(input) ?? .zero
     jsonLine([
         "ok": command == "stage" || (submitResult["submitted"] as? Bool == true),
-        "submitted": command == "send",
+        "submitted": submitResult["submitted"] as? Bool ?? false,
+        "error": submitResult["reason"] ?? "",
         "chars": text.count,
         "method": submitResult["method"] ?? "ax_text_input",
         "submit": submitResult,

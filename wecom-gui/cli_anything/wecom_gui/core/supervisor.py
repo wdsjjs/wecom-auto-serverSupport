@@ -81,7 +81,7 @@ def _command(service: str) -> str:
     python_path = os.environ.get("WECOM_GUI_PYTHONPATH", "")
     prefix = f"PYTHONPATH={shlex.quote(python_path)} " if python_path else ""
     if service == "edge":
-        args = [python, "-u", "-m", "cli_anything.wecom_gui", "edge-channel", "run", "--poll", os.environ.get("WECOM_EDGE_CHANNEL_POLL", "1"), "--inbox-limit", os.environ.get("WECOM_EDGE_CHANNEL_INBOX_LIMIT", "8"), "--last", os.environ.get("WECOM_EDGE_CHANNEL_LAST", "100")]
+        args = [python, "-u", "-m", "cli_anything.wecom_gui", "edge-channel", "run", "--poll", os.environ.get("WECOM_EDGE_CHANNEL_POLL", "1"), "--inbox-limit", os.environ.get("WECOM_EDGE_CHANNEL_INBOX_LIMIT", "8"), "--last", os.environ.get("WECOM_EDGE_CHANNEL_LAST", "20")]
     else:
         raise ValueError("service must be edge")
     return f"cd {shlex.quote(str(ROOT_DIR))} && {prefix}{' '.join(shlex.quote(str(item)) for item in args)}"

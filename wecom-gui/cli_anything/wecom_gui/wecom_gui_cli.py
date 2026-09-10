@@ -420,7 +420,7 @@ def edge_channel_status() -> None:
 @click.option("--once", is_flag=True, help="Run one capture/upload/pull/send tick and exit.")
 @click.option("--poll", default=1.0, show_default=True, type=click.FloatRange(min=0.1))
 @click.option("--inbox-limit", default=30, show_default=True, type=click.IntRange(min=1, max=100))
-@click.option("--last", default=100, show_default=True, type=click.IntRange(min=1, max=100))
+@click.option("--last", default=20, show_default=True, type=click.IntRange(min=1, max=100))
 def edge_channel_run(once: bool, poll: float, inbox_limit: int, last: int) -> None:
     """Capture external direct chats and execute centrally issued commands."""
     if once:

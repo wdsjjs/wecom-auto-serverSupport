@@ -60,7 +60,8 @@ def send_message(
         result["attachment_count"] = 0
         return result
 
-    text_result = send_text(text, dry_run=False, submit=False) if text.strip() else {"ok": True, "chars": 0}
+    text_result = send_text(text, dry_run=False, submit=False,
+                            allow_clipboard_fallback=allow_clipboard_fallback) if text.strip() else {"ok": True, "chars": 0}
     if text_result is None:
         text_result = {"ok": True, "submitted": False, "chars": len(text)}
     file_results = []

@@ -22,6 +22,57 @@ class FakeChannel:
         return {"accepted": True}
 
 
+def test_inbound_png_uses_png_multipart_type_and_closes_file(tmp_path, monkeypatch):
+    path = tmp_path / "capture.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\nimage content")
+    client = edge_channel.ChannelClient(edge_channel.ChannelConfig("https://example.test", "device", "test", False, 5))
+    handles = []
+
+    def request(method, endpoint, **kwargs):
+        field, (name, handle, mime) = kwargs["files"][0]
+        assert field == "media"
+        assert name == "capture.png"
+        assert mime == "image/png"
+        assert handle.read() == path.read_bytes()
+        handles.append(handle)
+        return {"accepted": True}
+    monkeypatch.setattr(client, "_json_request", request)
+    payload = _inbound_payload()
+    payload["message"]["media"] = [{"type": "image", "media_id": "media-1"}]
+    client.post_inbound(payload, [{"capture_path": str(path)}])
+    assert handles[0].closed
+
+
+def test_registration_capability_is_explicit_and_registration_requires_ack(monkeypatch):
+    client = edge_channel.ChannelClient(edge_channel.ChannelConfig("https://example.test", "device", "test", False, 5))
+    monkeypatch.setattr(client, "_json_request", lambda *args, **kwargs: {"capabilities": {"deferredMediaV1": True}})
+    client.heartbeat()
+    assert client.supports_deferred_media
+    monkeypatch.setattr(client, "_json_request", lambda *args, **kwargs: {"status": "active"})
+    client.heartbeat()
+    assert not client.supports_deferred_media
+    with pytest.raises(edge_channel.ChannelError, match="not acknowledged"):
+        client.register_message(_inbound_payload())
+
+
+def test_attachment_only_request_requires_ready_ack_and_uses_original_message_id(tmp_path, monkeypatch):
+    client = edge_channel.ChannelClient(edge_channel.ChannelConfig("https://example.test", "device", "test", False, 5))
+    path = tmp_path / "test.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\nimage bytes")
+    event = _inbound_payload()
+    event["message"]["media"] = [{"media_id": "media-1"}]
+    state_response = "pending"
+    def request(method, endpoint, **kwargs):
+        assert endpoint == "/api/wecom-channel/edge/messages/edge-msg-1/media"
+        assert kwargs["files"][0][0] == "media"
+        return {"accepted": True, "message": {"mediaState": state_response}}
+    monkeypatch.setattr(client, "_json_request", request)
+    with pytest.raises(edge_channel.ChannelError, match="not acknowledged"):
+        client.post_inbound(event, [{"capture_path": str(path)}], attachment_only=True)
+    state_response = "ready"
+    assert client.post_inbound(event, [{"capture_path": str(path)}], attachment_only=True)["accepted"]
+
+
 def _inbound_payload() -> dict:
     return {
         "event_type": "inbound_message",
@@ -48,6 +99,42 @@ def _match_sidebar_identity(monkeypatch) -> None:
         "cli_anything.wecom_gui.core.edge_worker._current_identity_for_row",
         lambda row: (str(row.get("external_user_id") or "customer-1"), ""),
     )
+
+
+@pytest.mark.parametrize("submitted,status", [
+    (False, "precondition_failed"), (None, "needs_reconciliation"), (True, "needs_reconciliation"),
+])
+def test_text_submit_failure_keeps_specific_reason_and_never_retries(monkeypatch, tmp_path, submitted, status):
+    monkeypatch.setattr(state, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(edge_worker.inbox, "open_row", lambda row: None)
+    monkeypatch.setattr(edge_worker, "_wait_for_opened_conversation", lambda row: True)
+    monkeypatch.setattr(edge_worker.macos_backend, "send_input_ready", lambda: {"ok": True, "input": {"valueLength": 0}})
+    reads = []
+    monkeypatch.setattr(edge_worker.chat, "read_current", lambda **kwargs: reads.append(kwargs) or {"messages": []})
+    sends = []
+
+    def fail_send(*args, **kwargs):
+        sends.append(args)
+        raise edge_worker.macos_backend.TextSendError("chat_input_focus_not_confirmed", submitted=submitted)
+
+    monkeypatch.setattr(edge_worker.reply, "send_message", fail_send)
+    result = edge_worker.execute_command(FakeChannel(), _command())
+    assert result == {"status": status, "reason": "text_send:chat_input_focus_not_confirmed"}
+    assert len(sends) == 1
+    assert len(reads) == (1 if submitted is False else 2)
+
+
+def test_unreadable_input_is_not_treated_as_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr(state, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(edge_worker.inbox, "open_row", lambda row: None)
+    monkeypatch.setattr(edge_worker, "_wait_for_opened_conversation", lambda row: True)
+    monkeypatch.setattr(edge_worker.macos_backend, "send_input_ready", lambda: {
+        "ok": False, "error": "chat_input_value_unavailable", "input": {},
+    })
+    monkeypatch.setattr(edge_worker.reply, "send_message", lambda *args, **kwargs: pytest.fail("must not send"))
+    assert edge_worker.execute_command(FakeChannel(), _command()) == {
+        "status": "precondition_failed", "reason": "chat_input_value_unavailable",
+    }
 
 
 def test_inbound_spool_reuses_persisted_event_id_and_retries(monkeypatch, tmp_path):

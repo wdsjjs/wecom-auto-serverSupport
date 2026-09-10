@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cli_anything.wecom_gui.core import chat, edge_channel, edge_state, inbox, reply, runtime_reporting, state
+from cli_anything.wecom_gui.core import chat, edge_channel, edge_message_ledger, edge_state, inbox, reply, runtime_reporting, state
 from cli_anything.wecom_gui.utils import macos_backend
 
 
@@ -159,6 +159,7 @@ def _event_for_row(
     external_user_id: str,
     turn_position: int,
     direction: str = "inbound",
+    ledger_entry: dict | None = None,
 ) -> tuple[str, dict, list[dict]]:
     conversation_key = state.conversation_key_for_uid(external_user_id) or state.conversation_key_for_row(row)
     message_id, message_hash = _message_identity(
@@ -167,12 +168,15 @@ def _event_for_row(
         turn_position,
         direction=direction,
     )
+    if ledger_entry is not None:
+        message_id, message_hash = ledger_entry["event_id"], ledger_entry["event_hash"]
     media = _media_fingerprint(message.get("media") or [])
     for index, item in enumerate(media):
         item["media_id"] = f"edge-media-{message_hash[:16]}-{index}"
     payload = {
         "event_type": f"{direction}_message",
-        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "occurred_at": (datetime.fromtimestamp(ledger_entry["occurred_at"], timezone.utc)
+                        if ledger_entry is not None else datetime.now(timezone.utc)).isoformat(),
         "conversation": {
             "key": conversation_key,
             "external_user_id": external_user_id,
@@ -185,6 +189,8 @@ def _event_for_row(
             "text": _message_text(message),
             "media": [{key: value for key, value in item.items() if key != "capture_path"} for item in media],
             "visible_chat_hash": str(current.get("hash") or ""),
+            **({"source": {"stream_id": ledger_entry["stream_id"], "sequence": ledger_entry["sequence"]}}
+               if ledger_entry and ledger_entry.get("stream_id") else {}),
         },
     }
     return f"{conversation_key}:{message_hash}", payload, media
@@ -265,7 +271,7 @@ def _visible_observation_fingerprints(messages: list[dict]) -> list[tuple[str, d
 
 def collect_visible_conversation_once(
     *,
-    last: int = 100,
+    last: int = 20,
     expected_row: dict | None = None,
     bootstrap_recent_count: int = 0,
 ) -> dict:
@@ -286,95 +292,181 @@ def collect_visible_conversation_once(
             conversation_key = state.conversation_key_for_uid(external_user_id) or state.conversation_key_for_row(row)
             messages = current.get("messages") or []
             candidates = _visible_observation_fingerprints(messages)
-            pending_fingerprints = set(edge_state.record_visible_chat_observations(
-                conversation_key,
-                [fingerprint for fingerprint, _message, _position in candidates],
+            return _capture_ordered_snapshot(
+                row, current, external_user_id, conversation_key, candidates,
                 bootstrap_recent_count=bootstrap_recent_count,
-            ))
-            captured = 0
-            pending_direction = 0
-            for fingerprint, message, position in candidates:
-                if fingerprint not in pending_fingerprints:
-                    continue
-                text = _message_text(message)
-                role = str(message.get("role") or "").strip()
-                confidence = str(message.get("role_confidence") or "").strip().lower()
-                if not confidence and role in {"用户", "客服"}:
-                    confidence = "high"
-                # Re-reading an unknown message must retain its original message ID and position.
-                event_position = position
-                if role == "用户" and confidence in {"high", "medium"}:
-                    direction = "inbound"
-                elif role == "客服" and confidence in {"high", "medium"}:
-                    if text and edge_state.consume_outbound_echo_suppression(conversation_key, text):
-                        edge_state.mark_chat_observation_captured(conversation_key, fingerprint, confidence=confidence)
-                        continue
-                    evidence = message.get("direction_evidence") or {}
-                    direction = "outbound" if (
-                        evidence.get("source") == "screencapturekit"
-                        and evidence.get("status") == "matched" and evidence.get("side") == "right"
-                    ) else "unknown"
-                else:
-                    key, payload, media = _event_for_row(
-                        row,
-                        current,
-                        message,
-                        external_user_id,
-                        position,
-                        direction="unknown",
-                    )
-                    inserted, _event = edge_state.enqueue_inbound(dedupe_key=key, payload=payload, media=media)
-                    edge_state.mark_chat_observation_pending_direction(
-                        conversation_key,
-                        fingerprint,
-                        confidence=confidence or "unknown",
-                    )
-                    captured += int(inserted)
-                    pending_direction += 1
-                    continue
-                if _has_unsupported_media(message):
-                    edge_state.ignore_chat_observation(conversation_key, fingerprint, reason="unsupported_media")
-                    continue
-                if direction == "unknown":
-                    key, payload, media = _event_for_row(
-                        row,
-                        current,
-                        message,
-                        external_user_id,
-                        event_position,
-                        direction="unknown",
-                    )
-                    inserted, _event = edge_state.enqueue_inbound(dedupe_key=key, payload=payload, media=media)
-                    edge_state.mark_chat_observation_pending_direction(
-                        conversation_key,
-                        fingerprint,
-                        confidence=confidence or "unknown",
-                    )
-                    captured += int(inserted)
-                    pending_direction += 1
-                    continue
-                key, payload, media = _event_for_row(
-                    row,
-                    current,
-                    message,
-                    external_user_id,
-                    event_position,
-                    direction=direction,
-                )
-                inserted, _event = edge_state.enqueue_inbound(dedupe_key=key, payload=payload, media=media)
-                edge_state.mark_chat_observation_captured(conversation_key, fingerprint, confidence=confidence)
-                captured += int(inserted)
-            return {
-                    "ok": True,
-                    "captured": captured,
-                    "pending_direction": pending_direction,
-                    "baseline": not pending_fingerprints,
-                }
+            )
     except Exception as exc:
         return {"ok": False, "captured": 0, "reason": f"visible_capture_exception:{type(exc).__name__}"}
 
 
-def collect_visible_outbound_once(*, last: int = 100) -> dict:
+def _snapshot_match_key(message: dict) -> str:
+    # A screenshot becomes available later; file digests must not change alignment.
+    return _hash(json.dumps([_message_text(message),
+                            [str(item.get("type") or "image") for item in message.get("media") or []]],
+                           ensure_ascii=False))
+
+
+class MediaCapturePending(ValueError):
+    """A bounded, non-sensitive reason to retry media collection."""
+
+
+def _capture_snapshot_image(row, candidates, index, missing_indices):
+    macos_backend.activate_app()
+    selected = macos_backend.selected_conversation_row(limit=30)
+    if not _row_matches_opened(row, selected):
+        raise MediaCapturePending("media_conversation_changed")
+    fresh = chat.read_current(last=max(20, len(candidates)), capture_images=False)
+    messages = [msg for _, msg, _ in _visible_observation_fingerprints(fresh.get("messages") or [])]
+    if [_snapshot_match_key(msg) for msg in messages] != [_snapshot_match_key(msg) for _, msg, _ in candidates]:
+        raise MediaCapturePending("media_snapshot_changed")
+    if not _row_matches_opened(row, macos_backend.selected_conversation_row(limit=30)):
+        raise MediaCapturePending("media_conversation_changed")
+    media = messages[index].get("media") or []
+    missing = [media[i] for i in missing_indices]
+    for item in missing:
+        rect, viewport = item.get("rect") or {}, item.get("chat_viewport") or {}
+        x, y, w, h = (float(rect.get(k) or 0) for k in ("x", "y", "width", "height"))
+        vx, vy, vw, vh = (float(viewport.get(k) or 0) for k in ("x", "y", "width", "height"))
+        if not (w > 0 and h > 0 and vw > 0 and vh > 0
+                and vx <= x and vy <= y and x + w <= vx + vw and y + h <= vy + vh):
+            raise MediaCapturePending("media_not_visible")
+    # A transient preview failure must stay retryable, not become a sticker.
+    return macos_backend.capture_chat_images(
+        [{**messages[index], "media": missing}], cache_preview_failures=False,
+    )[0]["media"]
+
+
+def _prepare_snapshot_media(row, candidates, index, entry, existing):
+    message = candidates[index][1]
+    media = [dict(item) for item in message.get("media") or []]
+    cached = edge_message_ledger.media_state(entry)
+    for saved in [existing.get("media") if existing else [], json.loads(cached["files_json"])]:
+        if len(saved) != len(media):
+            continue
+        for i, item in enumerate(saved):
+            if edge_state.media_files_ready([item]):
+                media[i] = {**media[i], **item}
+    missing = [i for i, item in enumerate(media) if not edge_state.media_files_ready([item])]
+    if missing:
+        if cached["next_attempt_at"] > time.time():
+            return None
+        try:
+            captured = _capture_snapshot_image(row, candidates, index, missing)
+            if len(captured) != len(missing):
+                raise ValueError("media_capture_count_mismatch")
+            for i, item in zip(missing, captured):
+                media[i] = item
+            if not edge_state.media_files_ready(media):
+                errors = {str(item.get("error") or "media_file_missing") for item in media
+                          if not edge_state.media_files_ready([item])}
+                edge_message_ledger.save_media(entry, media, error=",".join(sorted(errors)))
+                return None
+        except Exception as exc:
+            edge_message_ledger.save_media(entry, media, error=(str(exc) if isinstance(exc, MediaCapturePending)
+                                                              else f"media_capture:{type(exc).__name__}"))
+            return None
+    edge_message_ledger.save_media(entry, media)
+    return {**message, "media": media}
+
+
+def _capture_ordered_snapshot(row, current, external_user_id, conversation_key, candidates, *, bootstrap_recent_count=0):
+    descriptors = []
+    for fingerprint, message, position in candidates:
+        media = [{"type": item["type"], "sha256": item["sha256"]}
+                 for item in _media_fingerprint(message.get("media") or [])]
+        descriptors.append({
+            "match_key": _hash(json.dumps([_message_text(message), media], ensure_ascii=False)),
+            "legacy_fingerprint": fingerprint,
+            "legacy_hash": _message_identity(conversation_key, message, position)[1],
+            "message": message,
+            "media_only": bool(media) and _message_text(message) in {"[图片]", ""},
+        })
+    captured = pending_direction = pending_media = 0
+    # Reserve durable identities first; slow GUI capture must not hold a DB lock.
+    with edge_message_ledger.transaction() as conn:
+        entries, reason = edge_message_ledger.prepare(
+            conn, conversation_key, descriptors, bootstrap_recent_count=bootstrap_recent_count,
+        )
+        if reason == "message_alignment_pending":
+            return {"ok": False, "captured": 0, "reason": reason, "pending_alignment": 1}
+    prepared = []
+    for index, (entry, (_fingerprint, message, position)) in enumerate(zip(entries, candidates)):
+        if entry["capture_status"] in {"baseline", "ignored"}:
+            continue
+        existing = edge_state.inbound_by_key(f'{conversation_key}:{entry["event_hash"]}')
+        repair_media = bool(existing and existing["media"] and (
+            existing["status"] == edge_state.WAITING_MEDIA or
+            (existing["status"] == edge_state.PENDING and not edge_state.media_files_ready(existing["media"]))))
+        if entry["capture_status"] == "captured" and not repair_media:
+            continue
+        if repair_media:
+            edge_state.wait_for_inbound_media(existing["client_event_id"])
+        if not message.get("media") and (repair_media or entry["capture_status"] == "pending_media"):
+            pending_media += 1
+            continue
+        prepared.append((entry, message, position, index, existing))
+    # Enqueue and captured status still commit atomically. A failed commit leaves
+    # reserved pending rows (and cached files) available with the same IDs.
+    with edge_message_ledger.transaction() as conn:
+        for entry, message, position, _index, _existing in prepared:
+            text = _message_text(message)
+            role = str(message.get("role") or "").strip()
+            confidence = str(message.get("role_confidence") or "").strip().lower()
+            if not confidence and role in {"用户", "客服"}:
+                confidence = "high"
+            direction = "unknown"
+            if role == "用户" and confidence in {"high", "medium"}:
+                direction = "inbound"
+            elif role == "客服" and confidence in {"high", "medium"}:
+                if text and edge_state.consume_outbound_echo_suppression(conversation_key, text, connection=conn):
+                    edge_message_ledger.mark(conn, entry, status="captured", direction="outbound")
+                    continue
+                evidence = message.get("direction_evidence") or {}
+                if (evidence.get("source") == "screencapturekit" and evidence.get("status") == "matched"
+                        and evidence.get("side") == "right"):
+                    direction = "outbound"
+            if _has_unsupported_media(message):
+                edge_message_ledger.mark(conn, entry, status="ignored")
+                continue
+            key, payload, media = _event_for_row(
+                row, current, message, external_user_id, position, direction=direction, ledger_entry=entry,
+            )
+            inserted, event = edge_state.enqueue_inbound(
+                dedupe_key=key, payload=payload, media=media, connection=conn,
+            )
+            direction = event["payload"]["message"]["direction"]
+            needs_media = bool(media) and not edge_state.media_files_ready(event["media"])
+            edge_message_ledger.mark(conn, entry, direction=direction,
+                status="pending_media" if needs_media else "pending_direction" if direction == "unknown" else "captured")
+            captured += int(inserted)
+            pending_direction += int(direction == "unknown")
+    # Registration is now durable even when image capture is unavailable.
+    for entry, message, position, index, existing in prepared:
+        if not message.get("media") or _has_unsupported_media(message):
+            continue
+        enriched = _prepare_snapshot_media(row, candidates, index, entry, existing)
+        if enriched is None:
+            pending_media += 1
+            continue
+        with edge_message_ledger.transaction() as conn:
+            key, payload, media = _event_for_row(row, current, enriched, external_user_id, position, ledger_entry=entry)
+            # Direction was decided above; attachment completion must not change it.
+            saved = conn.execute("SELECT payload_json FROM edge_inbound_events WHERE dedupe_key = ?", (key,)).fetchone()
+            if not saved:
+                continue
+            payload = json.loads(saved[0])
+            payload["message"]["media"] = [{k: v for k, v in item.items() if k != "capture_path"} for item in media]
+            _, event = edge_state.enqueue_inbound(dedupe_key=key, payload=payload, media=media, connection=conn)
+            direction = event["payload"]["message"]["direction"]
+            edge_message_ledger.mark(conn, entry, direction=direction,
+                                     status="pending_direction" if direction == "unknown" else "captured")
+    return {"ok": True, "captured": captured, "pending_direction": pending_direction,
+            "pending_media": pending_media,
+            "baseline": all(entry["capture_status"] == "baseline" for entry in entries)}
+
+
+def collect_visible_outbound_once(*, last: int = 20) -> dict:
     """Compatibility wrapper for callers that only reported staff capture."""
     return collect_visible_conversation_once(last=last)
 
@@ -395,14 +487,44 @@ def _event_for_upload(payload: dict) -> dict:
 def flush_inbound(client: edge_channel.ChannelClient) -> dict:
     delivered = failed = 0
     for event in edge_state.due_inbound():
+        # A server rollback or lost heartbeat must not send a registered placeholder
+        # through the old duplicate path, which cannot attach its missing files.
+        if event["registration_started"] and not getattr(client, "supports_deferred_media", False):
+            continue
+        deferred = bool(getattr(client, "supports_deferred_media", False) and event["payload"]["message"].get("source"))
+        if deferred and event["registered_direction"] != event["payload"]["message"]["direction"]:
+            continue
+        if not edge_state.media_files_ready(event["media"]):
+            edge_state.wait_for_inbound_media(event["client_event_id"])
+            continue
         try:
-            client.post_inbound(_event_for_upload(dict(event["payload"])), list(event["media"]))
+            client.post_inbound(_event_for_upload(dict(event["payload"])), list(event["media"]),
+                                **({"attachment_only": True} if deferred else {}))
             edge_state.mark_inbound_delivered(event["client_event_id"])
             delivered += 1
         except Exception as exc:
             edge_state.retry_inbound(event["client_event_id"], str(exc), delay_seconds=_retry_delay(event["attempts"]))
             failed += 1
     return {"delivered": delivered, "failed": failed}
+
+
+def flush_registrations(client: edge_channel.ChannelClient) -> dict:
+    registered = failed = 0
+    if not getattr(client, "supports_deferred_media", False):
+        return {"registered": 0, "failed": 0}
+    for event in edge_state.due_registrations():
+        try:
+            edge_state.start_registration(event["client_event_id"])
+            result = client.register_message(_event_for_upload(event["payload"]))
+            edge_state.mark_registered(event["client_event_id"], event["payload"]["message"]["direction"])
+            if not event["media"] or result.get("message", {}).get("mediaState") == "ready":
+                edge_state.mark_inbound_delivered(event["client_event_id"])
+            registered += 1
+        except Exception as exc:
+            edge_state.retry_registration(event["client_event_id"], type(exc).__name__,
+                                          _retry_delay(event["registration_attempts"]))
+            failed += 1
+    return {"registered": registered, "failed": failed}
 
 
 def _command_expired(command: dict) -> bool:
@@ -520,6 +642,8 @@ def execute_command(client: edge_channel.ChannelClient, command: dict, *, last: 
             if not _wait_for_opened_conversation(row):
                 return {"status": "precondition_failed", "reason": "opened_conversation_mismatch"}
             input_state = macos_backend.send_input_ready()
+            if not input_state.get("ok"):
+                return {"status": "precondition_failed", "reason": str(input_state.get("error") or "chat_input_not_ready")}
             if int((input_state.get("input") or {}).get("valueLength") or 0) > 0:
                 return {"status": "precondition_failed", "reason": "chat_input_not_empty"}
             before = chat.read_current(last=last, capture_images=False)
@@ -536,12 +660,16 @@ def execute_command(client: edge_channel.ChannelClient, command: dict, *, last: 
                     allow_clipboard_fallback=False,
                 )
             except Exception as exc:
+                if isinstance(exc, macos_backend.TextSendError) and exc.submitted is False:
+                    return {"status": "precondition_failed", "reason": f"text_send:{exc.reason_code}"}
                 after_error = chat.read_current(last=last, capture_images=False)
                 if _visible_outbound_reply_count(after_error.get("messages") or [], text) > before_outbound_replies or (
                     not text and attachments and _outbound_image_count(after_error.get("messages") or []) > before_outbound_images
                 ):
                     return {"status": "succeeded", "verification": "visible_after_send_error"}
-                return {"status": "needs_reconciliation", "reason": f"send_exception:{type(exc).__name__}"}
+                reason = (f"text_send:{exc.reason_code}" if isinstance(exc, macos_backend.TextSendError)
+                          else f"send_exception:{type(exc).__name__}")
+                return {"status": "needs_reconciliation", "reason": reason}
             if text and _wait_for_visible_outbound_reply(text, before_count=before_outbound_replies, last=last):
                 return {"status": "succeeded", "verification": "reply_visible"}
             if not text and attachments:
@@ -554,7 +682,7 @@ def execute_command(client: edge_channel.ChannelClient, command: dict, *, last: 
         return {"status": "needs_reconciliation", "reason": f"gui_exception:{type(exc).__name__}"}
 
 
-def reconcile_command_echo(receipt: dict, *, last: int = 100) -> dict:
+def reconcile_command_echo(receipt: dict, *, last: int = 20) -> dict:
     """Re-read an uncertain send without ever issuing a second send action."""
     command = receipt.get("payload") if isinstance(receipt.get("payload"), dict) else {}
     command_id = str(receipt.get("command_id") or command.get("command_id") or "")
@@ -584,7 +712,7 @@ def reconcile_command_echo(receipt: dict, *, last: int = 100) -> dict:
     return {"confirmed": True, "command_id": command_id}
 
 
-def reconcile_pending_command_echoes(*, last: int = 100) -> dict:
+def reconcile_pending_command_echoes(*, last: int = 20) -> dict:
     """Periodically resolve ambiguous sends; do not retry delivery itself."""
     checked = confirmed = 0
     max_attempts = max(1, int(os.environ.get("WECOM_GUI_RECONCILIATION_MAX_ATTEMPTS", "3")))
@@ -633,7 +761,14 @@ def tick(*, inbox_limit: int = 30, last: int = 20, pull_wait_seconds: int = 25) 
     capture = collect_inbound_once(inbox_limit=inbox_limit, last=last)
     visible_capture = collect_visible_conversation_once(last=last)
     pending_direction = int(capture.get("pending_direction") or 0) + int(visible_capture.get("pending_direction") or 0)
-    if pending_direction > 0:
+    pending_alignment = edge_state.edge_status()["message_alignment_pending"]
+    if pending_alignment:
+        runtime_reporting.publish(
+            "edge_channel", status="waiting", phase="message_alignment",
+            rationale="message_sequence_overlap_not_unique", error_code="message_alignment_pending",
+            metrics={"pending_alignment": pending_alignment},
+        )
+    elif pending_direction > 0:
         runtime_reporting.publish(
             "edge_channel",
             status="waiting",
@@ -649,11 +784,14 @@ def tick(*, inbox_limit: int = 30, last: int = 20, pull_wait_seconds: int = 25) 
             phase="uploading_events",
             metrics={"captured": int(capture.get("captured") or 0) + int(visible_capture.get("captured") or 0)},
         )
+    registrations = flush_registrations(client)
     inbound = flush_inbound(client)
     results_before = flush_command_results(client)
     reconciliation = reconcile_pending_command_echoes(last=last)
     command_result: dict | None = None
-    runtime_reporting.publish("edge_channel", status="waiting", phase="waiting_for_command")
+    runtime_reporting.publish("edge_channel", status="waiting", phase="waiting_for_command",
+                              metrics={"pending_alignment": pending_alignment},
+                              error_code="message_alignment_pending" if pending_alignment else "")
     try:
         command = client.pull_command(wait_seconds=pull_wait_seconds)
         if command:
@@ -677,13 +815,18 @@ def tick(*, inbox_limit: int = 30, last: int = 20, pull_wait_seconds: int = 25) 
         command_result = {"status": "pull_failed", "reason": str(exc)}
         runtime_reporting.publish("edge_channel", status="retrying", phase="command_pull_failed", error_code=type(exc).__name__)
     results_after = flush_command_results(client)
-    final_status = "retrying" if heartbeat_error or inbound.get("failed") else "idle"
+    queue_status = edge_state.edge_status()
+    pending_media = queue_status["media_capture_pending"]
+    final_status = "retrying" if heartbeat_error or inbound.get("failed") or registrations["failed"] else ("waiting" if pending_alignment or pending_media else "idle")
     runtime_reporting.publish(
         "edge_channel",
         status=final_status,
-        phase="idle" if final_status == "idle" else "network_retry",
-        metrics={"pending_uploads": edge_state.edge_status().get("inbound_pending", 0)},
-        error_code="heartbeat_failed" if heartbeat_error else "",
+        phase="network_retry" if final_status == "retrying" else ("message_alignment" if pending_alignment else
+                                                                "media_capture" if pending_media else "idle"),
+        metrics={"pending_uploads": queue_status.get("inbound_pending", 0),
+                 "pending_alignment": pending_alignment, "pending_media": pending_media},
+        error_code="heartbeat_failed" if heartbeat_error else ("message_alignment_pending" if pending_alignment else
+                                                              "media_capture_pending" if pending_media else ""),
     )
     return {
         "ok": True,
@@ -691,6 +834,7 @@ def tick(*, inbox_limit: int = 30, last: int = 20, pull_wait_seconds: int = 25) 
         "capture": capture,
         "visible_capture": visible_capture,
         "inbound": inbound,
+        "registrations": registrations,
         "command_result": command_result,
         "results": {"before": results_before, "after": results_after},
         "reconciliation": reconciliation,

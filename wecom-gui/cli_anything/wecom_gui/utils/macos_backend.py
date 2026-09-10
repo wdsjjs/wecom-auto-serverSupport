@@ -505,6 +505,13 @@ def _swift_ax_runner(script_path: Path) -> list[str]:
     return ["swift", str(script_path)]
 
 
+class TextSendError(RuntimeError):
+    def __init__(self, reason_code: str, *, submitted: bool | None = None):
+        self.reason_code = reason_code
+        self.submitted = submitted
+        super().__init__(reason_code)
+
+
 def send_via_ax_text_input(text: str, *, submit: bool = True) -> dict:
     """Set the right-side chat input through AXUIElement and optionally submit."""
     command = "send" if submit else "stage"
@@ -520,9 +527,10 @@ def send_via_ax_text_input(text: str, *, submit: bool = True) -> dict:
         }
     )
     if not ready.get("ok"):
-        raise RuntimeError(f"AX text input not ready: {ready}")
+        raise TextSendError(str(ready.get("error") or "chat_input_not_ready"), submitted=False)
     items: list[dict] = []
-    attempts = max(1, int(os.environ.get("WECOM_GUI_AX_SEND_ATTEMPTS", "2")))
+    # A missing result may mean Return was already delivered. Only staging can retry.
+    attempts = 1 if submit else max(1, int(os.environ.get("WECOM_GUI_AX_SEND_ATTEMPTS", "2")))
     retry_delay = float(os.environ.get("WECOM_GUI_AX_SEND_RETRY_DELAY", "0.25"))
     for attempt in range(attempts):
         items = _swift_ax([command, text])
@@ -531,10 +539,21 @@ def send_via_ax_text_input(text: str, *, submit: bool = True) -> dict:
         if attempt < attempts - 1:
             time.sleep(retry_delay)
     if not items:
-        raise RuntimeError("AX text input send failed: no result")
+        _append_event({"type": "wecom_text_submit", "ok": False, "error": "ax_send_result_missing", "submitted": None})
+        raise TextSendError("ax_send_result_missing")
     result = items[-1]
+    submit_result = result.get("submit") if isinstance(result.get("submit"), dict) else {}
+    reason = str(result.get("error") or submit_result.get("reason") or "")
+    submitted = result.get("submitted", submit_result.get("submitted"))
+    submitted = submitted if isinstance(submitted, bool) else None
+    _append_event({
+        "type": "wecom_text_submit", "ok": bool(result.get("ok")),
+        "submitted": submitted, "method": result.get("method"),
+        "input_changed": bool(submit_result.get("confirmed")),
+        "error": reason, "code": result.get("code", submit_result.get("code")),
+    })
     if not result.get("ok"):
-        raise RuntimeError(f"AX text input send failed: {result}")
+        raise TextSendError(reason or "ax_text_submit_failed", submitted=submitted)
     return result
 
 
@@ -1543,7 +1562,12 @@ def _hidden_image_rows(
             continue
         if content_parts and not is_placeholder:
             continue
-        rect = _chat_image_row_rect(item, anchor_x=_image_row_anchor_x(items, index))
+        direction_evidence = item.get("directionEvidence") or {
+            "source": "screencapturekit", "status": "unavailable", "side": "unknown",
+        }
+        verified_rect = direction_evidence.get("bubbleRect") if direction_evidence.get("status") == "matched" else None
+        rect = (_rect_from_item(verified_rect) if isinstance(verified_rect, dict) else
+                _chat_image_row_rect(item, anchor_x=_image_row_anchor_x(items, index)))
         if not _is_chat_image_rect(rect):
             continue
         message = {
@@ -1555,9 +1579,11 @@ def _hidden_image_rows(
             "width": rect["width"],
             "right": rect["x"] + rect["width"],
             "source": "axuielement-chat-hidden-image-row",
+            "direction_evidence": direction_evidence,
         }
         if include_media:
-            media = {"type": "image", "rect": rect, "source": "axuielement-chat-hidden-image-row", "row": message["row"]}
+            media = {"type": "image", "rect": rect, "source": "axuielement-chat-hidden-image-row", "row": message["row"],
+                     "chat_viewport": item.get("chatViewport") or {}}
             if _media_capture_skip_cached(media, rect):
                 media.update(
                     {
@@ -1718,7 +1744,7 @@ def _capture_mini_program_card(rect: dict) -> dict:
     return captured
 
 
-def capture_chat_images(messages: list[dict]) -> list[dict]:
+def capture_chat_images(messages: list[dict], *, cache_preview_failures: bool = True) -> list[dict]:
     """Capture image bubbles only during formal queue processing."""
     if os.environ.get("WECOM_GUI_CAPTURE_IMAGES", "1") == "0":
         return messages
@@ -1752,7 +1778,7 @@ def capture_chat_images(messages: list[dict]) -> list[dict]:
                 media_type in {"sticker", "emoji", "animated_sticker"}
                 or media_copy.get("skip_capture")
                 or _is_animated_sticker_media(media_copy)
-                or _media_capture_skip_cached(media_copy, rect)
+                or (cache_preview_failures and _media_capture_skip_cached(media_copy, rect))
             ):
                 media_copy["type"] = "animated_sticker"
                 media_copy["skip_capture"] = True
@@ -1775,7 +1801,7 @@ def capture_chat_images(messages: list[dict]) -> list[dict]:
                 media_copy["capture_rect"] = result.get("rect", {})
             else:
                 media_copy["error"] = result.get("error") or "capture_failed"
-                if media_copy["error"] in {"preview_image_not_found", "preview_not_found"}:
+                if cache_preview_failures and media_copy["error"] in {"preview_image_not_found", "preview_not_found"}:
                     _remember_media_capture_skip(media_copy, rect)
             media_items.append(media_copy)
         if media_items:
@@ -1791,7 +1817,7 @@ def _ax_chat_messages(
     include_hidden_image_media: bool = True,
 ) -> list[dict]:
     messages: list[dict] = []
-    snapshot_items = _swift_ax("chat")
+    snapshot_items = _swift_ax(["chat", str(last)])
     viewport = next((item.get("chatViewport") for item in snapshot_items
                      if isinstance(item.get("chatViewport"), dict) and _float_value(item["chatViewport"].get("width")) > 0), None)
     geometry = {}
@@ -1872,6 +1898,7 @@ def _ax_chat_messages(
                     "rect": rect,
                     "source": "axuielement-chat-media",
                     "row": int(item.get("index") or len(messages) + 1),
+                    "chat_viewport": viewport or {},
                 }
                 texts = media.get("texts") if isinstance(media.get("texts"), list) else []
                 if texts:

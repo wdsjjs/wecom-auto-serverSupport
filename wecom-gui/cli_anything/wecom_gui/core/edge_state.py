@@ -12,7 +12,7 @@ import json
 import sqlite3
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Iterator
 
 from cli_anything.wecom_gui.core import state
@@ -20,6 +20,7 @@ from cli_anything.wecom_gui.core import state
 
 PENDING = "pending"
 DELIVERED = "delivered"
+WAITING_MEDIA = "waiting_media"
 RESULT_PENDING = "result_pending"
 RESULT_REPORTED = "result_reported"
 
@@ -62,6 +63,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         ON edge_inbound_events(status, next_attempt_at, id)
         """
     )
+    for column, definition in (
+        ("registered_direction", "TEXT NOT NULL DEFAULT ''"),
+        ("registration_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("registration_next_attempt_at", "REAL NOT NULL DEFAULT 0"),
+        ("registration_error", "TEXT NOT NULL DEFAULT ''"),
+        ("registration_started", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        _ensure_column(conn, "edge_inbound_events", column, definition)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS edge_command_receipts (
@@ -155,7 +164,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
-def enqueue_inbound(*, dedupe_key: str, payload: dict, media: list[dict]) -> tuple[bool, dict]:
+def enqueue_inbound(*, dedupe_key: str, payload: dict, media: list[dict], connection=None) -> tuple[bool, dict]:
     """Persist a captured inbound event before any network request.
 
     A stable dedupe key means a scan after a crash reuses the original event
@@ -164,16 +173,32 @@ def enqueue_inbound(*, dedupe_key: str, payload: dict, media: list[dict]) -> tup
     now = time.time()
     client_event_id = str(payload.get("client_event_id") or uuid.uuid4())
     complete_payload = {**payload, "client_event_id": client_event_id}
-    with _connect() as conn:
+    with (nullcontext(connection) if connection is not None else _connect()) as conn:
         existing = conn.execute(
             "SELECT * FROM edge_inbound_events WHERE dedupe_key = ?", (dedupe_key,)
         ).fetchone()
         if existing is not None:
             existing_payload = json.loads(existing["payload_json"])
+            if not existing_payload["message"].get("source") and complete_payload["message"].get("source"):
+                existing_payload["message"]["source"] = complete_payload["message"]["source"]
+                conn.execute("UPDATE edge_inbound_events SET payload_json = ? WHERE dedupe_key = ?",
+                             (json.dumps(existing_payload, ensure_ascii=False), dedupe_key))
+                existing = conn.execute("SELECT * FROM edge_inbound_events WHERE dedupe_key = ?", (dedupe_key,)).fetchone()
             existing_direction = str((existing_payload.get("message") or {}).get("direction") or "")
             next_direction = str((complete_payload.get("message") or {}).get("direction") or "")
-            if existing_direction == "unknown" and next_direction in {"inbound", "outbound"}:
+            previous_media = json.loads(existing["media_json"])
+            media_repaired = (existing["status"] in {PENDING, WAITING_MEDIA} and bool(media)
+                              and (existing["status"] == WAITING_MEDIA or not media_files_ready(previous_media))
+                              and len(media) == len(previous_media) and media_files_ready(media))
+            if media_repaired or (existing_direction == "unknown" and next_direction in {"inbound", "outbound"}):
                 complete_payload["client_event_id"] = str(existing["client_event_id"])
+                complete_payload["occurred_at"] = existing_payload["occurred_at"]
+                if existing_direction in {"inbound", "outbound"}:
+                    complete_payload["message"]["direction"] = existing_direction
+                    complete_payload["event_type"] = f"{existing_direction}_message"
+                if previous_media and not media_repaired:
+                    media = previous_media
+                    complete_payload["message"]["media"] = existing_payload["message"]["media"]
                 conn.execute(
                     """
                     UPDATE edge_inbound_events
@@ -184,7 +209,7 @@ def enqueue_inbound(*, dedupe_key: str, payload: dict, media: list[dict]) -> tup
                     (
                         json.dumps(complete_payload, ensure_ascii=False),
                         json.dumps(media, ensure_ascii=False),
-                        PENDING,
+                        WAITING_MEDIA if media and not media_files_ready(media) else PENDING,
                         dedupe_key,
                     ),
                 )
@@ -212,6 +237,54 @@ def enqueue_inbound(*, dedupe_key: str, payload: dict, media: list[dict]) -> tup
             "SELECT * FROM edge_inbound_events WHERE client_event_id = ?", (client_event_id,)
         ).fetchone()
         return True, _event_row(row)
+
+
+def media_files_ready(media: list[dict]) -> bool:
+    from pathlib import Path
+    try:
+        return all(bool(item.get("capture_path")) and Path(item["capture_path"]).is_file()
+                   and Path(item["capture_path"]).stat().st_size > 0 for item in media)
+    except OSError:
+        return False
+
+
+def inbound_by_key(dedupe_key: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM edge_inbound_events WHERE dedupe_key = ?", (dedupe_key,)).fetchone()
+        return _event_row(row) if row else None
+
+
+def wait_for_inbound_media(client_event_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("""UPDATE edge_inbound_events SET status = ?, last_error = 'awaiting_media_capture'
+            WHERE client_event_id = ? AND status = ?""", (WAITING_MEDIA, client_event_id, PENDING))
+
+
+def due_registrations(limit: int = 20) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute("""SELECT * FROM edge_inbound_events
+            WHERE json_type(payload_json, '$.message.source') = 'object'
+              AND registered_direction != json_extract(payload_json, '$.message.direction')
+              AND registration_next_attempt_at <= ? ORDER BY id LIMIT ?""", (time.time(), limit)).fetchall()
+        return [_event_row(row) for row in rows]
+
+
+def mark_registered(client_event_id: str, direction: str) -> None:
+    with _connect() as conn:
+        conn.execute("""UPDATE edge_inbound_events SET registered_direction = ?, registration_attempts = 0,
+            registration_next_attempt_at = 0, registration_error = '' WHERE client_event_id = ?""", (direction, client_event_id))
+
+
+def start_registration(client_event_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE edge_inbound_events SET registration_started = 1 WHERE client_event_id = ?", (client_event_id,))
+
+
+def retry_registration(client_event_id: str, error: str, delay: float) -> None:
+    with _connect() as conn:
+        conn.execute("""UPDATE edge_inbound_events SET registration_attempts = registration_attempts + 1,
+            registration_next_attempt_at = ?, registration_error = ? WHERE client_event_id = ?""",
+            (time.time() + delay, error[:300], client_event_id))
 
 
 def due_inbound(limit: int = 20, *, now: float | None = None) -> list[dict]:
@@ -510,12 +583,12 @@ def register_outbound_echo_suppression(command_id: str, conversation_key: str, t
         )
 
 
-def consume_outbound_echo_suppression(conversation_key: str, text: str) -> bool:
+def consume_outbound_echo_suppression(conversation_key: str, text: str, *, connection=None) -> bool:
     normalized = "".join(str(text).split())
     if not conversation_key or not normalized:
         return False
     now = time.time()
-    with _connect() as conn:
+    with (nullcontext(connection) if connection is not None else _connect()) as conn:
         conn.execute("DELETE FROM edge_outbound_echo_suppressions WHERE expires_at < ?", (now,))
         row = conn.execute(
             """
@@ -554,9 +627,20 @@ def edge_status() -> dict:
             "SELECT COUNT(*) AS count FROM edge_command_receipts WHERE result_status = ?", (RESULT_PENDING,)
         ).fetchone()["count"]
         commands = conn.execute("SELECT COUNT(*) AS count FROM edge_command_receipts").fetchone()["count"]
+        alignment_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edge_message_alignment_pending'").fetchone()
+        pending_alignment = conn.execute("SELECT COUNT(*) FROM edge_message_alignment_pending").fetchone()[0] if alignment_table else 0
+        ledger_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edge_message_ledger'").fetchone()
+        pending_media = conn.execute("""SELECT COUNT(*) FROM (
+            SELECT dedupe_key FROM edge_inbound_events WHERE status = 'waiting_media'
+            UNION SELECT conversation_key || ':' || event_hash FROM edge_message_ledger WHERE capture_status = 'pending_media'
+        )""").fetchone()[0] if ledger_table else conn.execute(
+            "SELECT COUNT(*) FROM edge_inbound_events WHERE status = ?", (WAITING_MEDIA,)
+        ).fetchone()[0]
     return {
         "ok": True,
         "inbound_pending": inbound_pending,
         "command_results_pending": result_pending,
         "commands_received": commands,
+        "message_alignment_pending": pending_alignment,
+        "media_capture_pending": pending_media,
     }

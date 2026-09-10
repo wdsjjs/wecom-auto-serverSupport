@@ -210,7 +210,7 @@ def test_reply_send_message_supports_image_attachments(monkeypatch, tmp_path):
     image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
     calls = []
 
-    def fake_stage(text, dry_run=False, submit=True):
+    def fake_stage(text, dry_run=False, submit=True, allow_clipboard_fallback=True):
         calls.append(("text", text, submit))
         return {"ok": True, "submitted": submit, "chars": len(text)}
 
@@ -227,6 +227,21 @@ def test_reply_send_message_supports_image_attachments(monkeypatch, tmp_path):
     assert data["attachment_count"] == 1
     assert calls == [("text", "hello", False), ("file", str(image_path), True)]
 
+
+def test_mixed_message_honors_disabled_clipboard_fallback(monkeypatch, tmp_path):
+    from cli_anything.wecom_gui.utils import macos_backend
+    def fail_stage(text, *, submit=True):
+        assert submit is False
+        raise macos_backend.TextSendError("chat_input_not_empty", submitted=False)
+    monkeypatch.setattr(macos_backend, "send_via_ax_text_input", fail_stage)
+    monkeypatch.setattr(macos_backend, "paste_and_enter", lambda *args, **kwargs: pytest.fail("must not paste text"))
+    monkeypatch.setattr(macos_backend, "paste_file_and_enter", lambda *args, **kwargs: pytest.fail("must not paste media"))
+    with pytest.raises(macos_backend.TextSendError) as raised:
+        reply.send_message("hello", attachments=[{"type": "image", "path": str(tmp_path / "image.png")}],
+                           allow_clipboard_fallback=False)
+    assert raised.value.submitted is False
+
+
 def test_cli_reply_send_dry_run_json():
     runner = CliRunner()
     result = runner.invoke(cli, ["--json", "reply", "send", "--text", "hello", "--dry-run"])
@@ -238,6 +253,8 @@ def test_cli_reply_send_dry_run_json():
 
 def test_cli_loads_env_local_for_inbox_scan(monkeypatch, tmp_path):
     monkeypatch.delenv("WECOM_GUI_REQUIRED_TAGS", raising=False)
+    # Track the initially absent key so dotenv cannot leak it into later tests.
+    monkeypatch.setenv("WECOM_GUI_REQUIRED_TAG", "")
     monkeypatch.delenv("WECOM_GUI_REQUIRED_TAG", raising=False)
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env.local").write_text("WECOM_GUI_REQUIRED_TAG='@重庆邮电大学'\n", encoding="utf-8")
