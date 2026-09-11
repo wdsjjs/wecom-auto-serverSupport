@@ -14,6 +14,7 @@ from cli_anything.wecom_gui.core import agent_input as agent_input_core
 from cli_anything.wecom_gui.core import app as app_core
 from cli_anything.wecom_gui.core import chat as chat_core
 from cli_anything.wecom_gui.core import edge_state as edge_state_core
+from cli_anything.wecom_gui.core import edge_message_ledger as edge_message_ledger_core
 from cli_anything.wecom_gui.core import edge_worker as edge_worker_core
 from cli_anything.wecom_gui.core import inbox as inbox_core
 from cli_anything.wecom_gui.core import llm as llm_core
@@ -427,6 +428,14 @@ def edge_channel_run(once: bool, poll: float, inbox_limit: int, last: int) -> No
         _emit_or_fail(edge_worker_core.tick, inbox_limit=inbox_limit, last=last)
         return
     edge_worker_core.run_forever(poll_seconds=poll, inbox_limit=inbox_limit, last=last)
+
+
+@edge_channel_group.command("resume-media")
+@click.argument("event_id")
+def edge_channel_resume_media(event_id: str) -> None:
+    """Resume one paused image task locally; collection still verifies its identity."""
+    with state_core.gui_lock():
+        _emit_or_fail(edge_message_ledger_core.resume_media, event_id)
 
 
 @cli.command()

@@ -89,9 +89,29 @@ Useful commands:
 ./修复PiProvider.command
 ```
 
-`start-agent.command` starts both the menu-bar client and the real WeCom edge
-channel through the same supervisor. Running it again is idempotent. Starting
-the app directly only opens the status UI and does not start the channel.
+`start-agent.command` (or `启动客服.command`) only opens the native control
+panel. It does not start Enterprise WeChat or resume message processing.
+Start those services from the panel buttons, or explicitly run:
+
+```bash
+./wecom-gui/scripts/wecom-control start-all
+```
+
+All lifecycle actions still use the same supervisor, and running the control
+panel repeatedly is idempotent. `stop-agent.command` stops the controlled edge
+channel, Enterprise WeChat, and the panel.
+
+The panel checks its own Accessibility and Screen Recording permissions before
+starting the edge channel. Grant them to `UDA WeCom Agent`, not only to Terminal
+or Codex. If an updated local build stops reading while the checkbox is still
+enabled, remove the old Accessibility entry and add
+`~/Applications/UDA WeCom Agent.app` again. Reopen the panel after granting
+Screen Recording; services still require an explicit start.
+
+The desktop installer skips unchanged builds and stops the controlled edge
+before replacing the app. For deployed Macs, set `WECOM_DESKTOP_SIGN_IDENTITY`
+to an installed signing certificate. Without a certificate, builds use ad-hoc
+signing and macOS may require renewed permission after a code change.
 
 If an already-installed Mac reports that `uda-openai` is missing or that
 `models.json` is empty, double-click `修复PiProvider.command`. It rewrites the

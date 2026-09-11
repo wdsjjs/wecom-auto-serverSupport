@@ -15,6 +15,8 @@ import tempfile
 import json
 import time
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +25,35 @@ DEFAULT_APP_NAMES = ("企业微信", "WeCom", "WeChat Work")
 DEFAULT_TAG_MARKERS = ("@微信", "外部", "部门", "BOT")
 NAVIGATION_ROW_TITLES = {"单聊", "群聊", "@我", "未读", "内部聊天"}
 _AX_SCAN_DISABLED_UNTIL = 0.0
+_CAPTURE_DEADLINE = ContextVar("wecom_capture_deadline", default=None)
+
+
+class CaptureDeadlineExceeded(TimeoutError):
+    """The edge capture budget expired; no further GUI action may start."""
+
+
+@contextmanager
+def capture_deadline(deadline: float):
+    token = _CAPTURE_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _CAPTURE_DEADLINE.reset(token)
+
+
+def _capture_timeout(default: float) -> float:
+    deadline = _CAPTURE_DEADLINE.get()
+    if deadline is None:
+        return default
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise CaptureDeadlineExceeded("media_time_budget_exhausted")
+    return min(default, remaining)
+
+
+def _capture_sleep(seconds: float):
+    time.sleep(_capture_timeout(seconds))
+    _capture_timeout(1)
 
 
 def _append_event(event: dict) -> None:
@@ -114,7 +145,7 @@ def run_osascript(script: str, *, check: bool = True) -> str:
     except ValueError:
         timeout = 8.0
     try:
-        proc = subprocess.run(args, text=True, capture_output=True, timeout=max(1.0, timeout))
+        proc = subprocess.run(args, text=True, capture_output=True, timeout=_capture_timeout(max(1.0, timeout)))
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("osascript timed out while reading the WeCom accessibility tree") from exc
     if check and proc.returncode != 0:
@@ -450,7 +481,7 @@ def _swift_ax(command: str | list[str]) -> list[dict]:
             [*runner, *args],
             text=True,
             capture_output=True,
-            timeout=timeout,
+            timeout=_capture_timeout(timeout),
             check=False,
             env=env,
         )
@@ -494,7 +525,7 @@ def _swift_ax_runner(script_path: Path) -> list[str]:
             [swiftc, "-O", str(script_path), "-o", str(binary_path)],
             text=True,
             capture_output=True,
-            timeout=compile_timeout,
+            timeout=_capture_timeout(compile_timeout),
             check=False,
             env=_swift_ax_env(),
         )
@@ -1554,11 +1585,8 @@ def _hidden_image_rows(
     for index, item in enumerate(items):
         content, content_parts, _stamp = _meaningful_chat_texts(item)
         media_elements = item.get("mediaElements") if isinstance(item.get("mediaElements"), list) else []
-        height = int(_float_value(item.get("height")))
-        y = int(_float_value(item.get("y")))
-        visible = y + height > 0
         is_placeholder = _is_image_placeholder_content(content, content_parts)
-        if media_elements or not visible:
+        if media_elements or (item.get("bubbleImageSupported") is False and not is_placeholder):
             continue
         if content_parts and not is_placeholder:
             continue
@@ -1569,15 +1597,20 @@ def _hidden_image_rows(
         rect = (_rect_from_item(verified_rect) if isinstance(verified_rect, dict) else
                 _chat_image_row_rect(item, anchor_x=_image_row_anchor_x(items, index)))
         if not _is_chat_image_rect(rect):
-            continue
+            if not is_placeholder and item.get("bubbleImageSupported") is not True:
+                continue
+            rect = {}
+        # Offscreen image rows still occupy a position in the message sequence.
+        # Capture checks their visibility separately before touching the GUI.
         message = {
             "row": int(item.get("index") or 0),
+            "capture_row_id": str(item.get("captureRowId") or ""),
             "role": "unknown",
             "text": "[图片]",
             "time": "",
-            "x": rect["x"],
-            "width": rect["width"],
-            "right": rect["x"] + rect["width"],
+            "x": rect.get("x", 0),
+            "width": rect.get("width", 0),
+            "right": rect.get("x", 0) + rect.get("width", 0),
             "source": "axuielement-chat-hidden-image-row",
             "direction_evidence": direction_evidence,
         }
@@ -1596,6 +1629,14 @@ def _hidden_image_rows(
             message["media"] = [media]
         candidates.append(message)
     return candidates[-last:] if last > 0 else candidates
+
+
+def reveal_chat_row(row: int, *, last: int = 20) -> dict:
+    """Reveal one row in the bounded chat snapshot using its AX scrollbar."""
+    if row <= 0 or last <= 0:
+        return {"ok": False, "error": "invalid_chat_row"}
+    results = _swift_ax(["chat-reveal", str(row), str(last)])
+    return results[0] if results else {"ok": False, "error": "chat_reveal_failed"}
 
 
 def _image_capture_dir() -> Path:
@@ -1632,7 +1673,7 @@ def _screenshot_rect(rect: dict, output_path: Path) -> dict:
             ["screencapture", "-x", "-R", f"{x},{y},{width},{height}", str(output_path)],
             text=True,
             capture_output=True,
-            timeout=timeout,
+            timeout=_capture_timeout(timeout),
             check=False,
         )
     except subprocess.TimeoutExpired:
@@ -1656,53 +1697,46 @@ def _click_image_and_capture(rect: dict) -> dict:
     if x <= 0 or y <= 0:
         return {"ok": False, "error": "invalid_media_point", "rect": rect}
     _append_event({"type": "image_capture_start", "rect": rect, "point": {"x": x, "y": y}})
-    clicked = _swift_ax(["doubleclick", str(x), str(y)])
-    if not clicked or not clicked[-1].get("ok"):
-        _append_event({"type": "image_capture_failed", "stage": "doubleclick", "rect": rect, "result": clicked[-1] if clicked else {}})
-        return {"ok": False, "error": (clicked[-1].get("error") if clicked else "") or "double_click_failed", "rect": rect}
-    time.sleep(float(os.environ.get("WECOM_GUI_IMAGE_PREVIEW_DELAY", "0.6")))
+    _capture_timeout(1)
     preview: dict = {}
-    attempts = max(1, int(os.environ.get("WECOM_GUI_IMAGE_PREVIEW_ATTEMPTS", "5")))
-    delay = float(os.environ.get("WECOM_GUI_IMAGE_PREVIEW_RETRY_DELAY", "0.25"))
-    for index in range(attempts):
-        items = _swift_ax("preview")
-        preview = items[-1] if items else {}
-        if preview.get("ok"):
-            break
-        if index < attempts - 1:
-            time.sleep(delay)
-    if not preview.get("ok"):
-        close_result = (_swift_ax("close-preview") or [{}])[-1]
-        _append_event(
-            {
-                "type": "image_capture_failed",
-                "stage": "preview",
-                "rect": rect,
-                "preview": preview,
-                "close_preview": close_result,
-            }
-        )
-        return {
-            "ok": False,
-            "error": preview.get("error") or "preview_not_found",
-            "rect": rect,
-            "close_preview": close_result,
-        }
-    image_rect = preview.get("image") if isinstance(preview.get("image"), dict) else {}
-    output_path = _image_capture_dir() / f"wecom-image-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.png"
-    captured = _screenshot_rect(image_rect, output_path)
-    close_result = (_swift_ax("close-preview") or [{}])[-1]
-    captured["close_preview"] = close_result
-    _append_event(
-        {
-            "type": "image_capture_result",
-            "rect": rect,
-            "preview": preview,
-            "capture": captured,
-            "close_preview": close_result,
-        }
-    )
-    return captured
+    captured: dict = {}
+    stage = "doubleclick"
+    try:
+        # A timed-out native call may already have opened the preview.
+        clicked = _swift_ax(["doubleclick", str(x), str(y)])
+        if not clicked or not clicked[-1].get("ok"):
+            captured = {"ok": False, "error": "double_click_failed", "rect": rect}
+            return captured
+        stage = "preview"
+        _capture_sleep(float(os.environ.get("WECOM_GUI_IMAGE_PREVIEW_DELAY", "0.6")))
+        attempts = max(1, int(os.environ.get("WECOM_GUI_IMAGE_PREVIEW_ATTEMPTS", "5")))
+        delay = float(os.environ.get("WECOM_GUI_IMAGE_PREVIEW_RETRY_DELAY", "0.25"))
+        for index in range(attempts):
+            items = _swift_ax("preview")
+            preview = items[-1] if items else {}
+            if preview.get("ok"):
+                break
+            if index < attempts - 1:
+                _capture_sleep(delay)
+        if not preview.get("ok"):
+            captured = {"ok": False, "error": preview.get("error") or "preview_not_found", "rect": rect}
+            return captured
+        image_rect = preview.get("image") if isinstance(preview.get("image"), dict) else {}
+        stage = "screenshot"
+        output_path = _image_capture_dir() / f"wecom-image-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.png"
+        captured = _screenshot_rect(image_rect, output_path)
+        return captured
+    finally:
+        # Cleanup gets its own small allowance even after the capture deadline.
+        try:
+            with capture_deadline(time.monotonic() + 2):
+                close_result = (_swift_ax("close-preview") or [{}])[-1]
+        except Exception:
+            close_result = {"ok": False, "error": "preview_cleanup_failed"}
+        captured["close_preview"] = close_result
+        _append_event({"type": "image_capture_result" if captured.get("ok") else "image_capture_failed",
+                       "stage": stage, "rect": rect, "preview": preview,
+                       "capture": captured, "close_preview": close_result})
 
 
 def _media_capture_mode() -> str:
@@ -1870,6 +1904,7 @@ def _ax_chat_messages(
         right = int(message_x + message_width)
         message = {
             "row": int(item.get("index") or len(messages) + 1),
+            "capture_row_id": str(item.get("captureRowId") or ""),
             "role": "unknown",
             "text": content,
             "time": stamp,

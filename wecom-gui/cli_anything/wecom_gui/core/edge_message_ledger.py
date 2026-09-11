@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import time
@@ -12,6 +14,11 @@ from cli_anything.wecom_gui.core import edge_state
 
 
 HISTORY_LIMIT = 200
+MEDIA_ATTEMPT_LIMIT = 5
+
+
+class MediaIdentityError(ValueError):
+    """A bounded reason code, never a customer message or a native error string."""
 
 
 @contextmanager
@@ -35,6 +42,8 @@ def transaction():
             event_hash TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0,
             next_attempt_at REAL NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '',
             files_json TEXT NOT NULL DEFAULT '[]')""")
+        for column in ("paused_reason", "capture_row_id", "image_fingerprint"):
+            edge_state._ensure_column(conn, "edge_media_capture_state", column, "TEXT NOT NULL DEFAULT ''")
         yield conn
 
 
@@ -166,18 +175,129 @@ def mark(conn, row: dict, *, status: str, direction: str = "unknown"):
 def media_state(entry: dict) -> dict:
     with transaction() as conn:
         row = conn.execute("SELECT * FROM edge_media_capture_state WHERE event_hash = ?", (entry["event_hash"],)).fetchone()
-        return dict(row) if row else {"attempts": 0, "next_attempt_at": 0, "files_json": "[]"}
+        return dict(row) if row else {"attempts": 0, "next_attempt_at": 0, "files_json": "[]",
+                                     "last_error": "", "paused_reason": "", "capture_row_id": "", "image_fingerprint": ""}
 
 
-def save_media(entry: dict, media: list[dict], *, error: str = ""):
+def remember_media_identity(conn, entry: dict, message: dict):
+    """Pin initial evidence even when this tick cannot afford to capture the image."""
+    conn.execute("""INSERT OR IGNORE INTO edge_media_capture_state
+        (event_hash, capture_row_id, image_fingerprint) VALUES (?, ?, ?)""",
+        (entry["event_hash"], message.get("capture_row_id") or "",
+         (message.get("direction_evidence") or {}).get("imageFingerprint") or ""))
+
+
+def media_fingerprints_match(expected: str, observed: str, *, allow_render_drift: bool = True) -> bool:
+    if expected == observed and not expected.startswith("rgb32-v2:"):
+        return bool(expected)
+
+    def decode(value):
+        parts = value.split(":")
+        if len(parts) == 2 and parts[0] == "rgb32-v1":
+            return parts[1], None
+        if len(parts) != 3 or parts[0] != "rgb32-v2" or len(parts[1]) != 64 or len(parts[2]) != 4096:
+            return None
+        try:
+            pixels = base64.b64decode(parts[2], validate=True)
+        except (ValueError, binascii.Error):
+            return None
+        if len(pixels) != 32 * 32 * 3:
+            return None
+        digest = hashlib.sha256(bytes(value & 0xf8 for value in pixels)).hexdigest()
+        return (digest, pixels) if digest == parts[1] else None
+
+    before, after = decode(expected), decode(observed)
+    if before is None or after is None:
+        return False
+    if before[0] == after[0]:
+        return True
+    if not allow_render_drift or before[1] is None or after[1] is None:
+        return False
+    # Per-channel AND average bounds; do not allow a small replaced region to
+    # disappear in a whole-image average. Always compare against the pinned anchor.
+    differences = [abs(a - b) for a, b in zip(before[1], after[1])]
+    if max(differences) <= 12 and sum(differences) <= 5 * len(differences):
+        return True
+    # A one-pixel bubble-boundary change resamples high-contrast edges. Require
+    # small total error AND small local low-frequency error, not just similarity.
+    if max(differences) > 64 or sum(differences) > 5 * len(differences):
+        return False
+    signed = [a - b for a, b in zip(before[1], after[1])]
+    smoothed = []
+    for y in range(2, 30):
+        for x in range(2, 30):
+            for channel in range(3):
+                error = abs(sum(signed[(yy * 32 + xx) * 3 + channel]
+                    for yy in range(y - 2, y + 3) for xx in range(x - 2, x + 3)))
+                if error > 10 * 25:
+                    return False
+                smoothed.append(error)
+    return sum(smoothed) <= 3.2 * 25 * len(smoothed)
+
+
+def verify_media_identity(entry: dict, message: dict, *, require_pixels: bool = False):
+    row_id = str(message.get("capture_row_id") or "")
+    fingerprint = str((message.get("direction_evidence") or {}).get("imageFingerprint") or "")
+    if not row_id:
+        raise MediaIdentityError("media_row_identity_unavailable")
+    if require_pixels and not fingerprint:
+        raise MediaIdentityError("media_fingerprint_unavailable")
     with transaction() as conn:
-        old = conn.execute("SELECT attempts FROM edge_media_capture_state WHERE event_hash = ?", (entry["event_hash"],)).fetchone()
-        attempts = (old[0] if old else 0) + 1 if error else 0
-        next_attempt = time.time() + min(60, 2 ** min(6, attempts)) if error else 0
-        conn.execute("""INSERT INTO edge_media_capture_state(event_hash, attempts, next_attempt_at, last_error, files_json)
-            VALUES (?, ?, ?, ?, ?) ON CONFLICT(event_hash) DO UPDATE SET
-            attempts=excluded.attempts, next_attempt_at=excluded.next_attempt_at,
-            last_error=excluded.last_error, files_json=excluded.files_json""",
-            (entry["event_hash"], attempts, next_attempt, error[:96], json.dumps(media, ensure_ascii=False)))
+        remember_media_identity(conn, entry, message)
+        old = conn.execute("SELECT * FROM edge_media_capture_state WHERE event_hash = ?", (entry["event_hash"],)).fetchone()
+        if old["image_fingerprint"] and fingerprint and not media_fingerprints_match(old["image_fingerprint"], fingerprint):
+            raise MediaIdentityError("media_fingerprint_changed")
+        if old["capture_row_id"] and old["capture_row_id"] != row_id:
+            # An app restart invalidates AX handles. Rebind only with already pinned
+            # pixels and the ordered ledger; never on another identical placeholder.
+            restarted = old["capture_row_id"].rsplit(":", 1)[0] != row_id.rsplit(":", 1)[0]
+            if not (restarted and fingerprint and media_fingerprints_match(
+                    old["image_fingerprint"], fingerprint, allow_render_drift=False)):
+                raise MediaIdentityError("media_row_identity_changed")
+        upgrade = old["image_fingerprint"].startswith("rgb32-v1:") and fingerprint.startswith("rgb32-v2:")
+        conn.execute("""UPDATE edge_media_capture_state SET capture_row_id = ?,
+            image_fingerprint = CASE WHEN image_fingerprint = '' OR ? THEN ? ELSE image_fingerprint END
+            WHERE event_hash = ?""", (row_id, upgrade, fingerprint, entry["event_hash"]))
+
+
+def begin_media_attempt(entry: dict) -> bool:
+    """Reserve before GUI work so a crash cannot reset the retry limit."""
+    with transaction() as conn:
+        conn.execute("INSERT OR IGNORE INTO edge_media_capture_state(event_hash) VALUES (?)", (entry["event_hash"],))
+        old = conn.execute("SELECT * FROM edge_media_capture_state WHERE event_hash = ?", (entry["event_hash"],)).fetchone()
+        if old["paused_reason"] or old["attempts"] >= MEDIA_ATTEMPT_LIMIT or old["next_attempt_at"] > time.time():
+            return False
+        attempts = old["attempts"] + 1
+        conn.execute("""UPDATE edge_media_capture_state SET attempts = ?, next_attempt_at = ?,
+            last_error = 'media_capture_interrupted', paused_reason = ? WHERE event_hash = ?""",
+            (attempts, time.time() + min(60, 2 ** attempts),
+             "media_retry_limit" if attempts >= MEDIA_ATTEMPT_LIMIT else "", entry["event_hash"]))
+        return True
+
+
+def save_media(entry: dict, media: list[dict], *, error: str = "", complete: bool = True):
+    with transaction() as conn:
+        conn.execute("INSERT OR IGNORE INTO edge_media_capture_state(event_hash) VALUES (?)", (entry["event_hash"],))
+        done = complete and not error
+        conn.execute("""UPDATE edge_media_capture_state SET files_json = ?, last_error = ?,
+            attempts = CASE WHEN ? THEN 0 ELSE attempts END,
+            next_attempt_at = CASE WHEN ? OR ? = '' THEN 0 ELSE next_attempt_at END,
+            paused_reason = CASE WHEN ? THEN '' WHEN attempts >= ? THEN 'media_retry_limit' ELSE '' END
+            WHERE event_hash = ?""",
+            (json.dumps(media, ensure_ascii=False), error[:96], done, done, error, done, MEDIA_ATTEMPT_LIMIT, entry["event_hash"]))
         if error:
-            mark(conn, entry, status="pending_media", direction=entry["direction"])
+            conn.execute("UPDATE edge_message_ledger SET capture_status = 'pending_media' WHERE event_hash = ?",
+                         (entry["event_hash"],))
+
+
+def resume_media(event_id: str) -> dict:
+    """Resume a paused local task without changing event identity or pinned evidence."""
+    with transaction() as conn:
+        row = conn.execute("SELECT * FROM edge_message_ledger WHERE event_id = ?", (event_id,)).fetchone()
+        if not row or row["capture_status"] != "pending_media":
+            return {"ok": False, "reason": "pending_media_not_found"}
+        updated = conn.execute("""UPDATE edge_media_capture_state SET attempts = 0, next_attempt_at = 0,
+            paused_reason = '', last_error = '' WHERE event_hash = ? AND (paused_reason != '' OR attempts >= ?)""",
+            (row["event_hash"], MEDIA_ATTEMPT_LIMIT)).rowcount
+        return {"ok": bool(updated), "event_id": event_id,
+                "reason": "media_retry_resumed" if updated else "media_not_paused"}

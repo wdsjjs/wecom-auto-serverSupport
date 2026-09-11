@@ -711,6 +711,33 @@ def test_ax_chat_messages_enriches_image_placeholder_rows(monkeypatch):
     assert [message["text"] for message in messages] == ["[图片]", "这是哪里？"]
     assert "chat-all" in commands
 
+
+@pytest.mark.parametrize("image_y", [-600, 1200])
+def test_offscreen_image_rows_keep_their_place_in_the_snapshot(monkeypatch, image_y):
+    viewport = {"x": 311, "y": 100, "width": 700, "height": 600}
+    rows = [
+        {"index": 1, "texts": ["before"], "messageTexts": ["before"],
+         "bubbleImageSupported": False, "x": 311, "width": 700, "height": 84},
+        {"index": 2, "texts": [], "messageTexts": [], "bubbleImageSupported": True,
+         "x": 311, "y": image_y, "width": 700, "height": 290,
+         "directionEvidence": {"source": "screencapturekit", "side": "unknown",
+                               "status": "outside_viewport_or_unlaid_out"}},
+        {"index": 3, "texts": ["after"], "messageTexts": ["after"],
+         "bubbleImageSupported": False, "x": 311, "width": 700, "height": 84},
+    ]
+    for row in rows:
+        row.update(snapshotComplete=True, chatViewport=viewport)
+    monkeypatch.setattr(macos_backend, "_swift_ax", lambda command: rows)
+
+    messages = macos_backend._ax_chat_messages(last=20, include_hidden_images=True)
+
+    assert [msg["row"] for msg in messages] == [1, 2, 3]
+    assert [msg["text"] for msg in messages] == ["before", "[图片]", "after"]
+    assert messages[1]["media"][0]["type"] == "image"
+    assert messages[1]["direction_evidence"]["side"] == "unknown"
+    assert not messages[1]["media"][0].get("capture_path")
+
+
 def test_ax_chat_messages_does_not_read_hidden_rows_unless_requested(monkeypatch):
     commands = []
 
@@ -752,6 +779,7 @@ def test_ax_chat_messages_ignores_small_media_icons(monkeypatch):
     assert messages == [
         {
             "row": 2,
+            "capture_row_id": "",
             "role": "unknown",
             "text": "客户消息",
             "time": "",
@@ -1207,6 +1235,62 @@ def test_capture_chat_images_closes_preview_when_preview_detection_fails(monkeyp
     assert "close-preview" in calls
     assert events[-1]["type"] == "image_capture_failed"
     assert events[-1]["close_preview"]["ok"] is True
+
+
+@pytest.mark.parametrize("fail_at", ["doubleclick", "preview", "screenshot"])
+def test_preview_cleanup_runs_after_exceptions_or_expired_deadline(monkeypatch, fail_at):
+    now = 100.0
+    calls = []
+    cleanup_timeouts = []
+    monkeypatch.setattr(macos_backend.time, "monotonic", lambda: now)
+    monkeypatch.setattr(macos_backend.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(macos_backend, "_append_event", lambda event: None)
+
+    def fail():
+        nonlocal now
+        now += 15
+        raise macos_backend.CaptureDeadlineExceeded("media_time_budget_exhausted")
+
+    def native(command):
+        name = command[0] if isinstance(command, list) else command
+        calls.append(name)
+        if name == fail_at:
+            fail()
+        if name == "close-preview":
+            cleanup_timeouts.append(macos_backend._capture_timeout(8))
+        return [{"ok": True, "image": {"x": 10, "y": 20, "width": 100, "height": 100}}]
+
+    monkeypatch.setattr(macos_backend, "_swift_ax", native)
+    monkeypatch.setattr(macos_backend, "_screenshot_rect", lambda *args: fail())
+    with pytest.raises(macos_backend.CaptureDeadlineExceeded):
+        with macos_backend.capture_deadline(now + 15):
+            macos_backend._click_image_and_capture({"x": 10, "y": 20, "width": 100, "height": 100})
+    assert calls[-1] == "close-preview"
+    assert cleanup_timeouts == [2]
+    assert macos_backend._capture_timeout(8) == 8
+
+
+def test_native_applescript_and_screenshot_use_remaining_capture_deadline(monkeypatch, tmp_path):
+    now = 100.0
+    timeouts = []
+    monkeypatch.setattr(macos_backend.time, "monotonic", lambda: now)
+    monkeypatch.setattr(macos_backend, "_swift_ax_runner", lambda source: ["ax-helper"])
+    monkeypatch.setattr(macos_backend, "_swift_ax_env", lambda: {})
+    monkeypatch.setattr(macos_backend.shutil, "which", lambda name: "/usr/bin/swift")
+
+    def run(args, **kwargs):
+        nonlocal now
+        timeouts.append(kwargs["timeout"])
+        now += 0.6
+        return subprocess.CompletedProcess(args, 0, stdout='{}', stderr='')
+
+    monkeypatch.setattr(macos_backend.subprocess, "run", run)
+    with macos_backend.capture_deadline(101.0):
+        macos_backend._swift_ax(["chat", "20"])
+        macos_backend.run_osascript("return 1")
+        with pytest.raises(macos_backend.CaptureDeadlineExceeded):
+            macos_backend._screenshot_rect({"x": 1, "y": 1, "width": 100, "height": 100}, tmp_path / "unused.png")
+    assert timeouts == pytest.approx([1, 0.4])
 
 def test_infer_roles_treats_none_role_as_unknown_user():
     messages = chat.infer_roles([{"role": None, "text": "老男复维多少钱"}])

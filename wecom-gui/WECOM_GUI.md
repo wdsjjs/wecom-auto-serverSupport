@@ -118,12 +118,26 @@ Install the AppKit menu-bar client to `~/Applications`:
 ./scripts/install-desktop-client
 ```
 
-The client has no Dock icon and only reads redacted local operational state. It
-can start, stop, or restart the controlled edge channel through
-`wecom-supervisor`; the AI reply is generated in the central service and is
-not a Mac process. It never provides a direct customer read/send action.
-Installation does not start the edge channel. Existing channel commands remain
-compatible and now delegate to the same supervisor:
+The client shows a Dock/menu-bar control surface and only reads redacted local
+operational state. The AI reply is generated in the central service and is not
+a Mac process. It never provides a direct customer read/send action.
+
+All local lifecycle actions go through one script:
+
+```bash
+./scripts/wecom-control start       # only opens the control panel
+./scripts/wecom-control start-wecom # starts Enterprise WeChat
+./scripts/wecom-control start-edge  # starts the edge channel
+./scripts/wecom-control stop        # stops the edge channel, WeChat, and panel
+./scripts/wecom-control status
+```
+
+The normal `启动客服.command` entry point only opens the control panel. Use its
+buttons to start or stop WeChat and the edge channel, so opening the desktop
+client cannot unexpectedly resume message processing. `start-all` remains
+available for an explicit one-shot startup. Installation does not start the
+edge channel. Existing channel commands remain compatible and still delegate
+to the same supervisor:
 
 ```bash
 ./scripts/wecom-channel status

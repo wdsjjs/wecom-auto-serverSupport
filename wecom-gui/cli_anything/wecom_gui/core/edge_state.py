@@ -142,6 +142,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         ON edge_outbound_echo_suppressions(conversation_key, normalized_text, expires_at)
         """
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS edge_command_echo_rows (
+            command_id TEXT NOT NULL,
+            conversation_key TEXT NOT NULL,
+            capture_row_id TEXT NOT NULL,
+            match_key TEXT NOT NULL,
+            PRIMARY KEY (conversation_key, capture_row_id)
+        )"""
+    )
 
 
 def _event_row(row: sqlite3.Row) -> dict:
@@ -363,7 +372,23 @@ def mark_command_executing(command_id: str) -> bool:
 
 def save_command_result(command_id: str, result: dict) -> None:
     """Persist a result before reporting it, so reboot never repeats a send."""
+    public_result = {key: value for key, value in result.items() if key != "_echo_rows"}
     with _connect() as conn:
+        # The receipt and exact GUI echo identities commit together. No customer
+        # content or image pixels are needed to recognize these rows on a rescan.
+        if result.get("status") == "succeeded" and result.get("_echo_rows"):
+            receipt = conn.execute("SELECT payload_json FROM edge_command_receipts WHERE command_id = ?",
+                                   (command_id,)).fetchone()
+            if receipt is None:
+                raise ValueError("command receipt missing for verified echoes")
+            conversation_key = str((json.loads(receipt[0]).get("conversation") or {}).get("key") or "")
+            if not conversation_key:
+                raise ValueError("command conversation missing for verified echoes")
+            for echo in result["_echo_rows"]:
+                conn.execute("""INSERT INTO edge_command_echo_rows
+                    (command_id, conversation_key, capture_row_id, match_key) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(conversation_key, capture_row_id) DO NOTHING""",
+                    (command_id, conversation_key, echo["capture_row_id"], echo["match_key"]))
         conn.execute(
             """
             UPDATE edge_command_receipts
@@ -373,12 +398,21 @@ def save_command_result(command_id: str, result: dict) -> None:
             """,
             (
                 str(result.get("status") or "needs_reconciliation"),
-                json.dumps(result, ensure_ascii=False),
+                json.dumps(public_result, ensure_ascii=False),
                 RESULT_PENDING,
                 time.time(),
                 command_id,
             ),
         )
+
+
+def is_command_echo_row(conversation_key: str, capture_row_id: str, match_key: str, *, connection) -> bool:
+    if not capture_row_id:
+        return False
+    return connection.execute("""SELECT 1 FROM edge_command_echo_rows e
+        JOIN edge_command_receipts r ON r.command_id = e.command_id
+        WHERE e.conversation_key = ? AND e.capture_row_id = ? AND e.match_key = ?
+          AND r.execution_status = 'succeeded'""", (conversation_key, capture_row_id, match_key)).fetchone() is not None
 
 
 def due_command_results(limit: int = 20, *, now: float | None = None) -> list[dict]:
@@ -619,6 +653,8 @@ def retry_command_result(command_id: str, error: str, *, delay_seconds: float) -
 
 
 def edge_status() -> dict:
+    from cli_anything.wecom_gui.core.edge_message_ledger import MEDIA_ATTEMPT_LIMIT
+
     with _connect() as conn:
         inbound_pending = conn.execute(
             "SELECT COUNT(*) AS count FROM edge_inbound_events WHERE status = ?", (PENDING,)
@@ -636,6 +672,17 @@ def edge_status() -> dict:
         )""").fetchone()[0] if ledger_table else conn.execute(
             "SELECT COUNT(*) FROM edge_inbound_events WHERE status = ?", (WAITING_MEDIA,)
         ).fetchone()[0]
+        media_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edge_media_capture_state'").fetchone()
+        paused_media = 0
+        paused_tasks = []
+        if ledger_table and media_table:
+            paused_media = conn.execute("""SELECT COUNT(*) FROM edge_media_capture_state s
+                JOIN edge_message_ledger l ON l.event_hash = s.event_hash
+                WHERE l.capture_status = 'pending_media' AND s.attempts >= ?""", (MEDIA_ATTEMPT_LIMIT,)).fetchone()[0]
+            paused_tasks = [dict(row) for row in conn.execute("""SELECT l.event_id, s.attempts, s.last_error
+                FROM edge_media_capture_state s JOIN edge_message_ledger l ON l.event_hash = s.event_hash
+                WHERE l.capture_status = 'pending_media' AND s.attempts >= ?
+                ORDER BY l.occurred_at DESC, l.event_id LIMIT 20""", (MEDIA_ATTEMPT_LIMIT,))]
     return {
         "ok": True,
         "inbound_pending": inbound_pending,
@@ -643,4 +690,6 @@ def edge_status() -> dict:
         "commands_received": commands,
         "message_alignment_pending": pending_alignment,
         "media_capture_pending": pending_media,
+        "media_capture_paused": paused_media,
+        "paused_media_tasks": paused_tasks,
     }

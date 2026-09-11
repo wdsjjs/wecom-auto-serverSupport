@@ -1,0 +1,137 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+GUI_DIR="${SCRIPT_DIR:h}"
+ROOT_DIR="${GUI_DIR:h}"
+SUPERVISOR="$SCRIPT_DIR/wecom-supervisor"
+ENV_FILE="${WECOM_CHANNEL_ENV:-$GUI_DIR/.env.local}"
+UDA_APP="$HOME/Applications/UDA WeCom Agent.app"
+APP_NAME="${WECOM_GUI_APP_NAME:-企业微信}"
+BUNDLE_ID="${WECOM_GUI_BUNDLE_ID:-com.tencent.WeWorkMac}"
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  source "$ENV_FILE"
+  set +a
+  APP_NAME="${WECOM_GUI_APP_NAME:-$APP_NAME}"
+  BUNDLE_ID="${WECOM_GUI_BUNDLE_ID:-$BUNDLE_ID}"
+fi
+
+die() {
+  print -u2 -- "ERROR: $*"
+  exit 1
+}
+
+app_running() {
+  osascript -e "tell application id \"$BUNDLE_ID\" to running" 2>/dev/null | grep -qi '^true$'
+}
+
+wait_for_app_state() {
+  local expected="$1"
+  local attempt
+  for attempt in {1..20}; do
+    if [[ "$expected" == "running" ]] && app_running; then return 0; fi
+    if [[ "$expected" == "stopped" ]] && ! app_running; then return 0; fi
+    sleep 0.25
+  done
+  return 1
+}
+
+start_wecom() {
+  if app_running; then
+    print -- "企微已运行：$APP_NAME"
+    return 0
+  fi
+  open -b "$BUNDLE_ID"
+  wait_for_app_state running || die "企微启动超时：$APP_NAME ($BUNDLE_ID)"
+  print -- "企微已启动：$APP_NAME"
+}
+
+stop_wecom() {
+  if ! app_running; then
+    print -- "企微未运行：$APP_NAME"
+    return 0
+  fi
+  osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null
+  wait_for_app_state stopped || die "企微停止超时：$APP_NAME ($BUNDLE_ID)"
+  print -- "企微已停止：$APP_NAME"
+}
+
+start_uda() {
+  local installer="$SCRIPT_DIR/install-desktop-client"
+  [[ -x "$installer" ]] || die "缺少 UDA 客户端安装脚本：$installer"
+  "$installer"
+}
+
+stop_uda() {
+  local app_pids
+  app_pids="$(pgrep -x UDAWeComAgent || true)"
+  if [[ -n "$app_pids" ]]; then
+    print -- "$app_pids" | xargs kill 2>/dev/null || true
+  fi
+}
+
+start_edge() { "$SUPERVISOR" start edge; }
+stop_edge() { "$SUPERVISOR" stop edge; }
+restart_edge() { "$SUPERVISOR" restart edge; }
+
+start_services() {
+  start_wecom
+  start_edge
+}
+
+stop_services() {
+  stop_edge
+  stop_wecom
+}
+
+start_all() {
+  start_uda
+  start_services
+}
+
+stop_all() {
+  stop_services
+  stop_uda
+}
+
+start_ui() {
+  start_uda
+  print -- "控制面板已启动；企微和边缘通道等待面板按钮操作。"
+}
+
+runtime_status() {
+  cd "$GUI_DIR"
+  export PYTHONPATH="${WECOM_GUI_PYTHONPATH:-}"
+  exec "${WECOM_GUI_PYTHON:-python3}" -m cli_anything.wecom_gui --json runtime status
+}
+
+status_all() {
+  print -- "企微：$(app_running && print -- 运行中 || print -- 已停止)"
+  "$SUPERVISOR" status
+}
+
+case "${1:-}" in
+  # The normal desktop launcher opens the control plane only. Services are
+  # deliberately started from the panel so opening the launcher is harmless.
+  start) start_ui ;;
+  start-ui) start_ui ;;
+  stop-ui) stop_uda ;;
+  start-all) start_all ;;
+  start-services) start_services ;;
+  stop-services) stop_services ;;
+  stop) stop_all ;;
+  restart) stop_all; start_all ;;
+  start-wecom) start_wecom ;;
+  stop-wecom) stop_wecom ;;
+  start-edge) start_edge ;;
+  stop-edge) stop_edge ;;
+  restart-edge) restart_edge ;;
+  status) status_all ;;
+  runtime-status) runtime_status ;;
+  *)
+    print -u2 -- "用法：$0 {start|stop|restart|start-all|start-services|stop-services|start-wecom|stop-wecom|start-edge|stop-edge|restart-edge|status|runtime-status}"
+    exit 2
+    ;;
+esac

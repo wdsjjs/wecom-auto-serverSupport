@@ -1,4 +1,20 @@
 import AppKit
+import ApplicationServices
+
+private struct DesktopAccess {
+    let accessibility: Bool
+    let screenCapture: Bool
+
+    static func current() -> DesktopAccess {
+        DesktopAccess(accessibility: AXIsProcessTrusted(), screenCapture: CGPreflightScreenCaptureAccess())
+    }
+
+    var issue: String? {
+        if !accessibility { return "需要重新授权无障碍" }
+        if !screenCapture { return "需要屏幕录制权限" }
+        return nil
+    }
+}
 
 private enum JsonValue: Decodable, CustomStringConvertible {
     case string(String), number(Double), bool(Bool), null
@@ -60,13 +76,22 @@ private final class FloatingDashboardView: NSView {
     private var snapshot = RuntimeSnapshot(states: [], events: [])
     private var pulse: CGFloat = 0
     private var animationTimer: Timer?
+    var controlNotice = "" { didSet { needsDisplay = true } }
     var onDetails: (() -> Void)?
     var onLogs: (() -> Void)?
     var onWorkbench: (() -> Void)?
+    var onStartWeCom: (() -> Void)?
+    var onStopWeCom: (() -> Void)?
+    var onStartEdge: (() -> Void)?
+    var onStopEdge: (() -> Void)?
 
-    private let detailRect = NSRect(x: 20, y: 14, width: 92, height: 30)
-    private let logsRect = NSRect(x: 134, y: 14, width: 92, height: 30)
-    private let workbenchRect = NSRect(x: 248, y: 14, width: 92, height: 30)
+    private let startWeComRect = NSRect(x: 20, y: 90, width: 102, height: 30)
+    private let stopWeComRect = NSRect(x: 129, y: 90, width: 102, height: 30)
+    private let startEdgeRect = NSRect(x: 238, y: 90, width: 102, height: 30)
+    private let stopEdgeRect = NSRect(x: 20, y: 52, width: 102, height: 30)
+    private let detailRect = NSRect(x: 129, y: 52, width: 102, height: 30)
+    private let logsRect = NSRect(x: 238, y: 52, width: 102, height: 30)
+    private let workbenchRect = NSRect(x: 20, y: 14, width: 320, height: 30)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -79,6 +104,8 @@ private final class FloatingDashboardView: NSView {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     deinit { animationTimer?.invalidate() }
 
@@ -178,6 +205,11 @@ private final class FloatingDashboardView: NSView {
             }
         }
 
+        drawText(shortened(controlNotice, limit: 29), at: NSPoint(x: 20, y: 129), font: .systemFont(ofSize: 11), color: .systemYellow)
+        drawFooterButton("启动企微", rect: startWeComRect, icon: "play.fill")
+        drawFooterButton("停止企微", rect: stopWeComRect, icon: "stop.fill")
+        drawFooterButton("启动边缘", rect: startEdgeRect, icon: "bolt.fill")
+        drawFooterButton("停止边缘", rect: stopEdgeRect, icon: "bolt.slash.fill")
         drawFooterButton("详情", rect: detailRect, icon: "list.bullet")
         drawFooterButton("日志", rect: logsRect, icon: "doc.text")
         drawFooterButton("中台", rect: workbenchRect, icon: "arrow.up.right.square")
@@ -208,7 +240,11 @@ private final class FloatingDashboardView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        if detailRect.contains(point) { onDetails?() }
+        if startWeComRect.contains(point) { onStartWeCom?() }
+        else if stopWeComRect.contains(point) { onStopWeCom?() }
+        else if startEdgeRect.contains(point) { onStartEdge?() }
+        else if stopEdgeRect.contains(point) { onStopEdge?() }
+        else if detailRect.contains(point) { onDetails?() }
         else if logsRect.contains(point) { onLogs?() }
         else if workbenchRect.contains(point) { onWorkbench?() }
     }
@@ -216,26 +252,28 @@ private final class FloatingDashboardView: NSView {
 
 private final class AgentApp: NSObject, NSApplicationDelegate {
     private let root: String
-    private let supervisor: String
-    private let python: String
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private let summary = NSMenuItem(title: "本机状态: 正在读取...", action: nil, keyEquivalent: "")
     private let edge = NSMenuItem(title: "边缘通道: 已停止", action: nil, keyEquivalent: "")
     private let centralCommands = NSMenuItem(title: "中台指令: 等待边缘通道", action: nil, keyEquivalent: "")
     private var snapshot = RuntimeSnapshot(states: [], events: [])
+    private let control: String
     private var detailWindow: NSWindow?
     private var floatingPanel: FloatingStatusPanel?
     private var dashboard: FloatingDashboardView?
     private var timer: Timer?
+    private var refreshing = false
+    private var actionInFlight = false
+    private var actionNotice = ""
+    private var refreshError = ""
 
     override init() {
         let app = URL(fileURLWithPath: Bundle.main.bundlePath)
         let resourceRoot = Bundle.main.url(forResource: "wecom-gui-root", withExtension: "txt")
             .flatMap { try? String(contentsOf: $0, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) }
         root = ProcessInfo.processInfo.environment["WECOM_GUI_ROOT"] ?? resourceRoot ?? app.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path
-        supervisor = ProcessInfo.processInfo.environment["WECOM_SUPERVISOR_PATH"] ?? "\(root)/scripts/wecom-supervisor"
-        python = ProcessInfo.processInfo.environment["WECOM_GUI_PYTHON"] ?? "/usr/bin/env"
+        control = ProcessInfo.processInfo.environment["WECOM_CONTROL_PATH"] ?? "\(root)/scripts/wecom-control"
         super.init()
     }
 
@@ -247,6 +285,8 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
         menu.addItem(centralCommands)
         menu.addItem(.separator())
         add("启动边缘通道", #selector(startEdge)); add("停止边缘通道", #selector(stopEdge)); add("重启边缘通道", #selector(restartEdge))
+        add("启动企微", #selector(startWeCom)); add("停止企微", #selector(stopWeCom))
+        add("检查系统权限", #selector(checkPermissions))
         menu.addItem(.separator())
         add("显示/隐藏状态浮窗", #selector(toggleDashboard)); add("查看本机流转详情", #selector(showDetails)); add("打开运行日志", #selector(openLogs)); add("打开中台工作台", #selector(openWorkbench))
         menu.addItem(.separator()); add("退出 UDA WeCom Agent", #selector(quit))
@@ -256,7 +296,7 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
     }
 
     private func makeFloatingDashboard() {
-        let size = NSSize(width: 360, height: 390)
+        let size = NSSize(width: 360, height: 520)
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let origin = NSPoint(x: screen.maxX - size.width - 24, y: screen.maxY - size.height - 56)
         let panel = FloatingStatusPanel(
@@ -274,6 +314,10 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
         view.onDetails = { [weak self] in self?.showDetails() }
         view.onLogs = { [weak self] in self?.openLogs() }
         view.onWorkbench = { [weak self] in self?.openWorkbench() }
+        view.onStartWeCom = { [weak self] in self?.controlAction("start-wecom") }
+        view.onStopWeCom = { [weak self] in self?.controlAction("stop-wecom") }
+        view.onStartEdge = { [weak self] in self?.controlAction("start-edge") }
+        view.onStopEdge = { [weak self] in self?.controlAction("stop-edge") }
         panel.contentView = view
         floatingPanel = panel
         dashboard = view
@@ -285,26 +329,44 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
         NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "UDA WeCom Agent")?.withSymbolConfiguration(.init(paletteColors: [color]))
     }
 
-    private func invoke(_ executable: String, _ args: [String], completion: @escaping (String) -> Void) {
-        let task = Process(); task.currentDirectoryURL = URL(fileURLWithPath: root)
-        if executable == "/usr/bin/env" { task.executableURL = URL(fileURLWithPath: executable); task.arguments = args }
-        else { task.executableURL = URL(fileURLWithPath: executable); task.arguments = args }
-        let pipe = Pipe(); task.standardOutput = pipe; task.standardError = pipe
-        task.terminationHandler = { _ in
-            let result = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            DispatchQueue.main.async { completion(result) }
+    private func invoke(_ executable: String, _ args: [String], completion: @escaping (String, Bool) -> Void) {
+        let directory = root
+        DispatchQueue.global(qos: .utility).async {
+            let task = Process(); task.currentDirectoryURL = URL(fileURLWithPath: directory)
+            task.executableURL = URL(fileURLWithPath: executable)
+            task.arguments = args
+            let pipe = Pipe(); task.standardOutput = pipe; task.standardError = pipe
+            do {
+                try task.run()
+                // Drain while the child runs; waiting for exit first can fill the pipe.
+                let result = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                task.waitUntilExit()
+                let success = task.terminationStatus == 0
+                DispatchQueue.main.async { completion(result, success) }
+            } catch {
+                DispatchQueue.main.async { completion("\(error)", false) }
+            }
         }
-        do { try task.run() } catch { completion("\(error)") }
     }
 
     private func refresh() {
-        invoke(python, ["-m", "cli_anything.wecom_gui", "--json", "runtime", "status"]) { [weak self] text in
-            guard let data = text.data(using: .utf8), let snapshot = try? JSONDecoder().decode(RuntimeSnapshot.self, from: data) else { return }
-            self?.snapshot = snapshot; self?.render()
+        guard !refreshing else { return }
+        refreshing = true
+        invoke(control, ["runtime-status"]) { [weak self] text, success in
+            guard let self else { return }
+            self.refreshing = false
+            if success, let data = text.data(using: .utf8), let snapshot = try? JSONDecoder().decode(RuntimeSnapshot.self, from: data) {
+                self.snapshot = snapshot
+                self.refreshError = ""
+            } else {
+                self.refreshError = "状态读取失败，请查看运行日志"
+            }
+            self.render()
         }
     }
 
     private func render() {
+        let access = DesktopAccess.current()
         let edgeState = snapshot.states.first { $0.process == "edge_channel" }
         edge.title = line("边缘通道", edgeState)
         centralCommands.title = commandLine(edgeState)
@@ -313,6 +375,26 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
         item.button?.image = indicator(color)
         summary.title = color == .systemRed ? "本机状态: 需要处理" : color == .systemYellow ? "本机状态: 等待确认或重试" : color == .systemGreen ? "本机状态: 正常" : "本机状态: 服务已停止"
         dashboard?.update(snapshot)
+        let issue = access.issue ?? (refreshError.isEmpty ? nil : refreshError)
+        dashboard?.controlNotice = issue ?? actionNotice
+        if let issue {
+            item.button?.image = indicator(.systemRed)
+            summary.title = "本机状态: \(issue)"
+        }
+        writeDesktopHealth(access)
+    }
+
+    private func writeDesktopHealth(_ access: DesktopAccess) {
+        let health: [String: Any] = ["pid": ProcessInfo.processInfo.processIdentifier,
+            "accessibility": access.accessibility, "screen_capture": access.screenCapture,
+            "state_read_ok": refreshError.isEmpty, "action_in_flight": actionInFlight,
+            "updated_at": Date().timeIntervalSince1970]
+        let directory = URL(fileURLWithPath: "\(root)/.codex-run")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let data = try JSONSerialization.data(withJSONObject: health, options: [.sortedKeys])
+            try data.write(to: directory.appendingPathComponent("desktop-health.json"), options: .atomic)
+        } catch { NSLog("Unable to write desktop health: %@", error.localizedDescription) }
     }
 
     private func line(_ title: String, _ value: RuntimeProcess?) -> String {
@@ -334,14 +416,60 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
     }
 
     private func supervise(_ action: String, _ service: String, completion: (() -> Void)? = nil) {
-        invoke(supervisor, [action, service]) { [weak self] _ in
-            self?.refresh()
+        controlAction("\(action)-\(service)", completion: completion)
+    }
+    private func controlAction(_ action: String, completion: (() -> Void)? = nil) {
+        guard !actionInFlight else { return }
+        if ["start-edge", "restart-edge"].contains(action), !ensureEdgePermissions() { return }
+        actionInFlight = true
+        actionNotice = "正在执行操作..."
+        render()
+        invoke(control, [action]) { [weak self] text, success in
+            guard let self else { return }
+            self.actionInFlight = false
+            self.actionNotice = success ? "操作已执行" : "操作失败，请查看错误提示"
+            self.refresh()
+            if !success { self.showCommandError(text) }
             completion?()
         }
+    }
+    private func ensureEdgePermissions() -> Bool {
+        let access = DesktopAccess.current()
+        guard let issue = access.issue else { return true }
+        render()
+        let alert = NSAlert()
+        alert.messageText = issue
+        alert.informativeText = !access.accessibility
+            ? "请在系统设置的隐私与安全性 > 辅助功能中授权 UDA WeCom Agent。更新后如果已经开启，请移除旧条目，再添加 ~/Applications/UDA WeCom Agent.app。授权完成后重新点击启动边缘。"
+            : "请在系统设置的隐私与安全性 > 屏幕与系统音频录制中允许 UDA WeCom Agent，用于读取消息气泡方向和图片。授权后重新打开客户端，再点击启动边缘。"
+        alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "稍后")
+        if alert.runModal() == .alertFirstButtonReturn {
+            if !access.accessibility {
+                let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                _ = AXIsProcessTrustedWithOptions(options)
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+            } else {
+                _ = CGRequestScreenCaptureAccess()
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+            }
+        }
+        return false
+    }
+    @objc private func checkPermissions() { _ = ensureEdgePermissions() }
+    private func showCommandError(_ text: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "操作未完成"
+        alert.informativeText = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "统一控制脚本执行失败。" : text.trimmingCharacters(in: .whitespacesAndNewlines)
+        alert.addButton(withTitle: "知道了")
+        alert.runModal()
     }
     @objc private func startEdge() { supervise("start", "edge") }
     @objc private func stopEdge() { supervise("stop", "edge") }
     @objc private func restartEdge() { supervise("restart", "edge") }
+    @objc private func startWeCom() { controlAction("start-wecom") }
+    @objc private func stopWeCom() { controlAction("stop-wecom") }
     @objc private func toggleDashboard() {
         guard let floatingPanel else { return }
         if floatingPanel.isVisible { floatingPanel.orderOut(nil) }
@@ -349,9 +477,7 @@ private final class AgentApp: NSObject, NSApplicationDelegate {
     }
     @objc private func openLogs() { NSWorkspace.shared.open(URL(fileURLWithPath: "\(root)/.codex-run")) }
     @objc private func openWorkbench() { NSWorkspace.shared.open(URL(string: ProcessInfo.processInfo.environment["WECOM_WORKBENCH_URL"] ?? "https://knowledge-cs.uda.cn/operations/wecom-message-workbench")!) }
-    @objc private func quit() {
-        supervise("stop", "edge") { NSApp.terminate(nil) }
-    }
+    @objc private func quit() { NSApp.terminate(nil) }
 
     @objc private func showDetails() {
         let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 760, height: 520)); text.isEditable = false

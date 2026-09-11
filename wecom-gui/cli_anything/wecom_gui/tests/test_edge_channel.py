@@ -572,6 +572,78 @@ def test_command_waits_for_target_conversation_selection(monkeypatch):
     assert result == {"status": "succeeded", "verification": "reply_visible"}
 
 
+@pytest.mark.parametrize("failed_index", [0, 1])
+@pytest.mark.parametrize("error_type", [edge_channel.ChannelError, TimeoutError, OSError])
+def test_command_media_download_failure_never_sends_text_or_images(monkeypatch, tmp_path, failed_index, error_type):
+    monkeypatch.setattr(state, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(edge_worker.inbox, "open_row", lambda row: None)
+    monkeypatch.setattr(edge_worker, "_wait_for_opened_conversation", lambda row: True)
+    monkeypatch.setattr(edge_worker.macos_backend, "send_input_ready", lambda: {"ok": True, "input": {"valueLength": 0}})
+    monkeypatch.setattr(edge_worker.chat, "read_current", lambda **kwargs: {"messages": []})
+    command = _command()
+    command["media"] = [{"id": f"image-{index}", "type": "image", "filename": "图片.jpeg"} for index in range(2)]
+    downloads = []
+    sends = []
+    client = FakeChannel()
+
+    def download(command_id, media_id, destination):
+        assert command_id == command["command_id"]
+        downloads.append(media_id)
+        if len(downloads) - 1 == failed_index:
+            raise error_type("private upstream error")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"image bytes")
+
+    monkeypatch.setattr(client, "download_command_media", download, raising=False)
+    monkeypatch.setattr(edge_worker.reply, "send_message", lambda *args, **kwargs: sends.append((args, kwargs)))
+
+    result = edge_worker.execute_command(client, command)
+
+    assert result == {"status": "precondition_failed", "reason": f"command_media_download_failed:{error_type.__name__}"}
+    assert len(downloads) == failed_index + 1
+    assert sends == []
+
+
+def test_command_downloads_all_images_before_sending_with_text(monkeypatch, tmp_path):
+    monkeypatch.setattr(state, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(edge_worker.inbox, "open_row", lambda row: None)
+    monkeypatch.setattr(edge_worker, "_wait_for_opened_conversation", lambda row: True)
+    monkeypatch.setattr(edge_worker.macos_backend, "send_input_ready", lambda: {"ok": True, "input": {"valueLength": 0}})
+    command = _command()
+    command["media"] = [{"id": f"image-{index}", "filename": "图片.jpeg"} for index in range(2)]
+    monkeypatch.setattr(edge_worker.macos_backend, "selected_conversation_row",
+                        lambda **kwargs: {"title": "客户A", "external_user_id": "customer-1"})
+    evidence = {"source": "screencapturekit", "status": "matched", "side": "right"}
+    echoes = [{"capture_row_id": "text-1", "role": "客服", "text": command["text"], "direction_evidence": evidence}]
+    echoes += [{"capture_row_id": f"picture-{index}", "role": "客服", "text": "[图片]",
+                "media": [{"type": "image"}], "direction_evidence": evidence} for index in range(2)]
+    reads = iter([{"messages": []}, {"messages": echoes}])
+    monkeypatch.setattr(edge_worker.chat, "read_current", lambda **kwargs: next(reads))
+    operations = []
+    client = FakeChannel()
+
+    def download(command_id, media_id, destination):
+        operations.append(media_id)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"image bytes")
+
+    def send(text, **kwargs):
+        operations.append("send")
+        assert text == command["text"]
+        assert kwargs["attachments"] == [
+            {"type": "image", "path": str(tmp_path / "edge-command-media" / "cmd-1" / f"{index}.jpeg")}
+            for index in range(2)
+        ]
+        assert kwargs["submit"] is True
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "download_command_media", download, raising=False)
+    monkeypatch.setattr(edge_worker.reply, "send_message", send)
+
+    assert edge_worker.execute_command(client, command)["status"] == "succeeded"
+    assert operations == ["image-0", "image-1", "send"]
+
+
 def test_duplicate_command_is_durable_but_never_becomes_executable_twice(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_anything.wecom_gui.core.state.state_dir", lambda: tmp_path)
     command = _command()

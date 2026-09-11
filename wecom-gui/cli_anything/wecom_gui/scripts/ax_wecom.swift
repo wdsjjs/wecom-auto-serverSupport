@@ -3,6 +3,7 @@ import ApplicationServices
 import AppKit
 import ScreenCaptureKit
 import ImageIO
+import CryptoKit
 
 let profileChatRead = ProcessInfo.processInfo.environment["WECOM_GUI_AX_PROFILE"] == "1"
 
@@ -561,19 +562,32 @@ func chatPayload(_ nodes: [ChatNodeSnapshot], index: Int, viewport: [String: Dou
 }
 
 func chatPayload(_ row: AXUIElement, index: Int, viewport: [String: Double]?) -> [String: Any] {
-    chatPayload(readChatNodes(row), index: index, viewport: viewport)
+    var payload = chatPayload(readChatNodes(row), index: index, viewport: viewport)
+    payload["captureRowId"] = captureRowIdentity(row)
+    return payload
 }
 
-func ancestorRect(_ element: AXUIElement, matchingRole: String) -> [String: Double]? {
+func captureRowIdentity(_ row: AXUIElement) -> String {
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(row, &pid) == .success,
+          let launched = NSRunningApplication(processIdentifier: pid)?.launchDate else { return "" }
+    return "\(pid):\(launched.timeIntervalSince1970):\(CFHash(row))"
+}
+
+func ancestorElement(_ element: AXUIElement, matchingRole: String) -> AXUIElement? {
     var current = element
     for _ in 0..<16 {
         var parent: CFTypeRef?
         guard AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parent) == .success,
               let value = parent, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
         current = value as! AXUIElement
-        if role(current) == matchingRole { return rectPayload(current) }
+        if role(current) == matchingRole { return current }
     }
     return nil
+}
+
+func ancestorRect(_ element: AXUIElement, matchingRole: String) -> [String: Double]? {
+    ancestorElement(element, matchingRole: matchingRole).flatMap { rectPayload($0) }
 }
 
 func cgRect(_ payload: [String: Double]) -> CGRect {
@@ -642,31 +656,53 @@ func bubbleComponents(image: CGImage, window: CGRect, viewport: CGRect, images: 
         fputs("ax-profile bubble_palette: images=\(images) threshold=\(minimumTextPixels) "
             + String(format: "background=%06x ", background) + "colors=\(samples)\n", stderr)
     }
-    let foreground = images ? colors.map { colorDistance($0, background) >= 20 } : []
-    var visited = [Bool](repeating: false, count: colors.count)
     var boxes: [CGRect] = []
-    for start in colors.indices where !visited[start] && (images ? foreground[start] : palette.contains(colors[start])) {
-        let color = colors[start]
-        var stack = [start]
-        visited[start] = true
-        var minX = start % width, maxX = minX, minY = start / width, maxY = minY, count = 0
-        while let pixel = stack.popLast() {
-            let x = pixel % width, y = pixel / width
-            count += 1
-            minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
-            for next in [x > 0 ? pixel - 1 : -1, x + 1 < width ? pixel + 1 : -1,
-                         y > 0 ? pixel - width : -1, y + 1 < height ? pixel + width : -1] {
-                if next >= 0 && !visited[next] && (images ? foreground[next] : colors[next] == color) {
-                    visited[next] = true
-                    stack.append(next)
+    // Keep the existing dense-photo pass. White screenshots need a second,
+    // low-contrast pass with a complete four-sided outline, not a relaxed fill.
+    for threshold in (images ? [20, 4] : [0]) {
+        let foreground = images ? colors.map { colorDistance($0, background) >= threshold } : []
+        var visited = [Bool](repeating: false, count: colors.count)
+        var labels = threshold == 4 ? [Int](repeating: 0, count: colors.count) : []
+        for start in colors.indices where !visited[start] && (images ? foreground[start] : palette.contains(colors[start])) {
+            let color = colors[start]
+            var stack = [start]
+            visited[start] = true
+            var minX = start % width, maxX = minX, minY = start / width, maxY = minY, count = 0
+            while let pixel = stack.popLast() {
+                let x = pixel % width, y = pixel / width
+                if threshold == 4 { labels[pixel] = start + 1 }
+                count += 1
+                minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+                for next in [x > 0 ? pixel - 1 : -1, x + 1 < width ? pixel + 1 : -1,
+                             y > 0 ? pixel - width : -1, y + 1 < height ? pixel + width : -1] {
+                    if next >= 0 && !visited[next] && (images ? foreground[next] : colors[next] == color) {
+                        visited[next] = true
+                        stack.append(next)
+                    }
                 }
             }
-        }
-        let w = maxX - minX + 1, h = maxY - minY + 1
-        let sizeMatches = images ? w >= 64 && h >= 64 && Double(w) <= viewport.width * 0.8 : w >= 20 && h >= 18
-        if sizeMatches && Double(count) / Double(w * h) >= 0.35 {
-            boxes.append(CGRect(x: viewport.minX + Double(minX), y: viewport.minY + Double(minY),
-                                width: Double(w), height: Double(h)))
+            let w = maxX - minX + 1, h = maxY - minY + 1
+            let sizeMatches = images ? w >= 64 && h >= 64 && Double(w) <= viewport.width * 0.8 : w >= 20 && h >= 18
+            var outlined = false
+            if threshold == 4 && sizeMatches {
+                let xs = (minX + w / 10)..<(maxX - w / 10)
+                let ys = (minY + h / 10)..<(maxY - h / 10)
+                let top = xs.filter { x in (minY...minY + 2).contains { labels[$0 * width + x] == start + 1 } }.count
+                let bottom = xs.filter { x in (maxY - 2...maxY).contains { labels[$0 * width + x] == start + 1 } }.count
+                let left = ys.filter { y in (minX...minX + 2).contains { labels[y * width + $0] == start + 1 } }.count
+                let right = ys.filter { y in (maxX - 2...maxX).contains { labels[y * width + $0] == start + 1 } }.count
+                outlined = [top, bottom].allSatisfy { Double($0) >= Double(xs.count) * 0.9 }
+                    && [left, right].allSatisfy { Double($0) >= Double(ys.count) * 0.9 }
+            }
+            if sizeMatches && (threshold == 4 ? outlined : Double(count) / Double(w * h) >= 0.35) {
+                let box = CGRect(x: viewport.minX + Double(minX), y: viewport.minY + Double(minY),
+                                 width: Double(w), height: Double(h))
+                if threshold == 4 && boxes.contains(where: {
+                    let overlap = $0.intersection(box)
+                    return !overlap.isNull && overlap.width * overlap.height >= box.width * box.height * 0.9
+                }) { continue }
+                boxes.append(box)
+            }
         }
     }
     if profileChatRead {
@@ -683,9 +719,13 @@ func imageBubbleEvidence(row: CGRect, viewport: CGRect, boxes: [CGRect]) -> [Str
         result["status"] = "outside_viewport_or_unlaid_out"
         return result
     }
-    let candidates = boxes.filter {
+    let enclosed = boxes.filter {
         visible.insetBy(dx: -2, dy: -2).contains($0)
             && $0.minY > viewport.minY + 2 && $0.maxY < viewport.maxY - 2
+    }
+    // Content inside a complete image frame belongs to that same image.
+    let candidates = enclosed.filter { box in
+        !enclosed.contains { $0.width * $0.height > box.width * box.height && $0.contains(box) }
     }
     let matches = candidates.compactMap { box -> (CGRect, String)? in
         let left = box.minX - viewport.minX, right = viewport.maxX - box.maxX
@@ -698,6 +738,31 @@ func imageBubbleEvidence(row: CGRect, viewport: CGRect, boxes: [CGRect]) -> [Str
     result["side"] = match.1
     result["bubbleRect"] = rectDictionary(match.0)
     return result
+}
+
+func imageFingerprint(image: CGImage, window: CGRect, rect: CGRect) -> String? {
+    guard window.width > 0, window.height > 0, window.contains(rect), rect.width >= 64, rect.height >= 64 else { return nil }
+    let crop = CGRect(x: (rect.minX - window.minX) * Double(image.width) / window.width,
+                      y: (rect.minY - window.minY) * Double(image.height) / window.height,
+                      width: rect.width * Double(image.width) / window.width,
+                      height: rect.height * Double(image.height) / window.height)
+    guard let cropped = image.cropping(to: crop) else { return nil }
+    var pixels = [UInt8](repeating: 0, count: 32 * 32 * 4)
+    let drawn = pixels.withUnsafeMutableBytes { bytes -> Bool in
+        guard let context = CGContext(data: bytes.baseAddress, width: 32, height: 32,
+            bitsPerComponent: 8, bytesPerRow: 32 * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+        context.interpolationQuality = .high
+        context.draw(cropped, in: CGRect(x: 0, y: 0, width: 32, height: 32))
+        return true
+    }
+    guard drawn else { return nil }
+    // Normalize position and size, excluding cursor/hover margins outside the image.
+    let rgb = pixels.enumerated().compactMap { index, value in index % 4 == 3 ? nil : value }
+    let legacy = SHA256.hash(data: Data(rgb.map { $0 & 0xf8 })).map { String(format: "%02x", $0) }.joined()
+    // Keep the legacy digest for a strict upgrade of persisted v1 anchors.
+    // Retain samples so tiny compositor changes do not avalanche into a new hash.
+    return "rgb32-v2:" + legacy + ":" + Data(rgb).base64EncodedString()
 }
 
 func bubbleEvidence(body: CGRect, viewport: CGRect, boxes: [CGRect]) -> [String: Any] {
@@ -876,6 +941,10 @@ func verifyBubbleDirections(_ payloads: [[String: Any]], root: AXUIElement, wind
             let row = CGRect(x: item["x"] as? Double ?? 0, y: item["y"] as? Double ?? 0,
                              width: item["width"] as? Double ?? 0, height: item["height"] as? Double ?? 0)
             evidence = imageBubbleEvidence(row: row, viewport: viewport, boxes: imageBoxes ?? [])
+            if let rect = evidence["bubbleRect"] as? [String: Double],
+               let fingerprint = imageFingerprint(image: image, window: windowRect, rect: cgRect(rect)) {
+                evidence["imageFingerprint"] = fingerprint
+            }
         } else {
             evidence = bubbleEvidence(body: bodyRect(item), viewport: viewport, boxes: boxes)
         }
@@ -932,7 +1001,15 @@ func candidatePreviewWindow(_ windows: [AXUIElement]) -> AXUIElement? {
 
 func doubleClickAt(x: Double, y: Double) {
     let source = CGEventSource(stateID: .hidSystemState)
+    let originalPoint = CGEvent(source: nil)?.location
     let point = CGPoint(x: x, y: y)
+    defer {
+        if let original = originalPoint, let current = CGEvent(source: nil)?.location,
+           abs(current.x - point.x) < 2, abs(current.y - point.y) < 2 {
+            CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: original,
+                    mouseButton: .left)?.post(tap: .cghidEventTap)
+        }
+    }
     CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
     Thread.sleep(forTimeInterval: 0.05)
     for clickState in [1, 2] {
@@ -1111,6 +1188,19 @@ func previewPayload(root: AXUIElement) -> [String: Any] {
 }
 
 func closePreview(root: AXUIElement) -> [String: Any] {
+    var didClose = false
+    defer {
+        if didClose {
+            // The preview can swallow mouse-exit updates for the underlying
+            // bubble. Refresh hover at the current location without moving it.
+            Thread.sleep(forTimeInterval: 0.15)
+            if let point = CGEvent(source: nil)?.location {
+                let source = CGEventSource(stateID: .hidSystemState)
+                CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point,
+                        mouseButton: .left)?.post(tap: .cghidEventTap)
+            }
+        }
+    }
     let windows = allWindows(root)
     var bestWindow: AXUIElement?
     var bestArea = 0.0
@@ -1138,6 +1228,7 @@ func closePreview(root: AXUIElement) -> [String: Any] {
         if AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &closeValue) == .success,
            let closeButton = closeValue {
             let result = AXUIElementPerformAction(closeButton as! AXUIElement, kAXPressAction as CFString)
+            didClose = result == .success
             return ["ok": result == .success, "method": "AXCloseButton", "code": result.rawValue]
         }
         var stack = children(window)
@@ -1148,6 +1239,7 @@ func closePreview(root: AXUIElement) -> [String: Any] {
             if itemSubrole == "AXCloseButton"
                 || values.contains(where: { $0 == "关闭" || $0 == "close" || $0.contains("关闭") }) {
                 let result = AXUIElementPerformAction(item, kAXPressAction as CFString)
+                didClose = result == .success
                 return ["ok": result == .success, "method": "AXPressClose", "code": result.rawValue]
             }
             stack.append(contentsOf: children(item))
@@ -1156,6 +1248,7 @@ func closePreview(root: AXUIElement) -> [String: Any] {
             let x = rect["x", default: 0] + 14
             let y = rect["y", default: 0] + 14
             clickAt(x: x, y: y)
+            didClose = true
             return ["ok": true, "method": "CGCloseButtonPoint", "x": x, "y": y, "windowCount": windows.count]
         }
     }
@@ -1444,13 +1537,71 @@ func chatSnapshotContext(window: AXUIElement?, last: Int) -> (table: AXUIElement
         if score > bestScore || (score == bestScore && area > bestArea) {
             bestTable = table
             bestPayloads = snapshots.enumerated().map {
-                chatPayload($0.element, index: indices.lowerBound + $0.offset + 1, viewport: viewport)
+                let index = indices.lowerBound + $0.offset
+                var payload = chatPayload($0.element, index: index + 1, viewport: viewport)
+                payload["captureRowId"] = captureRowIdentity(rows[index])
+                return payload
             }
             bestScore = score
             bestArea = area
         }
     }
     return (bestTable, bestPayloads, selectedRow)
+}
+
+func revealChatRow(window: AXUIElement?, index: Int, last: Int) -> [String: Any] {
+    let context = chatSnapshotContext(window: window, last: last)
+    guard let table = context.table, index > 0,
+          context.payloads.contains(where: { $0["index"] as? Int == index }),
+          let scrollArea = ancestorElement(table, matchingRole: "AXScrollArea"),
+          let viewportPayload = rectPayload(scrollArea) else {
+        return ["ok": false, "error": "chat_row_not_in_snapshot"]
+    }
+    let rows = children(table).filter { role($0) == "AXRow" }
+    guard index <= rows.count else { return ["ok": false, "error": "chat_row_changed"] }
+    let row = rows[index - 1]
+    let viewport = cgRect(viewportPayload).insetBy(dx: 0, dy: 4)
+    func visible() -> Bool {
+        guard let rect = rectPayload(row) else { return false }
+        return viewport.contains(cgRect(rect))
+    }
+    if visible() { return ["ok": true, "changed": false] }
+    let action = AXUIElementPerformAction(row, "AXScrollToVisible" as CFString)
+    if action == .success {
+        Thread.sleep(forTimeInterval: 0.15)
+        if visible() { return ["ok": true, "changed": true, "method": "AXScrollToVisible"] }
+    }
+    var barValue: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(scrollArea, kAXVerticalScrollBarAttribute as CFString, &barValue) == .success,
+          let value = barValue, CFGetTypeID(value) == AXUIElementGetTypeID() else {
+        return ["ok": false, "error": "chat_scrollbar_unavailable"]
+    }
+    let scrollbar = value as! AXUIElement
+    func number(_ attr: CFString, fallback: Double) -> Double {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(scrollbar, attr, &value) == .success,
+              let number = value as? NSNumber else { return fallback }
+        return number.doubleValue
+    }
+    let minimum = number(kAXMinValueAttribute as CFString, fallback: 0)
+    let maximum = number(kAXMaxValueAttribute as CFString, fallback: 1)
+    // Move only the chat scrollbar, without relocating the mouse or typing keys.
+    for _ in 0..<2 {
+        guard let target = rectPayload(row) else { break }
+        let rects = rows.compactMap { rectPayload($0) }.map { cgRect($0) }
+        guard let top = rects.map(\.minY).min(), let bottom = rects.map(\.maxY).max() else { break }
+        let overflow = bottom - top - viewport.height
+        guard overflow > 0, maximum > minimum else { break }
+        let targetRect = cgRect(target)
+        let delta = targetRect.minY < viewport.minY ? targetRect.minY - viewport.minY : targetRect.maxY - viewport.maxY
+        let current = number(kAXValueAttribute as CFString, fallback: .nan)
+        guard current.isFinite else { break }
+        let next = min(maximum, max(minimum, current + delta / overflow * (maximum - minimum)))
+        guard AXUIElementSetAttributeValue(scrollbar, kAXValueAttribute as CFString, NSNumber(value: next)) == .success else { break }
+        Thread.sleep(forTimeInterval: 0.15)
+        if visible() { return ["ok": true, "changed": true, "method": "AXScrollBar"] }
+    }
+    return ["ok": false, "error": "chat_row_not_visible_after_scroll"]
 }
 
 func setWindowFrame(_ window: AXUIElement, frame: NSRect) -> Bool {
@@ -1740,8 +1891,13 @@ if command == "bubble-fixture", args.count == 4 {
         let images = fixture["images"] as? Bool == true
         let boxes = bubbleComponents(image: image, window: cgRect(w), viewport: cgRect(v), images: images)
         for body in bodies {
-            jsonLine(images ? imageBubbleEvidence(row: cgRect(body), viewport: cgRect(v), boxes: boxes)
-                            : bubbleEvidence(body: cgRect(body), viewport: cgRect(v), boxes: boxes))
+            var evidence = images ? imageBubbleEvidence(row: cgRect(body), viewport: cgRect(v), boxes: boxes)
+                                  : bubbleEvidence(body: cgRect(body), viewport: cgRect(v), boxes: boxes)
+            if images, let rect = evidence["bubbleRect"] as? [String: Double],
+               let fingerprint = imageFingerprint(image: image, window: cgRect(w), rect: cgRect(rect)) {
+                evidence["imageFingerprint"] = fingerprint
+            }
+            jsonLine(evidence)
         }
         exit(0)
     } catch { fputs("Invalid bubble fixture\n", stderr); exit(2) }
@@ -1813,6 +1969,9 @@ if command == "rows" {
     jsonLine(sendReadyPayload(root: root, window: window))
 } else if command == "sidebar-identity" {
     jsonLine(sidebarIdentityPayload(root: root, window: window))
+} else if command == "chat-reveal" {
+    jsonLine(revealChatRow(window: window, index: intArg(2, defaultValue: 0),
+                          last: max(1, intArg(3, defaultValue: 20))))
 } else if command == "chat" || command == "chat-all" {
     let last = max(0, intArg(2, defaultValue: command == "chat" ? 20 : 0))
     let context = measured("locate_chat") { chatSnapshotContext(window: window, last: last) }

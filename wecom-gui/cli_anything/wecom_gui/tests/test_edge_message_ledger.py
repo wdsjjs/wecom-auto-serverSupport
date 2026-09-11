@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import sqlite3
 from unittest.mock import Mock
 from concurrent.futures import ThreadPoolExecutor
@@ -189,16 +191,71 @@ def test_concurrent_snapshot_commits_do_not_duplicate_messages(capture):
     assert len(all_events()) == 2
 
 
-def image_message(*, direction="unknown", count=1):
-    return {**message("[图片]", direction=direction), "media": [
+def image_message(*, direction="unknown", count=1, row_id="7551:1000:row-1", fingerprint="rgb32-v1:image-1"):
+    result = {**message("[图片]", direction=direction), "capture_row_id": row_id, "media": [
         {"type": "image", "rect": {"x": 10, "y": 20, "width": 80, "height": 80},
          "chat_viewport": {"x": 0, "y": 0, "width": 500, "height": 500}}
         for _ in range(count)]}
+    if fingerprint:
+        result["direction_evidence"]["imageFingerprint"] = fingerprint
+    return result
+
+
+def pixel_fingerprint(pixels):
+    digest = hashlib.sha256(bytes(value & 0xf8 for value in pixels)).hexdigest()
+    return "rgb32-v2:" + digest + ":" + base64.b64encode(bytes(pixels)).decode()
+
+
+def test_pixel_matching_allows_only_small_render_drift():
+    pixels = [80, 100, 140] * 1024
+    original = pixel_fingerprint(pixels)
+    drift = pixel_fingerprint([v + (8 if i % 3 == 0 else 0) for i, v in enumerate(pixels)])
+    assert edge_message_ledger.media_fingerprints_match(original, drift)
+    assert edge_message_ledger.media_fingerprints_match(original, pixel_fingerprint([v + 4 for v in pixels]))
+    assert not edge_message_ledger.media_fingerprints_match(original, drift, allow_render_drift=False)
+    assert not edge_message_ledger.media_fingerprints_match(original, pixel_fingerprint([v + 9 for v in pixels]))
+    replaced = pixels.copy()
+    replaced[12:15] = [0, 255, 0]
+    assert not edge_message_ledger.media_fingerprints_match(original, pixel_fingerprint(replaced))
+    assert not edge_message_ledger.media_fingerprints_match(original, "rgb32-v2:bad:not-base64")
+    assert not edge_message_ledger.media_fingerprints_match(original, original.replace(original.split(":")[1], "0" * 64))
+    resampled = pixels.copy()
+    for x in range(32):
+        for channel in range(3):
+            resampled[(14 * 32 + x) * 3 + channel] += 40
+            resampled[(15 * 32 + x) * 3 + channel] -= 40
+    assert edge_message_ledger.media_fingerprints_match(original, pixel_fingerprint(resampled))
+    replaced = pixels.copy()
+    for y in range(12, 16):
+        for x in range(12, 16):
+            for channel in range(3):
+                replaced[(y * 32 + x) * 3 + channel] += 50
+    assert not edge_message_ledger.media_fingerprints_match(original, pixel_fingerprint(replaced))
+
+
+def test_legacy_pixel_anchor_upgrades_only_on_exact_digest_and_does_not_drift(capture):
+    capture([])
+    pixels = [80, 100, 140] * 1024
+    original = pixel_fingerprint(pixels)
+    legacy = "rgb32-v1:" + original.split(":")[1]
+    capture([image_message(fingerprint=legacy)], media_budget=edge_worker.MediaCaptureBudget(image_limit=0))
+    with edge_message_ledger.transaction() as conn:
+        entry = dict(conn.execute("SELECT * FROM edge_message_ledger").fetchone())
+    drift = pixel_fingerprint([v + (8 if i % 3 == 0 else 0) for i, v in enumerate(pixels)])
+    with pytest.raises(edge_message_ledger.MediaIdentityError, match="media_fingerprint_changed"):
+        edge_message_ledger.verify_media_identity(entry, image_message(fingerprint=drift))
+    edge_message_ledger.verify_media_identity(entry, image_message(fingerprint=original))
+    edge_message_ledger.verify_media_identity(entry, image_message(fingerprint=drift))
+    assert edge_message_ledger.media_state(entry)["image_fingerprint"] == original
+    with pytest.raises(edge_message_ledger.MediaIdentityError, match="media_row_identity_changed"):
+        edge_message_ledger.verify_media_identity(entry, image_message(row_id="7551:1000:another", fingerprint=drift))
+    with pytest.raises(edge_message_ledger.MediaIdentityError, match="media_row_identity_changed"):
+        edge_message_ledger.verify_media_identity(entry, image_message(row_id="9999:2000:another", fingerprint=drift))
 
 
 @pytest.fixture
 def grab_images(monkeypatch, tmp_path):
-    def grab(row, candidates, index, missing):
+    def grab(row, candidates, index, missing, **kwargs):
         # Capturing must not hold a SQLite write lock.
         with edge_state._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -207,10 +264,57 @@ def grab_images(monkeypatch, tmp_path):
             path = tmp_path / f"image-{i}.png"
             path.write_bytes(b"\x89PNG\r\n\x1a\nimage content")
             result.append({"type": "image", "capture_path": str(path), "capture_ok": True})
-        return result
+        return {"media": result, "direction_evidence": {}}
     mock = Mock(side_effect=grab)
     monkeypatch.setattr(edge_worker, "_capture_snapshot_image", mock)
     return mock
+
+
+def test_three_new_images_align_after_old_images_scroll_offscreen(capture, grab_images, monkeypatch):
+    viewport = {"x": 311, "y": 100, "width": 700, "height": 600}
+
+    def read_snapshot(bodies, *, old_images_offscreen=False):
+        rows = []
+        image_number = 0
+        for index, body in enumerate(bodies, start=1):
+            is_image = body is None
+            offscreen = is_image and old_images_offscreen and image_number < 2
+            evidence = {"source": "screencapturekit", "status": "matched", "side": "left"}
+            if offscreen:
+                evidence.update(status="outside_viewport_or_unlaid_out", side="unknown")
+            rows.append({
+                "index": index, "texts": [] if is_image else [body],
+                "captureRowId": f"7551:1000:row-{index}",
+                "messageTexts": [] if is_image else [body],
+                "bubbleImageSupported": is_image, "snapshotComplete": True,
+                "x": 311, "y": -600 if offscreen else 200, "width": 700,
+                "height": 290 if is_image else 84, "chatViewport": viewport,
+                "directionEvidence": evidence,
+            })
+            image_number += int(is_image)
+        monkeypatch.setattr(edge_worker.macos_backend, "_swift_ax", lambda command: rows)
+        return edge_worker.chat.infer_roles(edge_worker.macos_backend._ax_chat_messages(
+            last=20, include_hidden_images=True,
+        ))
+
+    capture([])
+    original = [f"old-{i}" for i in range(17)] + [None, None, "last-text"]
+    assert capture(read_snapshot(original))["captured"] == 20
+    originals = all_events()
+    for event in originals:
+        edge_state.mark_inbound_delivered(event["client_event_id"])
+
+    shifted = read_snapshot(original[3:] + [None, None, None], old_images_offscreen=True)
+    assert len(shifted) == 20
+    assert capture(shifted)["captured"] == 3
+    events = all_events()
+    assert len(events) == 23
+    assert [event["client_event_id"] for event in events[:20]] == [
+        event["client_event_id"] for event in originals
+    ]
+    assert all(event["status"] == "delivered" for event in events[:20])
+    assert all(len(event["media"]) == 1 for event in events[-3:])
+    assert capture(shifted)["captured"] == 0
 
 
 def test_image_baseline_is_not_captured_or_uploaded(capture, grab_images):
@@ -250,9 +354,10 @@ def test_partial_capture_waits_and_recovers_same_message_after_backoff(capture, 
     now = edge_worker.time.time()
     monkeypatch.setattr(edge_worker.time, "time", lambda: now)
 
-    def partial(row, candidates, index, missing):
-        return [successful(row, candidates, index, [0])[0],
-                {"type": "image", "error": "preview_not_found"}]
+    def partial(row, candidates, index, missing, **kwargs):
+        result = successful(row, candidates, index, [0])
+        result["media"].append({"type": "image", "error": "preview_not_found"})
+        return result
     grab_images.side_effect = partial
     assert capture([image_message(count=2)])["pending_media"] == 1
     assert len(all_events()) == 1
@@ -352,8 +457,85 @@ def test_visible_image_capture_uses_existing_preview_and_keeps_failures_retryabl
     grab = Mock(return_value=[{"media": [{"type": "image", "capture_path": "test.png"}]}])
     monkeypatch.setattr(edge_worker.macos_backend, "capture_chat_images", grab)
     result = edge_worker._capture_snapshot_image({}, candidates, 0, [0])
-    assert result[0]["capture_path"] == "test.png"
+    assert result["media"][0]["capture_path"] == "test.png"
     assert grab.call_args.kwargs == {"cache_preview_failures": False}
+
+
+@pytest.mark.parametrize("whole_row_visible", [True, False])
+def test_clipped_image_is_revealed_then_captured_with_fresh_direction(capture, monkeypatch, whole_row_visible):
+    image = image_message()
+    image["row"] = 18
+    image["media"][0]["rect"]["y"] = -100
+    capture([image])
+    visible = image_message(direction="inbound")
+    visible["row"] = 18
+    monkeypatch.setattr(edge_worker.macos_backend, "activate_app", lambda: None)
+    monkeypatch.setattr(edge_worker, "_row_matches_opened", lambda *args: True)
+    monkeypatch.setattr(edge_worker.chat, "read_current", Mock(side_effect=[
+        {"messages": [image]}, {"messages": [visible]}, {"messages": [visible]},
+    ]))
+    reveal = Mock(return_value={"ok": whole_row_visible})
+    grab = Mock(return_value=[{"media": [{"type": "image", "capture_path": "test.png"}]}])
+    monkeypatch.setattr(edge_worker.macos_backend, "reveal_chat_row", reveal)
+    monkeypatch.setattr(edge_worker.macos_backend, "capture_chat_images", grab)
+
+    result = edge_worker._capture_snapshot_image({}, edge_worker._visible_observation_fingerprints([image]), 0, [0])
+
+    reveal.assert_called_once_with(18, last=20)
+    assert grab.call_args.args[0][0]["media"] == visible["media"]
+    assert result["direction_evidence"] == visible["direction_evidence"]
+
+
+@pytest.mark.parametrize("failure", ["scroll", "snapshot", "conversation", "offscreen"])
+def test_reveal_failure_or_changed_snapshot_never_captures_a_different_image(capture, monkeypatch, failure):
+    image = image_message()
+    image["row"] = 18
+    image["media"][0]["rect"]["y"] = -100
+    capture([image])
+    monkeypatch.setattr(edge_worker.macos_backend, "activate_app", lambda: None)
+    monkeypatch.setattr(edge_worker, "_row_matches_opened", Mock(
+        side_effect=[True, True, False] if failure == "conversation" else None, return_value=True,
+    ))
+    monkeypatch.setattr(edge_worker.chat, "read_current", Mock(side_effect=[
+        {"messages": [image]}, {"messages": [message("new arrival")] if failure == "snapshot" else [image]},
+    ]))
+    monkeypatch.setattr(edge_worker.macos_backend, "reveal_chat_row", Mock(return_value={"ok": failure != "scroll"}))
+    grab = Mock()
+    monkeypatch.setattr(edge_worker.macos_backend, "capture_chat_images", grab)
+
+    with pytest.raises(edge_worker.MediaCapturePending):
+        edge_worker._capture_snapshot_image({}, edge_worker._visible_observation_fingerprints([image]), 0, [0])
+    grab.assert_not_called()
+
+
+@pytest.mark.parametrize("initial_direction,expected", [("unknown", "inbound"), ("outbound", "outbound")])
+def test_image_reveal_resolves_only_unknown_direction_without_replacing_identity(
+    capture, grab_images, monkeypatch, initial_direction, expected,
+):
+    capture([])
+    now = edge_worker.time.time()
+    monkeypatch.setattr(edge_worker.time, "time", lambda: now)
+    successful = grab_images.side_effect
+    grab_images.side_effect = RuntimeError("temporarily offscreen")
+    snapshot = [image_message(direction=initial_direction)]
+    capture(snapshot)
+    original = all_events()[0]
+
+    def revealed(*args, **kwargs):
+        result = successful(*args, **kwargs)
+        result["direction_evidence"] = {"source": "screencapturekit", "status": "matched", "side": "left"}
+        return result
+
+    now += 3
+    grab_images.side_effect = revealed
+    capture(snapshot)
+    event = all_events()[0]
+    assert len(all_events()) == 1
+    assert event["client_event_id"] == original["client_event_id"]
+    assert event["payload"]["occurred_at"] == original["payload"]["occurred_at"]
+    assert event["payload"]["message"]["direction"] == expected
+    assert event["payload"]["event_type"] == expected + "_message"
+    assert edge_state.media_files_ready(event["media"])
 
 
 class DeferredChannel(FakeChannel):
@@ -439,3 +621,271 @@ def test_identical_image_window_is_retained_as_uncertain_not_silently_skipped(ca
     assert result["reason"] == "message_alignment_pending"
     assert edge_state.edge_status()["message_alignment_pending"] == 1
     assert [event["client_event_id"] for event in all_events()] == ids
+
+
+@pytest.mark.parametrize("change", ["row", "pixels"])
+@pytest.mark.parametrize("stage", ["before", "reveal", "after"])
+def test_identical_placeholders_cannot_hide_a_changed_capture_target(capture, monkeypatch, tmp_path, change, stage):
+    import copy
+    image = image_message()
+    image["row"] = 18
+    capture([image])
+    changed = copy.deepcopy(image)
+    if change == "row":
+        changed["capture_row_id"] = "7551:1000:replacement"
+    else:
+        changed["direction_evidence"]["imageFingerprint"] = "rgb32-v1:different-image"
+    if stage == "reveal":
+        image["media"][0]["rect"]["y"] = -100
+    reads = [changed] if stage == "before" else [image, changed]
+    if stage == "after" and change == "pixels":
+        reads += [changed, changed]
+    monkeypatch.setattr(edge_worker.macos_backend, "_capture_sleep", lambda seconds: None)
+    monkeypatch.setattr(edge_worker.macos_backend, "activate_app", lambda: None)
+    monkeypatch.setattr(edge_worker, "_row_matches_opened", lambda *args: True)
+    monkeypatch.setattr(edge_worker.chat, "read_current", Mock(side_effect=[{"messages": [item]} for item in reads]))
+    monkeypatch.setattr(edge_worker.macos_backend, "reveal_chat_row", Mock(return_value={"ok": True}))
+    monkeypatch.setenv("WECOM_GUI_CAPTURE_IMAGE_DIR", str(tmp_path))
+    path = tmp_path / "unverified.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\ntest")
+    grab = Mock(return_value=[{"media": [{"type": "image", "capture_path": str(path)}]}])
+    monkeypatch.setattr(edge_worker.macos_backend, "capture_chat_images", grab)
+    with pytest.raises(edge_worker.MediaCapturePending, match="media_(row_identity|fingerprint)_changed"):
+        edge_worker._capture_snapshot_image({}, edge_worker._visible_observation_fingerprints([image]), 0, [0])
+    assert grab.call_count == int(stage == "after")
+    assert path.exists() == (stage != "after")
+
+
+def test_image_without_complete_pixel_evidence_stays_pending(capture, monkeypatch):
+    image = image_message(fingerprint="")
+    capture([image])
+    monkeypatch.setattr(edge_worker.macos_backend, "activate_app", lambda: None)
+    grab = Mock()
+    monkeypatch.setattr(edge_worker.macos_backend, "capture_chat_images", grab)
+    with pytest.raises(edge_worker.MediaCapturePending, match="media_fingerprint_unavailable"):
+        edge_worker._capture_snapshot_image({"title": "客户A", "external_user_id": "customer-1"},
+                                            edge_worker._visible_observation_fingerprints([image]), 0, [0])
+    grab.assert_not_called()
+
+
+@pytest.mark.parametrize("transient", ["unavailable", "changed"])
+def test_preview_dismissal_allows_only_bounded_rechecks_of_same_image(capture, monkeypatch, transient):
+    image = image_message()
+    hidden = image_message(fingerprint="")
+    hidden["direction_evidence"].update(status="window_not_on_screen", side="unknown")
+    if transient == "changed":
+        hidden = image_message(fingerprint="rgb32-v1:preview-transition")
+    capture([image])
+    monkeypatch.setattr(edge_worker.macos_backend, "activate_app", lambda: None)
+    monkeypatch.setattr(edge_worker, "_row_matches_opened", lambda *args: True)
+    monkeypatch.setattr(edge_worker.macos_backend, "_capture_sleep", lambda seconds: None)
+    grab = Mock(return_value=[{"media": [{"type": "image", "capture_path": "test.png"}]}])
+    monkeypatch.setattr(edge_worker.macos_backend, "capture_chat_images", grab)
+    reads = Mock(side_effect=[{"messages": [item]} for item in (image, hidden, image)])
+    monkeypatch.setattr(edge_worker.chat, "read_current", reads)
+    result = edge_worker._capture_snapshot_image({}, edge_worker._visible_observation_fingerprints([image]), 0, [0])
+    assert result["media"][0]["capture_path"] == "test.png"
+    assert reads.call_count == 3
+    reads = Mock(side_effect=[{"messages": [item]} for item in (image, hidden, hidden, hidden)])
+    monkeypatch.setattr(edge_worker.chat, "read_current", reads)
+    with pytest.raises(edge_worker.MediaCapturePending, match="media_fingerprint_" + transient):
+        edge_worker._capture_snapshot_image({}, edge_worker._visible_observation_fingerprints([image]), 0, [0])
+    assert reads.call_count == 4
+
+
+def test_image_budget_is_shared_between_conversations_and_next_round_resumes(capture, grab_images, monkeypatch):
+    capture([])
+    budget = edge_worker.MediaCaptureBudget()
+    first = [image_message(), message("anchor"), image_message(row_id="7551:1000:row-2")]
+    capture(first, media_budget=budget)
+    second = [image_message(row_id="7551:1000:row-3"), message("anchor2"),
+              image_message(row_id="7551:1000:row-4"), message("later text")]
+    monkeypatch.setattr(edge_worker, "_current_identity_for_row", lambda row: ("customer-2", ""))
+    capture([], media_budget=budget)
+    result = capture(second, media_budget=budget)
+    assert result["captured"] == 4
+    assert result["pending_media"] == 1
+    assert grab_images.call_count == budget.images == 3
+    ids = [event["client_event_id"] for event in all_events()]
+    assert len(edge_state.due_registrations()) == 7
+    result = capture(second)
+    assert result["pending_media"] == 0
+    assert grab_images.call_count == 4
+    assert [event["client_event_id"] for event in all_events()] == ids
+
+
+def test_failed_early_images_do_not_starve_later_images(capture, monkeypatch):
+    capture([])
+    clock = [1000.0]
+    monkeypatch.setattr(edge_worker.time, "time", lambda: clock[0])
+    attempted = []
+
+    def fail_capture(row, candidates, index, missing, **kwargs):
+        attempted.append(index)
+        raise edge_worker.MediaCapturePending("media_fingerprint_changed")
+
+    monkeypatch.setattr(edge_worker, "_capture_snapshot_image", fail_capture)
+    snapshot = []
+    for i in range(4):
+        snapshot.extend([image_message(row_id=f"7551:1000:row-{i}"), message(f"anchor-{i}")])
+    budget = edge_worker.MediaCaptureBudget()
+    capture(snapshot, media_budget=budget)
+    assert attempted == [0, 2, 4]
+    ids = [event["client_event_id"] for event in all_events()]
+    clock[0] += 100
+    capture(snapshot)
+    assert attempted[3] == 6
+    assert [event["client_event_id"] for event in all_events()] == ids
+
+
+def test_same_image_is_not_retried_twice_in_shared_tick(capture, monkeypatch):
+    capture([])
+    clock = [1000.0]
+    monkeypatch.setattr(edge_worker.time, "time", lambda: clock[0])
+    attempted = []
+
+    def fail_capture(*args, **kwargs):
+        attempted.append(True)
+        raise edge_worker.MediaCapturePending("media_fingerprint_changed")
+
+    monkeypatch.setattr(edge_worker, "_capture_snapshot_image", fail_capture)
+    budget = edge_worker.MediaCaptureBudget()
+    snapshot = [image_message()]
+    capture(snapshot, media_budget=budget)
+    clock[0] += 100
+    capture(snapshot, media_budget=budget)
+    assert len(attempted) == 1
+    capture(snapshot)
+    assert len(attempted) == 2
+
+
+def test_partial_message_due_to_budget_keeps_files_and_does_not_recapture(capture, grab_images):
+    capture([])
+    snapshot = [image_message(count=4)]
+    assert capture(snapshot)["pending_media"] == 1
+    original = all_events()[0]
+    assert grab_images.call_args.args[-1] == [0, 1, 2]
+    assert capture(snapshot)["pending_media"] == 0
+    assert grab_images.call_args.args[-1] == [3]
+    assert all_events()[0]["client_event_id"] == original["client_event_id"]
+    assert len(all_events()[0]["media"]) == 4
+    assert edge_state.media_files_ready(all_events()[0]["media"])
+
+
+def test_capture_deadline_defers_remaining_images_but_preserves_later_text(capture, grab_images, monkeypatch):
+    capture([])
+    now = 100.0
+    monkeypatch.setattr(edge_worker.time, "monotonic", lambda: now)
+
+    def slow_capture(*args, **kwargs):
+        nonlocal now
+        now += 15
+        raise edge_worker.macos_backend.CaptureDeadlineExceeded("media_time_budget_exhausted")
+
+    grab_images.side_effect = slow_capture
+    snapshot = [image_message(), message("anchor"), image_message(row_id="7551:1000:row-2"), message("later text")]
+    budget = edge_worker.MediaCaptureBudget()
+    assert capture(snapshot, media_budget=budget)["captured"] == 4
+    assert grab_images.call_count == 1
+    assert budget.elapsed == 15
+    with edge_message_ledger.transaction() as conn:
+        rows = list(conn.execute("SELECT attempts FROM edge_media_capture_state ORDER BY rowid"))
+    assert [row[0] for row in rows] == [1, 0]
+    channel = DeferredChannel()
+    assert edge_worker.flush_registrations(channel)["registered"] == 4
+    assert channel.registrations[-1]["message"]["text"] == "later text"
+
+
+def test_media_retry_limit_survives_restart_and_explicit_resume_preserves_event(capture, grab_images, monkeypatch):
+    from click.testing import CliRunner
+    from cli_anything.wecom_gui.wecom_gui_cli import cli
+
+    capture([])
+    now = edge_worker.time.time()
+    monkeypatch.setattr(edge_worker.time, "time", lambda: now)
+    successful = grab_images.side_effect
+    grab_images.side_effect = RuntimeError("private detail must not escape")
+    snapshot = [image_message(direction="inbound")]
+    for _ in range(8):
+        capture(snapshot)
+        now += 65
+    original = all_events()[0]
+    assert grab_images.call_count == 5
+    status = edge_state.edge_status()
+    assert status["media_capture_pending"] == status["media_capture_paused"] == 1
+    assert status["paused_media_tasks"] == [{"event_id": original["payload"]["message"]["id"],
+                                             "attempts": 5, "last_error": "media_capture:RuntimeError"}]
+    with edge_message_ledger.transaction() as conn:
+        row = dict(conn.execute("SELECT * FROM edge_message_ledger").fetchone())
+    assert row["direction"] == "inbound"  # Failure must not restore the reserved unknown direction.
+    assert not edge_message_ledger.begin_media_attempt(row)
+    result = CliRunner().invoke(cli, ["--json", "edge-channel", "resume-media", row["event_id"]])
+    assert result.exit_code == 0, result.output
+    assert "media_retry_resumed" in result.output
+    grab_images.side_effect = successful
+    capture(snapshot)
+    repaired = all_events()[0]
+    assert repaired["client_event_id"] == original["client_event_id"]
+    assert repaired["payload"]["occurred_at"] == original["payload"]["occurred_at"]
+    assert edge_state.media_files_ready(repaired["media"])
+    assert edge_state.edge_status()["media_capture_paused"] == 0
+
+
+def test_crashes_consume_attempts_before_gui_work(capture, monkeypatch):
+    capture([])
+    now = edge_worker.time.time()
+    monkeypatch.setattr(edge_worker.time, "time", lambda: now)
+    snapshot = [image_message()]
+    # Reserve the event and image identity without doing GUI work.
+    capture(snapshot, media_budget=edge_worker.MediaCaptureBudget(image_limit=0))
+    with edge_message_ledger.transaction() as conn:
+        entry = dict(conn.execute("SELECT * FROM edge_message_ledger").fetchone())
+    for _ in range(5):
+        assert edge_message_ledger.begin_media_attempt(entry)
+        assert not edge_message_ledger.begin_media_attempt(entry)
+        now += 65
+        # No save_media call: simulate abrupt termination, then a new connection.
+    assert not edge_message_ledger.begin_media_attempt(entry)
+    assert edge_state.edge_status()["paused_media_tasks"][0]["last_error"] == "media_capture_interrupted"
+
+
+@pytest.mark.parametrize("same_pixels", [True, False])
+def test_restarted_wecom_can_only_rebind_an_image_with_pinned_pixels(capture, monkeypatch, same_pixels):
+    capture([])
+    original = image_message()
+    capture([original], media_budget=edge_worker.MediaCaptureBudget(image_limit=0))
+    with edge_message_ledger.transaction() as conn:
+        entry = dict(conn.execute("SELECT * FROM edge_message_ledger").fetchone())
+    restarted = image_message(row_id="8000:2000:new-row", fingerprint="rgb32-v1:image-1" if same_pixels else "rgb32-v1:new-image")
+    if same_pixels:
+        edge_message_ledger.verify_media_identity(entry, restarted, require_pixels=True)
+        assert edge_message_ledger.media_state(entry)["capture_row_id"] == restarted["capture_row_id"]
+    else:
+        with pytest.raises(edge_message_ledger.MediaIdentityError, match="media_fingerprint_changed"):
+            edge_message_ledger.verify_media_identity(entry, restarted, require_pixels=True)
+        assert edge_message_ledger.media_state(entry)["capture_row_id"] == original["capture_row_id"]
+
+
+def test_tick_keeps_command_polling_after_shared_image_budget_exhaustion(capture, grab_images, monkeypatch):
+    capture([])
+    snapshot = [image_message(), message("anchor"), image_message(row_id="7551:1000:row-2"),
+                image_message(row_id="7551:1000:row-3"), image_message(row_id="7551:1000:row-4")]
+    monkeypatch.setattr(edge_worker.chat, "read_current", lambda **kwargs: {"messages": snapshot})
+    row = {"title": "客户A", "external_user_id": "customer-1", "unread_count": 4}
+    monkeypatch.setattr(edge_worker.inbox, "scan_visible", lambda **kwargs: {"conversations": [row]})
+    monkeypatch.setattr(edge_worker.inbox, "is_customer_candidate", lambda row: True)
+    monkeypatch.setattr(edge_worker.inbox, "open_row", lambda row: None)
+    channel = DeferredChannel()
+    channel.heartbeat = Mock()
+    channel.pull_command = Mock(return_value=None)
+    monkeypatch.setattr(edge_worker.edge_channel.ChannelConfig, "from_env", lambda: None)
+    monkeypatch.setattr(edge_worker.edge_channel, "ChannelClient", lambda config: channel)
+    reported = []
+    monkeypatch.setattr(edge_worker.runtime_reporting, "publish", lambda *args, **kwargs: reported.append(kwargs))
+    result = edge_worker.tick(pull_wait_seconds=0)
+    assert result["ok"]
+    assert grab_images.call_count == 3
+    assert len(channel.registrations) == 5
+    channel.pull_command.assert_called_once_with(wait_seconds=0)
+    assert result["state"]["media_capture_pending"] == 1
+    assert reported[-1]["metrics"]["capture_images"] == 3

@@ -4,12 +4,54 @@ set -euo pipefail
 SCRIPT_DIR="${0:A:h}"
 ROOT_DIR="${SCRIPT_DIR:h}"
 APP="$HOME/Applications/UDA WeCom Agent.app"
+SIGN_IDENTITY="${WECOM_DESKTOP_SIGN_IDENTITY:--}"
+FINGERPRINT="$(shasum -a 256 "$ROOT_DIR/desktop-client/UDAWeComAgent.swift" "$ROOT_DIR/desktop-client/Info.plist" "$SCRIPT_DIR/install-desktop-client" | awk '{print $1}'):$SIGN_IDENTITY"
+
+if [[ -x "$APP/Contents/MacOS/UDAWeComAgent" && -f "$APP/Contents/Resources/build-fingerprint.txt" ]] &&
+   [[ "$(<"$APP/Contents/Resources/build-fingerprint.txt")" == "$FINGERPRINT" ]]; then
+  open "$APP"
+  print 'The installed control panel is current. Services were not started.'
+  exit 0
+fi
 
 command -v swiftc >/dev/null 2>&1 || { print -u2 'ERROR: swiftc is required'; exit 1; }
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -framework AppKit -framework Foundation "$ROOT_DIR/desktop-client/UDAWeComAgent.swift" -o "$APP/Contents/MacOS/UDAWeComAgent"
-cp "$ROOT_DIR/desktop-client/Info.plist" "$APP/Contents/Info.plist"
-print -r -- "$ROOT_DIR" > "$APP/Contents/Resources/wecom-gui-root.txt"
+mkdir -p "$HOME/Applications"
+BUILD_DIR="$(mktemp -d "$HOME/Applications/.uda-wecom-build.XXXXXX")"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+STAGED_APP="$BUILD_DIR/UDA WeCom Agent.app"
+mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
+swiftc -framework AppKit -framework Foundation -framework ApplicationServices \
+  "$ROOT_DIR/desktop-client/UDAWeComAgent.swift" -o "$STAGED_APP/Contents/MacOS/UDAWeComAgent"
+cp "$ROOT_DIR/desktop-client/Info.plist" "$STAGED_APP/Contents/Info.plist"
+print -r -- "$ROOT_DIR" > "$STAGED_APP/Contents/Resources/wecom-gui-root.txt"
+print -r -- "$FINGERPRINT" > "$STAGED_APP/Contents/Resources/build-fingerprint.txt"
+codesign --force --sign "$SIGN_IDENTITY" --identifier cn.uda.wecom-agent "$STAGED_APP"
+codesign --verify --strict "$STAGED_APP"
+
+# Replace only after a successful build. A running old binary must not retain
+# responsibility for workers after its on-disk signing identity changes.
+if [[ -d "$APP" ]]; then
+  "$SCRIPT_DIR/wecom-supervisor" stop edge
+  for app_pid in ${(f)"$(pgrep -x UDAWeComAgent || true)"}; do
+    kill "$app_pid"
+    for attempt in {1..40}; do
+      kill -0 "$app_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$app_pid" 2>/dev/null; then
+      print -u2 'ERROR: close the old UDA WeCom Agent before installing.'
+      exit 1
+    fi
+  done
+  mv "$APP" "$BUILD_DIR/previous.app"
+fi
+if ! mv "$STAGED_APP" "$APP"; then
+  [[ ! -d "$BUILD_DIR/previous.app" ]] || mv "$BUILD_DIR/previous.app" "$APP"
+  exit 1
+fi
 print "Installed $APP"
 open "$APP"
 print 'Started the UDA WeCom Agent desktop client. It does not start the edge channel automatically.'
+if [[ "$SIGN_IDENTITY" == '-' ]]; then
+  print 'Local ad-hoc build: macOS permissions may need reauthorization after code changes.'
+fi

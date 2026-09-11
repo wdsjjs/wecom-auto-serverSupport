@@ -286,6 +286,59 @@ def test_native_image_pixels_distinguish_sides_and_reject_ambiguous_clipped_or_b
     assert [item["side"] for item in results] == ["left", "right", "unknown", "unknown", "unknown", "unknown", "unknown"]
     assert results[0]["method"] == "image_pixels"
     assert results[-1]["status"] == "outside_viewport_or_unlaid_out"
+    assert results[0]["imageFingerprint"] != results[1]["imageFingerprint"]
+    assert all("imageFingerprint" not in item for item in results[2:])
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("layout,side", [("left", "left"), ("right", "right"), ("broken", "unknown"), ("two", "unknown")])
+def test_native_white_image_requires_complete_outline(native_helper, tmp_path, scale, layout, side):
+    window = {"x": 0, "y": 0, "width": 700, "height": 400}
+    rectangles = []
+    for x in ([16, 484] if layout == "two" else [484] if layout == "right" else [16]):
+        rectangles.extend([(x, 30, 200, 320, (249, 249, 249)),
+                           (x + 1, 31, 198, 318, (255, 255, 255))])
+        if layout == "broken":
+            rectangles.extend([(x, 30, 200, 3, (255, 255, 255)),
+                               (x + 197, 30, 3, 320, (255, 255, 255))])
+        else:
+            # A disconnected product photo inside the screenshot is not a second message.
+            rectangles.append((x + 20, 100, 70, 70, (60, 90, 140)))
+        rectangles.append((x + 20, 60, 120, 4, (60, 60, 60)))
+    image = tmp_path / "white-image.png"
+    write_png(image, 700 * scale, 400 * scale,
+              [(x * scale, y * scale, w * scale, h * scale, color) for x, y, w, h, color in rectangles])
+    fixture = tmp_path / "white-image.json"
+    fixture.write_text(json.dumps({"window": window, "viewport": window, "images": True, "bodies": [window]}))
+    completed = subprocess.run([str(native_helper), "bubble-fixture", str(fixture), str(image)],
+                               check=True, capture_output=True, text=True, timeout=10)
+    result = json.loads(completed.stdout)
+    assert result["side"] == side
+    if side != "unknown":
+        assert result["bubbleRect"] == {"x": 16 if side == "left" else 484, "y": 30, "width": 200, "height": 320}
+        assert result["imageFingerprint"].startswith("rgb32-v2:")
+    else:
+        assert "imageFingerprint" not in result
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_native_image_fingerprint_survives_translation_and_detects_changed_pixels(native_helper, tmp_path, scale):
+    window = {"x": 0, "y": 0, "width": 700, "height": 700}
+    image = tmp_path / "fingerprints.png"
+    rectangles = [(16, y, 200, 130, (80, 100, 140)) for y in (20, 230, 440)]
+    rectangles += [(36, 40, 70, 70, (170, 50, 80)), (36, 250, 70, 70, (170, 50, 80)),
+                   (36, 460, 70, 70, (40, 180, 80))]
+    write_png(image, 700 * scale, 700 * scale,
+              [(x * scale, y * scale, w * scale, h * scale, color) for x, y, w, h, color in rectangles])
+    fixture = tmp_path / "fingerprints.json"
+    fixture.write_text(json.dumps({"window": window, "viewport": window, "images": True,
+        "bodies": [{"x": 0, "y": y, "width": 700, "height": 180} for y in (0, 210, 420)]}))
+    completed = subprocess.run([str(native_helper), "bubble-fixture", str(fixture), str(image)],
+                               check=True, capture_output=True, text=True, timeout=10)
+    results = [json.loads(line) for line in completed.stdout.splitlines()]
+    fingerprints = [item["imageFingerprint"] for item in results]
+    assert fingerprints[0].startswith("rgb32-v2:")
+    assert fingerprints[0] == fingerprints[1] != fingerprints[2]
 
 
 @pytest.mark.parametrize("scale,origin", [(1, (0, 0)), (2, (-1100, 35))])
